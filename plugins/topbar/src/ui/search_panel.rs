@@ -514,9 +514,15 @@ impl Content for SearchPanel {
         true
     }
 
-    /// The caret blinks all the while the box is open.
+    /// The caret blinks all the while the box is open: a frame every 106 ms (a fifth of the blink) shows it, and finds what the
+    /// service answered meanwhile; a frame on every tick of the screen for that would repaint the box 360 times a second.
+    fn pulse(&self) -> u32 {
+        106
+    }
+
+    /// A switch of the list is waiting for its re-read.
     fn animating(&self, _now: u64) -> bool {
-        true
+        self.reread_at != 0
     }
 
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {

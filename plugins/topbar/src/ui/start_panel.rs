@@ -515,8 +515,14 @@ impl Content for StartPanel {
         500 // the last block rises in at 150 ms + 340 ms
     }
 
+    /// The field's caret blinks: a frame every 106 ms (a fifth of the blink) shows it; a frame on every tick of the screen would
+    /// repaint the panel 360 times a second for it.
+    fn pulse(&self) -> u32 {
+        if self.focus { 106 } else { 0 }
+    }
+
     fn animating(&self, _now: u64) -> bool {
-        self.focus || apps::just_pinned().is_some() || apps::current_note().is_some() || apps::GEN.load(std::sync::atomic::Ordering::Relaxed) != self.gen_seen
+        apps::just_pinned().is_some() || apps::current_note().is_some() || apps::GEN.load(std::sync::atomic::Ordering::Relaxed) != self.gen_seen
     }
 
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {

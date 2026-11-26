@@ -1,9 +1,11 @@
 //! Live window thumbnails under a panel of per-pixel alpha.
 //!
 //! DWM draws a thumbnail (`DwmRegisterThumbnail`) as part of its destination window, and a layered window that is painted
-//! with `UpdateLayeredWindow` is a bitmap that DWM composites as it is: a thumbnail registered on it is not drawn. So the
-//! thumbnails live in a plain window that stands right under the panel's own: the panel cuts holes in itself where a
-//! thumbnail belongs ([`super::panel::Hole`]), and DWM shows the thumbnails through them. The window's region is the union of
+//! with `UpdateLayeredWindow` is a bitmap that DWM composites as it is: a thumbnail registered on it is not drawn. (On a
+//! DirectComposition window it is drawn, but over everything the window shows, and a card's close cross sits on the
+//! thumbnail's corner.) So the thumbnails live in a plain window that stands right under the panel's own: the panel cuts holes
+//! in itself where a thumbnail belongs ([`super::panel::Hole`]), and DWM shows the thumbnails through them. The holes keep a hair
+//! of alpha: on a layered panel that keeps the pointer on it, on a composed one its window region does. The window's region is the union of
 //! the thumbnails' rectangles, so nothing of it is seen but the pictures (a panel that fades does not show a black box).
 
 use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};

@@ -12,7 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::HICON;
 use winrust_common::style::{self, Side, Style};
 
 use super::anim::{self, CubicBezier, EASE, SNAP, SPRING, Transition};
-use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba, Surface};
+use super::gfx::{self, Align, Canvas, Font, Gfx, Rect, Rgba, Rgn, Surface};
 use super::icons;
 
 /// Hit-test results and motion keys. App buttons are `>= 1` (their index in the button list, Start is 0); the tray's chevron
@@ -487,6 +487,49 @@ impl Motion {
     fn running(&self, now: u64) -> bool {
         self.t.values().any(|t| t.running(now))
     }
+
+    /// The theme is changing the bar's own shape (thickness, gap, corner, edge, ring): its click region would lag behind it.
+    fn morphing(&self, now: u64) -> bool {
+        [THICK, INSET, RADIUS, EDGE, RING].into_iter().any(|p| self.t.get(&(BAR_KEY, p)).is_some_and(|t| t.running(now)))
+    }
+}
+
+/// The x ranges (window-local DIPs) above the app buttons whose icon is out of its rest place (lifted, zoomed, or casting its
+/// shadow): they jump up into the strip above a bottom bar, and that strip catches the mouse only over them. A column is the
+/// button and 10 DIPs each side (the zoomed icon and its shadow reach that far); touching columns are one.
+fn lifted_columns(lay: &Layout, m: &Motion, now: u64) -> Vec<(f32, f32)> {
+    let mut cols: Vec<(f32, f32)> = lay
+        .items
+        .iter()
+        .filter(|it| it.kind == Kind::App)
+        .filter(|it| {
+            let zoom = m.val(it.key, ZOOM, now);
+            m.val(it.key, LIFT, now).abs() > 0.01 || (zoom != 0.0 && (zoom - 1.0).abs() > 0.001) || m.val(it.key, DROP, now) > 0.001
+        })
+        .map(|it| (it.rect.x - 10.0, it.rect.x + it.rect.w + 10.0))
+        .collect();
+    cols.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for c in cols {
+        match merged.last_mut() {
+            Some(last) if c.0 <= last.1 => last.1 = last.1.max(c.1),
+            _ => merged.push(c),
+        }
+    }
+    merged
+}
+
+/// The click region of the bar window, device pixels in window coordinates: the bar (`(left, top, width, height)`, corners of
+/// `radius`) and, above it, a column of the strip's height (`head`) for each x range in `lifted`.
+fn bar_region(bar: (i32, i32, i32, i32), radius: i32, head: i32, lifted: &[(i32, i32)]) -> Vec<Rgn> {
+    let mut parts = vec![Rgn { x: bar.0, y: bar.1, w: bar.2, h: bar.3, r: radius }];
+    if head > 0 {
+        parts.extend(lifted.iter().filter_map(|&(x0, x1)| {
+            let (x0, x1) = (x0.max(bar.0), x1.min(bar.0 + bar.2));
+            (x1 > x0).then_some(Rgn { x: x0, y: 0, w: x1 - x0, h: head, r: 0 })
+        }));
+    }
+    parts
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -517,6 +560,11 @@ pub struct Bar {
     gfx: Gfx,
     surf: Surface,
     shade: Surface,
+    /// What the shadow was painted for (width, height, corner radius): it is painted again only when that changes, its
+    /// opacity and place follow the bar without a repaint.
+    shade_key: Option<(i32, i32, u32)>,
+    /// The parts of the bar window that catch the mouse (a composed window has no per-pixel hit test); `None` = all of it.
+    shape: Option<Vec<Rgn>>,
     motion: Motion,
     lay: Layout,
     place: Placement,
@@ -530,8 +578,10 @@ impl Bar {
     pub fn new(scale: f32) -> windows::core::Result<Self> {
         Ok(Self {
             gfx: Gfx::new(scale)?,
-            surf: Surface::new(),
-            shade: Surface::new(),
+            surf: Surface::composed(),
+            shade: Surface::composed(),
+            shade_key: None,
+            shape: None,
             motion: Motion::default(),
             lay: Layout::default(),
             place: Placement::default(),
@@ -578,7 +628,6 @@ impl Bar {
     pub fn frame(&mut self, v: &View, live: &Live) -> Placement {
         let now = live.now;
         let s = self.scale;
-        self.gfx.target_for((v.screen.0 * s) as i32, (100.0 * s) as i32);
         self.motion.mode = Some(style::anim());
         let sh = shape(v.style, v.side, v.size);
 
@@ -674,6 +723,13 @@ impl Bar {
             dead.into_iter().for_each(|i| c.forget_icon(i));
             paint(c, lay_ref, v, live, motion, &look, &colors, dock, vert);
         });
+        // what catches the mouse: the bar, and the columns over the icons that jump out of it (a morph of the theme: all)
+        self.shape = if self.motion.morphing(now) {
+            None
+        } else {
+            let lifted: Vec<(i32, i32)> = if vert { Vec::new() } else { lifted_columns(&lay, &self.motion, now).into_iter().map(|(x0, x1)| (px(x0), px(x1))).collect() };
+            Some(bar_region((0, head, bw, bh), px(look.radius), head, &lifted))
+        };
         self.lay = lay;
 
         // the shadow of the floating styles lives in its own window right under the bar
@@ -684,10 +740,14 @@ impl Bar {
             let (w, h) = (bw + 2 * pad, bh + 2 * pad + sdy);
             let r = Rect::new(pad as f32 / s, pad as f32 / s, bw_d, bh_d);
             let rad = look.radius;
-            let _ = self.gfx.paint(&mut self.shade, w, h, |c| {
-                c.shadow(r, rad, 20.0, 50.0, Rgba::new(0.0, 0.0, 0.0, 0.45));
-                c.erase(r, rad);
-            });
+            let key = (w, h, rad.to_bits());
+            if self.shade_key != Some(key) || !self.shade.is_current() {
+                let _ = self.gfx.paint(&mut self.shade, w, h, |c| {
+                    c.shadow(r, rad, 20.0, 50.0, Rgba::new(0.0, 0.0, 0.0, 0.45));
+                    c.erase(r, rad);
+                });
+                self.shade_key = Some(key);
+            }
             shadow_rect = Some((bx - pad, by - pad, w, h));
         }
         let place = Placement {
@@ -705,13 +765,22 @@ impl Bar {
         place
     }
 
-    /// Presents the last frame: the bar window and, under it, the shadow window.
+    /// Presents the last frame: the bar window and, under it, the shadow window. A composed bar is cut to what catches the
+    /// mouse first (the cut grows before what it shows does) and reaches the screen with one commit.
     pub fn present(&self, bar: HWND, shadow: HWND) {
         let p = &self.place;
+        gfx::shape(bar, self.shape.as_deref());
         let _ = self.surf.present(bar, p.win.0, p.win.1, p.alpha);
         if let Some((x, y, _, _)) = p.shadow {
             let _ = self.shade.present(shadow, x, y, p.shadow_alpha);
         }
+        gfx::commit();
+    }
+
+    /// Which parts of the bar window catch the mouse (`None` = all of it); what a composed window is cut to.
+    #[must_use]
+    pub fn shape(&self) -> Option<&[Rgn]> {
+        self.shape.as_deref()
     }
 
     /// The frame's pixels, premultiplied BGRA: (bar window, shadow window).
@@ -1199,6 +1268,76 @@ mod tests {
             assert!(b.surfaces().0.present(hw, 0, 0, 255));
             let _ = DestroyWindow(hw);
         }
+    }
+
+    #[test]
+    fn a_frame_reaches_a_composed_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+        use windows::core::w;
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        if !gfx::compose_windows() {
+            return; // no DirectComposition on this machine: the layered path above is the one that runs
+        }
+        let mut b = bar();
+        b.frame(&view(3), &live(0));
+        let p = b.frame(&view(3), &live(10_000));
+        // SAFETY: a popup that is never shown, destroyed again below.
+        unsafe {
+            let hw = CreateWindowExW(WINDOW_EX_STYLE(gfx::window_ex()), w!("STATIC"), None, WS_POPUP, 0, 0, 1, 1, None, None, None, None).expect("window");
+            assert!(b.surfaces().0.present(hw, 0, 0, 255), "the frame did not reach the window's visual");
+            gfx::shape(hw, b.shape());
+            gfx::commit();
+            assert_eq!(b.surfaces().0.size(), (p.win.2, p.win.3));
+            assert!(b.surfaces().0.pixels().is_empty(), "a composed frame lives on the GPU, not in a DIB");
+            // the GPU goes away: the next frame makes a device, surfaces and the window's visual anew, and the frame is shown again
+            gfx::lose_device();
+            assert!(!b.surfaces().0.is_current(), "the lost device took the pixels");
+            b.frame(&view(3), &live(10_016));
+            assert!(b.surfaces().0.is_current() && b.surfaces().0.present(hw, 0, 0, 255), "the frame after the loss did not reach the window");
+            gfx::commit();
+            let _ = DestroyWindow(hw);
+        }
+        gfx::compose_off();
+    }
+
+    #[test]
+    fn the_region_is_the_bar_and_a_column_over_each_lifted_icon() {
+        // a bottom bar: the 14 px strip above it gets a column per lifted icon, nothing else
+        let r = bar_region((0, 14, 1440, 54), 16, 14, &[(100, 160), (-5, 30), (1400, 1500)]);
+        assert_eq!(r[0], Rgn { x: 0, y: 14, w: 1440, h: 54, r: 16 });
+        assert_eq!(&r[1..], &[Rgn { x: 100, y: 0, w: 60, h: 14, r: 0 }, Rgn { x: 0, y: 0, w: 30, h: 14, r: 0 }, Rgn { x: 1400, y: 0, w: 40, h: 14, r: 0 }]);
+        // a side bar's window is the bar: no strip
+        assert_eq!(bar_region((0, 0, 54, 900), 16, 0, &[(0, 40)]), vec![Rgn { x: 0, y: 0, w: 54, h: 900, r: 16 }]);
+    }
+
+    #[test]
+    fn hovering_an_app_lifts_it_out_of_the_region_and_leaving_takes_it_back() {
+        let mut b = bar();
+        let v = view(8);
+        b.frame(&v, &live(0));
+        b.frame(&v, &live(10_000));
+        let at_rest = b.shape().map(<[Rgn]>::to_vec).expect("a shape at rest");
+        assert_eq!(at_rest, vec![Rgn { x: 0, y: 14, w: 1440, h: 54, r: 0 }], "a flat bar at rest: its rectangle, the strip above it clicks through");
+        // the pointer on app 3: its icon jumps up, and the column over it (the button and 10 px each side) is part of the region
+        let hot = Live { hot: 3, ..live(10_000) };
+        b.frame(&v, &hot);
+        b.frame(&v, &Live { now: 10_450, ..hot });
+        let r = b.layout().rect_of(3).expect("app 3");
+        let lifted = b.shape().map(<[Rgn]>::to_vec).expect("a shape");
+        assert_eq!(lifted.len(), 2, "the bar and one column over app 3 and its neighbours (they zoom a little too, the columns touch): {lifted:?}");
+        assert!(lifted.iter().any(|g| g.y == 0 && (g.x as f32) <= r.x - 10.0 && ((g.x + g.w) as f32) >= r.x + r.w + 10.0), "{lifted:?}");
+        // away again: the columns are gone once the icons are home
+        b.frame(&v, &Live { now: 10_450, ..live(10_450) });
+        b.frame(&v, &live(11_800));
+        assert_eq!(b.shape().map(<[Rgn]>::to_vec), Some(at_rest));
+        // the dock's and the floating bar's corners are round
+        let mut f = view(8);
+        f.style = Style::Floating;
+        b.frame(&f, &live(12_000));
+        assert_eq!(b.shape(), None, "the theme is changing: the whole window until it has settled");
+        b.frame(&f, &live(13_000));
+        assert_eq!(b.shape().map(|s| s[0].r), Some(16));
     }
 
     #[test]

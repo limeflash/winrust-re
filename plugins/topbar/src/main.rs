@@ -39,6 +39,7 @@ mod ui;
 mod vdesk;
 mod wins;
 mod render;
+mod selftest;
 mod pacing;
 mod notify;
 #[allow(dead_code)]
@@ -1110,7 +1111,7 @@ fn ease(t: f32) -> f32 {
 }
 
 unsafe fn now_ms() -> u64 {
-    GetTickCount64()
+    ui::anim::now_ms()
 }
 
 /// Eased 0..1 hover value of one element: glides toward `on` (1) / off (0) instead of jumping. Sets BUSY while it moves,
@@ -2493,6 +2494,11 @@ fn main() {
             render::bench();
             return;
         }
+        // `topbar --selftest [<dir>] [scene]`: the composed windows on a stage in the top left corner, checked against the layered path (selftest.rs)
+        if let Some(i) = std::env::args().position(|a| a == "--selftest") {
+            selftest::run(&std::env::args().skip(i + 1).collect::<Vec<_>>());
+            return;
+        }
         // `topbar --render-thumbs <file.png>`: whether DWM thumbnails show in the windows the panels are made of (see render.rs)
         if let Some(i) = std::env::args().position(|a| a == "--render-thumbs") {
             render::render_thumbs(&std::env::args().skip(i + 1).collect::<Vec<_>>());
@@ -2540,11 +2546,15 @@ fn main() {
         let class = wide("topbar");
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: class.as_ptr(), ..zeroed() };
         RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), bar_h(), null_mut(), null_mut(), hi, null());
-        // The floating styles' shadow: a click-through layered window right under the bar (see redraw())
+        // The windows are drawn by DirectComposition (no redirection bitmap, cut to what catches the mouse); without it (WINRUST_ULW=1,
+        // a machine that has none) they are layered windows painted with UpdateLayeredWindow, as before.
+        ui::gfx::compose_windows();
+        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | ui::gfx::window_ex(), class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), bar_h(), null_mut(), null_mut(), hi, null());
+        // The floating styles' shadow: a click-through window right under the bar (see redraw())
         let shc = wide("topbar_shadow");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: hi, lpszClassName: shc.as_ptr(), ..zeroed() });
-        SHADOW.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, shc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
+        SHADOW.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | ui::gfx::window_ex_through(), shc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
+        ui::gfx::through(whwnd(SHADOW.get()));
         UI.set(barui::Bar::new(SCALE.get()).ok());
         // Our own Shell_TrayWnd (hidden, topmost, so apps find it before explorer's): apps register their tray icons here.
         let tc = wide("Shell_TrayWnd");

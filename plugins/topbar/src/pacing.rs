@@ -34,6 +34,7 @@ fn run() {
     // away. Only an error, or several returns in a row with no wait at all (composition off: RDP, a broken driver), means
     // DwmFlush is not pacing anything; then fall back to a short sleep so the thread cannot spin.
     let mut instant = 0u32;
+    let mut last = Instant::now();
     loop {
         let start = Instant::now();
         // SAFETY: DwmFlush takes no arguments; it only blocks until the compositor's next frame.
@@ -44,6 +45,9 @@ fn run() {
         }
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
         if s.windows.is_empty() { s.running = false; return; }
+        // layered windows (no DirectComposition): a frame is a readback and a copy, 60 of them a second are plenty
+        if !crate::ui::gfx::composed_anywhere() && last.elapsed() < Duration::from_millis(15) { continue; }
+        last = Instant::now();
         s.windows.retain(|&hwnd, pending| {
             if !*pending {
                 *pending = true;

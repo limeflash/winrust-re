@@ -2,14 +2,14 @@
 //! `0 8px 24px` shadow, radius 8, padding 5×10, Inter 500 12 px) that fades in over .2 s and rises 6 px into place over .35 s
 //! (`SPRING`) once the pointer has rested .25 s, and fades out again when it leaves.
 //!
-//! [`Tip`] is the windowless core; [`show`] and [`hide`] drive the one real window (layered, click-through, never active).
+//! [`Tip`] is the windowless core; [`show`] and [`hide`] drive the one real window (click-through, never active; composed, or layered without DirectComposition).
 
 use std::cell::RefCell;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HWND_TOPMOST, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetWindowPos, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    KillTimer, SetTimer, SetWindowPos, ShowWindow, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use winrust_common::style::{self, Side};
 
@@ -63,7 +63,7 @@ pub struct Tip {
     pending: Option<(String, Place, u64, Option<u32>)>,
     hide_at: Option<u64>,
     surf: Surface,
-    painted: Option<(i32, i32, u32, u32)>,
+    painted: Option<(i32, i32, u32)>,
     at: (i32, i32),
 }
 
@@ -80,7 +80,7 @@ impl Tip {
             mv: Transition::new(SLIDE),
             pending: None,
             hide_at: None,
-            surf: Surface::new(),
+            surf: Surface::composed(),
             painted: None,
             at: (0, 0),
         }
@@ -128,9 +128,16 @@ impl Tip {
         self.mv.set(SLIDE, now, md, 0, SPRING);
     }
 
+    /// Something is moving: frames on every tick of the screen. Waiting (the hold of a readout) is not that: see [`Tip::wake`].
     #[must_use]
     pub fn busy(&self, now: u64) -> bool {
-        self.op.running(now) || self.mv.running(now) || self.hide_at.is_some() || self.pending.is_some()
+        self.op.running(now) || self.mv.running(now) || self.pending.is_some()
+    }
+
+    /// When the label has to be looked at again though nothing moves until then (it hides itself after its hold).
+    #[must_use]
+    pub const fn wake(&self) -> Option<u64> {
+        self.hide_at
     }
 
     /// Where the label's box rests, in DIPs on the screen.
@@ -146,8 +153,9 @@ impl Tip {
         }
     }
 
-    /// Paints the label at `now`. Returns the window rectangle in device pixels and whether the window should be shown.
-    pub fn frame(&mut self, g: &mut Gfx, now: u64) -> ((i32, i32, i32, i32), bool) {
+    /// Paints the label at `now`. Returns the window rectangle in device pixels, whether the window should be shown, and its
+    /// opacity (the fade is the window's, not repainted).
+    pub fn frame(&mut self, g: &mut Gfx, now: u64) -> ((i32, i32, i32, i32), bool, u8) {
         if self.hide_at.is_some_and(|t| now >= t) {
             self.hide(now);
         }
@@ -158,7 +166,7 @@ impl Tip {
             }
             if self.op.target() <= 0.0 && self.pending.is_none() {
                 self.lines.clear();
-                return ((0, 0, 0, 0), false);
+                return ((0, 0, 0, 0), false, 0);
             }
         }
         let s = self.scale;
@@ -171,26 +179,24 @@ impl Tip {
             Side::Left => (-m, 0.0),
             Side::Right => (m, 0.0),
         };
-        let key = (wx, wy, o.to_bits(), m.to_bits());
-        if self.painted != Some(key) {
+        let key = (ww, wh, m.to_bits());
+        if self.painted != Some(key) || !self.surf.is_current() {
             self.painted = Some(key);
             let (w, h) = self.size;
             let r = Rect::new(PAD + dx, PAD + dy, w, h);
             let lines = &self.lines;
             let _ = g.paint(&mut self.surf, ww, wh, |c: &mut Canvas<'_>| {
-                c.faded(o, |c| {
-                    c.shadow(r, 8.0, 8.0, 24.0, Rgba::css(0, 0, 0, 0.5));
-                    c.ring(r.inset(-1.0), 9.0, 1.0, Rgba::white(0.1));
-                    c.erase(r, 8.0);
-                    c.fill(r, 8.0, BG);
-                    for (i, l) in lines.iter().enumerate() {
-                        c.text(l, Rect::new(r.x + 10.0, r.y + 5.0 + LINE * i as f32, w - 20.0, LINE), FONT, INK, Align::Start);
-                    }
-                });
+                c.shadow(r, 8.0, 8.0, 24.0, Rgba::css(0, 0, 0, 0.5));
+                c.ring(r.inset(-1.0), 9.0, 1.0, Rgba::white(0.1));
+                c.erase(r, 8.0);
+                c.fill(r, 8.0, BG);
+                for (i, l) in lines.iter().enumerate() {
+                    c.text(l, Rect::new(r.x + 10.0, r.y + 5.0 + LINE * i as f32, w - 20.0, LINE), FONT, INK, Align::Start);
+                }
             });
         }
         self.at = (wx, wy);
-        ((wx, wy, ww, wh), true)
+        ((wx, wy, ww, wh), true, (255.0 * o.clamp(0.0, 1.0)).round() as u8)
     }
 
     #[must_use]
@@ -219,8 +225,7 @@ fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 fn now() -> u64 {
-    // SAFETY: plain query.
-    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    anim::now_ms()
 }
 
 /// Creates the label's window; `screen` is the primary monitor in device pixels.
@@ -231,7 +236,7 @@ pub fn init(hi: HINSTANCE, scale: f32, screen: (i32, i32)) -> bool {
     // SAFETY: window creation with a live, NUL-terminated class name.
     let wnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | super::gfx::window_ex_through(),
             name.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
@@ -248,6 +253,7 @@ pub fn init(hi: HINSTANCE, scale: f32, screen: (i32, i32)) -> bool {
     if wnd.is_null() {
         return false;
     }
+    super::gfx::through(super::panel::whwnd(wnd));
     HOST.set(Some(Host { tip: Tip::new(scale, screen), gfx, wnd, shown: false, timer: false }));
     true
 }
@@ -277,9 +283,10 @@ pub fn is_up() -> bool {
 
 impl Host {
     fn frame(&mut self, t: u64) {
-        let (rect, up) = self.tip.frame(&mut self.gfx, t);
+        let (rect, up, alpha) = self.tip.frame(&mut self.gfx, t);
         if up {
-            let _ = self.tip.surface().present(super::panel::whwnd(self.wnd), rect.0, rect.1, 255);
+            let _ = self.tip.surface().present(super::panel::whwnd(self.wnd), rect.0, rect.1, alpha);
+            super::gfx::commit();
             if !self.shown {
                 self.shown = true;
                 // SAFETY: showing our own window without activating it.
@@ -293,6 +300,13 @@ impl Host {
         let busy = self.tip.busy(t);
         self.timer = busy;
         crate::pacing::set(self.wnd as isize, busy);
+        // SAFETY: a timer on our own window: a one-shot for the end of the hold, which needs no frames until then.
+        unsafe {
+            match self.tip.wake() {
+                Some(at) => _ = SetTimer(self.wnd, 1, at.saturating_sub(t).max(1) as u32, None),
+                None => _ = KillTimer(self.wnd, 1),
+            }
+        }
     }
 }
 
@@ -301,6 +315,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         if crate::pacing::received(hwnd as isize) { with(|h| h.frame(now())); }
         return 0;
     }
+    if msg == WM_TIMER && wp == 1 {
+        // SAFETY: our own window's timer.
+        unsafe { KillTimer(hwnd, 1) };
+        with(|h| h.frame(now()));
+        return 0;
+    }
     // SAFETY: the default procedure of our own window.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_label_waiting_out_its_hold_asks_for_a_timer_not_for_frames() {
+        let mut t = Tip::new(1.0, (1440, 900));
+        t.hide_at = Some(5000);
+        assert!(!t.busy(1000), "nothing moves while the readout holds");
+        assert_eq!(t.wake(), Some(5000));
+        t.op.set(1.0, 1000, 200, 0, EASE);
+        assert!(t.busy(1100), "its fade in is motion");
+    }
 }

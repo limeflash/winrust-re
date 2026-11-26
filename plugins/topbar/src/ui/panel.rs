@@ -3,8 +3,9 @@
 //! A panel is a [`Content`]: it says how big it is, how it looks ([`Look`]), how it comes and goes ([`Entry`], [`Exit`]),
 //! draws itself in its own DIP coordinates and answers hit tests and clicks. Everything else is done here:
 //!
-//! * the window: one layered window with per-pixel alpha for the panel and, under it, a click-through window that holds the
-//!   shadow (so a click beside the panel reaches what is under it);
+//! * the window: one DirectComposition window for the panel (cut to its box once it stands still, so a click beside it reaches
+//!   what is under it; a layered window with per-pixel alpha where DirectComposition is not available) and, under it, a
+//!   click-through window that holds the shadow, and one for the scrim;
 //! * the glass: the screen under the panel is grabbed before the window is shown, blurred and saturated on the GPU and
 //!   painted under the tint; it stays where it was grabbed while the panel moves or scales;
 //! * the motion: the open and close animations of the mockup (`qsIn`'s translate/scale/opacity, the `clip-path` reveal from the
@@ -12,7 +13,7 @@
 //! * the input: hover, clicks (left, right, middle), arrows/Enter/Esc, closing on lost focus, and the guard against a panel
 //!   that was just closed by the focus loss being opened again by the click on its own bar button.
 //!
-//! [`Popup`] is the windowless core (state, geometry, painting into two surfaces); the functions at the bottom ([`init`],
+//! [`Popup`] is the windowless core (state, geometry, painting into its surfaces); the functions at the bottom ([`init`],
 //! [`open`], [`toggle`], [`close`]) bind it to real windows. `topbar --render-panel` drives [`Popup`] directly.
 //!
 //! A new panel: implement [`Content`], build it where its button is clicked, and call
@@ -34,13 +35,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, GetForegroundWindow, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MSGFLT_ALLOW,
     PostMessageW, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos,
     ShowWindow, WM_ACTIVATE, WM_CHAR, WM_DROPFILES, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WM_RBUTTONDOWN, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     WS_POPUP,
 };
 use winrust_common::style::{self, Anim, Side};
 
 use super::anim::{self, CubicBezier, EASE, POP, Transition};
-use super::gfx::{Canvas, Gfx, Picture, Rect, Rgba, Surface, Xf};
+use super::gfx::{self, Canvas, Gfx, Picture, Rect, Rgba, Rgn, Surface, Xf};
 use super::live::Thumbs;
 
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
@@ -659,6 +660,9 @@ pub struct Shown {
     pub shadow_gen: u32,
     /// The scrim's rectangle (the screen) and opacity.
     pub scrim: Option<((i32, i32, i32, i32), u8)>,
+    /// What of the panel window catches the mouse once it stands still: its box, rounded (a composed window has no per-pixel
+    /// hit test, so what is outside the box is cut away); `None` while it moves, or when the content draws beyond its box.
+    pub shape: Option<Rgn>,
     /// Another frame is needed.
     pub busy: bool,
     /// The exit has finished: the windows can go.
@@ -763,7 +767,6 @@ impl Popup {
         let (w, h) = content.size(g);
         let place = content.place(); // asked again: a content that finds its place from its size (the switcher) knows it now
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
-        g.target_for(bw, bh);
         let size = (bw as f32 / s, bh as f32 / s);
         let at = place_box(&anchor, (bw, bh), place, s);
         let b = anchor.button;
@@ -828,12 +831,12 @@ impl Popup {
             mo: Motion::default(),
             cap,
             glass: None,
-            surf: Surface::new(),
-            shade: Surface::new(),
+            surf: Surface::composed(),
+            shade: Surface::composed(),
             shade_h: -1.0,
             shade_cards: Vec::new(),
             shade_gen: 0,
-            scrim: Surface::new(),
+            scrim: Surface::composed(),
             scrim_done: false,
             screen: anchor.screen,
             last: Shown::default(),
@@ -1196,7 +1199,7 @@ impl Popup {
 
         // the shadow is painted once, at rest (again when the box changes its height); its opacity follows the panel's
         let cards = self.content.cards();
-        if (self.shade_h - h).abs() > 0.01 || self.shade_cards != cards {
+        if (self.shade_h - h).abs() > 0.01 || self.shade_cards != cards || (self.sh.2 > 0 && !self.shade.is_current()) {
             self.shade_h = h;
             self.shade_cards.clone_from(&cards);
             self.shade_gen += 1;
@@ -1218,7 +1221,7 @@ impl Popup {
 
         // the sheet that dims the screen: painted once, its opacity comes and goes with the panel
         let scrim = self.look.scrim.map(|sc| {
-            if !self.scrim_done {
+            if !self.scrim_done || !self.scrim.is_current() {
                 self.scrim_done = true;
                 let (sw, sh) = (self.screen.0, self.screen.1);
                 let _ = g.paint(&mut self.scrim, sw, sh, |c| c.fill(Rect::new(0.0, 0.0, sw as f32 / s, sh as f32 / s), 0.0, sc.color));
@@ -1289,6 +1292,11 @@ impl Popup {
 
         self.posed = Some((pose, (ox, oy)));
         let shadow_k = if pose.clip.is_some() { open } else { pose.opacity };
+        // standing still: the box (rounded), not the room around it that the motion needed; the window has no per-pixel hit test
+        let shape = (self.closing.is_none() && at_rest(&pose) && self.content.reach() <= 0.0).then(|| {
+            let px = |d: f32| (d * s).round() as i32;
+            Rgn { x: px(m), y: px(m), w: px(w), h: px(h), r: px(look.radius) }
+        });
         let shown = Shown {
             win: self.win,
             alpha: (255.0 * pose.opacity.clamp(0.0, 1.0)).round() as u8,
@@ -1296,6 +1304,7 @@ impl Popup {
             shadow_alpha: (255.0 * shadow_k.clamp(0.0, 1.0)).round() as u8,
             shadow_gen: self.shade_gen,
             scrim,
+            shape,
             busy: self.busy(now),
             done: self.finished(now),
             pulse: if self.closing.is_some() { 0 } else { self.content.pulse() },
@@ -1303,6 +1312,12 @@ impl Popup {
         self.last = shown;
         shown
     }
+}
+
+/// The pose has settled (the box is where it rests, fully opaque, nothing of it clipped).
+fn at_rest(p: &Pose) -> bool {
+    let clip = p.clip.is_none_or(|c| c.top.abs() + c.right.abs() + c.bottom.abs() + c.left.abs() < 0.01);
+    (p.opacity - 1.0).abs() < 1e-3 && p.dx.abs() < 0.01 && p.dy.abs() < 0.01 && (p.k - 1.0).abs() < 1e-3 && clip
 }
 
 /// The corner of the box nearest to its button, in the box's own coordinates (what `transform-origin: 100% 100%` means for a
@@ -1389,6 +1404,9 @@ struct Host {
     thumbs: Thumbs,
 }
 
+/// The self-test opens real panels on a stage and must not take the user's focus.
+pub(crate) static NO_FOCUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The panel window, for the threads that ask for a repaint (a search that finished, an icon that arrived).
 static PANEL: AtomicIsize = AtomicIsize::new(0);
 
@@ -1416,8 +1434,7 @@ fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 fn now() -> u64 {
-    // SAFETY: plain query.
-    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    anim::now_ms()
 }
 
 pub(super) fn whwnd(h: HWND) -> windows::Win32::Foundation::HWND {
@@ -1437,7 +1454,8 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
         register_class(hi, &name, Some(proc), true);
         register_class(hi, &shade, Some(DefWindowProcW), false);
         register_class(hi, &sheet, Some(DefWindowProcW), false);
-        let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+        let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | gfx::window_ex();
+        let through = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | gfx::window_ex_through();
         register_class(hi, &thumbs, Some(DefWindowProcW), false);
         let panel = CreateWindowExW(ex, name.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null());
         let live = CreateWindowExW(
@@ -1455,7 +1473,7 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
             std::ptr::null(),
         );
         let shadow = CreateWindowExW(
-            ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            through,
             shade.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
@@ -1469,7 +1487,7 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
             std::ptr::null(),
         );
         let scrim = CreateWindowExW(
-            ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            through,
             sheet.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
@@ -1482,6 +1500,8 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
             hi,
             std::ptr::null(),
         );
+        gfx::through(whwnd(shadow));
+        gfx::through(whwnd(scrim));
         // files dragged from a normal-rights window onto an elevated panel (the Start menu pins what is dropped on it)
         DragAcceptFiles(panel, 1);
         for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, 0x4A /* WM_COPYDATA */] {
@@ -1541,6 +1561,7 @@ pub fn open(content: Box<dyn Content>, anchor: Anchor) {
         let Host { gfx, grab, .. } = h;
         let mut grabber = |x, y, w, ht| if grab.grab(x, y, w, ht) { Some(grab.pixels().to_vec()) } else { None };
         let p = Popup::new(gfx, content, anchor, t, &mut grabber);
+        grab.free(); // the pixels went to the popup; a Task view's screen is 14 MB that nothing needs until the next opening
         let dims = p.has_scrim();
         let act = p.activates();
         h.popup = Some(p);
@@ -1562,7 +1583,7 @@ pub fn open(content: Box<dyn Content>, anchor: Anchor) {
             SetWindowPos(h.panel, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
         }
         h.stack();
-        if act {
+        if act && !NO_FOCUS.load(Relaxed) {
             winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
         }
         h.live();
@@ -1695,17 +1716,22 @@ impl Host {
         let (win, sh) = (shown.win, shown.shadow);
         let s = whwnd(self.shadow);
         let key = (sh.0, sh.1, sh.2, sh.3, shown.shadow_alpha, shown.shadow_gen);
-        if key != self.shown && sh.2 > 0 {
+        // (a composed surface skips what it already told its window, so it is presented every frame: nothing to save, and a
+        // surface made anew after a lost device finds its way to the window)
+        if (key != self.shown || gfx::composing()) && sh.2 > 0 {
             self.shown = key;
             let _ = p.surfaces().1.present(s, sh.0, sh.1, shown.shadow_alpha);
         }
         if let Some((r, a)) = shown.scrim
-            && a != self.scrim_shown
+            && (a != self.scrim_shown || gfx::composing())
         {
             self.scrim_shown = a;
             let _ = p.scrim_surface().present(whwnd(self.scrim), r.0, r.1, a);
         }
+        // the window is cut to its box before the frame that shows it (and uncut before the one that moves it)
+        gfx::shape(whwnd(self.panel), shown.shape.as_ref().map(std::slice::from_ref));
         let _ = p.surfaces().0.present(whwnd(self.panel), win.0, win.1, shown.alpha);
+        gfx::commit();
         let done = shown.done;
         if live && !done {
             self.live();
@@ -1738,7 +1764,7 @@ impl Host {
     }
 
     fn hide(&mut self) {
-        let had = self.popup.take().is_some();
+        let had = self.popup.take().is_some(); // its surfaces go off the windows' visuals with it
         self.timer(false);
         self.pulse(0);
         self.thumbs.clear();
@@ -1747,6 +1773,10 @@ impl Host {
             ShowWindow(self.panel, SW_HIDE);
             ShowWindow(self.shadow, SW_HIDE);
             ShowWindow(self.scrim, SW_HIDE);
+        }
+        if had {
+            gfx::commit();
+            gfx::trim(); // a closed panel gives its GPU memory back
         }
         if had {
             (self.notify)();
@@ -1973,6 +2003,42 @@ mod tests {
         p.close(500);
         assert!(p.is_closing());
         assert!(p.frame(&mut g, 600).done, "the tray has no exit animation");
+    }
+
+    #[test]
+    fn panel_shape_is_the_box_once_the_panel_stands_still() {
+        // SAFETY: COM for WIC on this test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).unwrap();
+        let anchor = Anchor { side: Side::Bottom, button: (1000, 846, 1032, 886), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
+        let mut p = Popup::new(&mut g, Box::new(TrayPanel::new(cells, |_, _, _| {})), anchor, 0, &mut grab);
+        let (_, _, w, h) = p.rect();
+        // coming in (the tray scales and fades): the whole window, the motion needs the room around the box
+        assert_eq!(p.frame(&mut g, 20).shape, None);
+        // standing: the box inside its room, with the panel's corner radius
+        let shown = p.frame(&mut g, 5000);
+        let m = (shown.win.2 - w) / 2;
+        assert!(m > 0 && shown.win.3 == h + 2 * m);
+        let r = shown.shape.expect("the tray stands still");
+        assert_eq!((r.x, r.y, r.w, r.h), (m, m, w, h));
+        assert!(r.r > 0);
+        // going out: the whole window again
+        p.close(5000);
+        assert_eq!(p.frame(&mut g, 5001).shape, None);
+    }
+
+    #[test]
+    fn panel_shape_of_a_dialog_is_the_whole_screen() {
+        // SAFETY: COM for WIC on this test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).unwrap();
+        let anchor = Anchor { side: Side::Bottom, button: (552, 852, 594, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
+        let mut p = Popup::new(&mut g, Box::new(crate::ui::power_popup::PowerPanel::new(crate::ui::power_popup::Kind::Restart, |_| {})), anchor, 0, &mut grab);
+        let shown = p.frame(&mut g, 5000);
+        let r = shown.shape.expect("a dialog stands still after its entry");
+        assert_eq!((r.w, r.h), (1440, 900), "the dialog's box is the screen");
     }
 
     #[test]

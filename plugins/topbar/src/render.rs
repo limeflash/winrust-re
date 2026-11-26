@@ -10,30 +10,45 @@ use ui::bar::Net;
 use ui::quick_popup as qp;
 use winrust_common::style::{Side, Style};
 
-/// Hidden window and per-frame timings for the same surfaces used by the live UI.
+/// Three windows far off the screen (a panel or the bar, its shadow, the scrim) and the per-frame timings of what the live UI
+/// does with its surfaces: composed windows (the live path) or, with `ulw`, layered ones.
 struct Bench {
-    hwnd: HWND,
+    win: [HWND; 3],
     draw: Vec<f64>,
     end: Vec<f64>,
     present: Vec<f64>,
+    total: Vec<f64>,
+    /// What the GPU still needed after the CPU was done (composed windows only; a layered frame waits for it in `end`).
+    gpu: Vec<f64>,
 }
 
 impl Bench {
     unsafe fn new() -> Self {
-        let hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, wide("STATIC").as_ptr(), null(), WS_POPUP,
-            -5000, -5000, 1, 1, null_mut(), null_mut(), GetModuleHandleW(null()), null());
-        assert!(!hwnd.is_null(), "benchmark window creation failed: {}", GetLastError());
-        Self { hwnd, draw: Vec::new(), end: Vec::new(), present: Vec::new() }
+        let make = |ex: u32| {
+            let h = CreateWindowExW(ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wide("STATIC").as_ptr(), null(), WS_POPUP, -5000, -5000, 1, 1, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+            assert!(!h.is_null(), "benchmark window creation failed: {}", GetLastError());
+            h
+        };
+        let (a, b, c) = (make(ui::gfx::window_ex()), make(ui::gfx::window_ex_through()), make(ui::gfx::window_ex_through()));
+        ui::gfx::through(whwnd(b));
+        ui::gfx::through(whwnd(c));
+        for h in [a, b, c] {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        Self { win: [a, b, c], draw: Vec::new(), end: Vec::new(), present: Vec::new(), total: Vec::new(), gpu: Vec::new() }
     }
 
-    fn record(&mut self, elapsed: std::time::Duration, end: std::time::Duration, present: std::time::Duration) {
+    fn record(&mut self, elapsed: std::time::Duration, end: std::time::Duration, present: std::time::Duration, gpu: std::time::Duration) {
+        self.gpu.push(gpu.as_secs_f64() * 1000.0);
         self.draw.push(elapsed.saturating_sub(end).as_secs_f64() * 1000.0);
         self.end.push(end.as_secs_f64() * 1000.0);
         self.present.push(present.as_secs_f64() * 1000.0);
+        self.total.push((elapsed + present).as_secs_f64() * 1000.0);
     }
 
-    fn show(&self, surface: &ui::gfx::Surface, alpha: u8) {
-        assert!(surface.present(whwnd(self.hwnd), -5000, -5000, alpha), "UpdateLayeredWindow failed in benchmark");
+    /// Puts `surface` on window `slot` (0 the panel or bar, 1 its shadow, 2 the scrim) as the live UI does.
+    fn show(&self, slot: usize, surface: &ui::gfx::Surface, alpha: u8) {
+        assert!(surface.present(whwnd(self.win[slot]), -5000, -5000, alpha), "presenting a frame failed in benchmark");
     }
 
     fn report(&mut self, name: &str) {
@@ -41,13 +56,25 @@ impl Bench {
             v.sort_by(f64::total_cmp);
             (v.iter().sum::<f64>() / v.len() as f64, v[(v.len() * 95).div_ceil(100) - 1], v[v.len() - 1])
         }
-        let (a, b, c) = (stats(&mut self.draw), stats(&mut self.end), stats(&mut self.present));
-        println!("{name:10} | {:7.3} {:7.3} {:7.3} | {:7.3} {:7.3} {:7.3} | {:7.3} {:7.3} {:7.3}", a.0, a.1, a.2, b.0, b.1, b.2, c.0, c.1, c.2);
+        let (a, b, c, t, g) = (stats(&mut self.draw), stats(&mut self.end), stats(&mut self.present), stats(&mut self.total), stats(&mut self.gpu));
+        let (ws, private) = memory();
+        println!("{name:13} | {:6.3} {:6.3} {:7.3} | {:6.3} {:6.3} {:7.3} | {:6.3} {:6.3} {:7.3} | {:6.3} {:6.3} {:7.3} | {:6.3} {:6.3} {:7.3} | {ws:4.0} {private:4.0}", a.0, a.1, a.2, b.0, b.1, b.2, c.0, c.1, c.2, t.0, t.1, t.2, g.0, g.1, g.2);
     }
 }
 
 impl Drop for Bench {
-    fn drop(&mut self) { unsafe { DestroyWindow(self.hwnd); } }
+    fn drop(&mut self) { unsafe { for h in self.win { DestroyWindow(h); } } }
+}
+
+/// This process's working set and private bytes, MB.
+pub(crate) fn memory() -> (f64, f64) {
+    // SAFETY: a plain query into a local.
+    unsafe {
+        let mut c: windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS = zeroed();
+        c.cb = size_of::<windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS>() as u32;
+        windows_sys::Win32::System::ProcessStatus::K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb);
+        (c.WorkingSetSize as f64 / 1_048_576.0, c.PagefileUsage as f64 / 1_048_576.0)
+    }
 }
 
 pub(crate) unsafe fn bench() {
@@ -58,7 +85,12 @@ pub(crate) unsafe fn bench() {
     // SAFETY: single-threaded here, before any other thread exists that could read the environment.
     unsafe { std::env::set_var("ProgramData", &scratch) };
     i18n::style::set_anim(i18n::style::Anim::Full);
-    println!("surface    | draw mean     p95     max | EndDraw mean    p95     max | present mean    p95     max (ms)");
+    // the live path (composed windows) unless `ulw` asks for the layered ones; `topbar --bench [ulw]`
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let ulw = std::env::args().any(|a| a == "ulw");
+    let composed = !ulw && ui::gfx::compose_windows();
+    println!("{} windows; ms per frame, mean / p95 / max; memory in MB: working set, private", if composed { "composed" } else { "layered" });
+    println!("surface       | encode  mean    p95     max |    end  mean    p95     max | present mean    p95     max |  total  mean    p95     max |    gpu  mean    p95     max |   ws priv");
     for name in ["bar", "settings", "start", "quick", "search", "taskview", "power-restart"] {
         render_panel(&["unused.png".into(), name.into(), "width=2560".into(), "height=1440".into(), "bench".into()]);
     }
@@ -66,7 +98,7 @@ pub(crate) unsafe fn bench() {
 }
 
 /// What the mockup's bar holds: name, colour of its indicators, windows, an exe whose icon stands in for the brand's.
-const APPS: [(&str, u32, usize, &str); 8] = [
+pub(crate) const APPS: [(&str, u32, usize, &str); 8] = [
     ("Claude", 0xe58a66, 1, r"C:\Windows\System32\mspaint.exe"),
     ("File manager", 0xf6c453, 2, r"C:\Windows\explorer.exe"),
     ("Microsoft Edge", 0x3cc4f2, 3, r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
@@ -96,7 +128,7 @@ fn key_of(name: &str) -> i32 {
 }
 
 /// Alpha-blends a premultiplied BGRA layer onto an opaque canvas, `alpha` being the window's constant alpha.
-fn blend(dst: &mut [u32], (dw, dh): (i32, i32), src: &[u32], sw: i32, (x, y): (i32, i32), alpha: u8) {
+pub(crate) fn blend(dst: &mut [u32], (dw, dh): (i32, i32), src: &[u32], sw: i32, (x, y): (i32, i32), alpha: u8) {
     for sy in 0..src.len() as i32 / sw.max(1) {
         let ty = y + sy;
         if ty < 0 || ty >= dh {
@@ -509,18 +541,31 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     };
     if benchmarking && what == "bar" {
         let mut bench = Bench::new();
-        for i in 0..120 {
+        for i in 0..240 {
+            // the pointer sweeps the app buttons, a new one every 60 ms: icons jump, plates grow, the column set changes
+            let hot = 1 + (i / 15) as i32 % 8;
+            windows_sys::Win32::Graphics::Dwm::DwmFlush(); // frames start on the compositor's tick, as the live ones do; a commit that outruns it would block
             ui::gfx::bench_start();
             let start = std::time::Instant::now();
-            let p = bar.frame(&view, &barui::Live { now: i * 4, ..lit });
+            let p = bar.frame(&view, &barui::Live { now: i * 4, hot, ..lit });
             let elapsed = start.elapsed();
             let end = ui::gfx::bench_end();
             let start = std::time::Instant::now();
-            bench.show(bar.surfaces().0, p.alpha);
-            if p.shadow.is_some() { bench.show(bar.surfaces().1, p.shadow_alpha); }
-            bench.record(elapsed, end, start.elapsed());
+            ui::gfx::shape(whwnd(bench.win[0]), bar.shape());
+            bench.show(0, bar.surfaces().0, p.alpha);
+            if p.shadow.is_some() { bench.show(1, bar.surfaces().1, p.shadow_alpha); }
+            ui::gfx::commit();
+            let present = start.elapsed();
+            bench.record(elapsed, end, present, ui::gfx::gpu_wait());
         }
         bench.report("bar");
+        // at rest nothing asks for a frame: the pointer leaves, the last motion ends, and the bar says it is not busy
+        let (mut t, mut busy) = (240 * 4, true);
+        while busy && t < 240 * 4 + 6000 {
+            busy = bar.frame(&view, &barui::Live { now: t, hot: NONE, ..lit }).busy;
+            t += 16;
+        }
+        println!("  bar at rest: {}", if busy { "STILL ASKING FOR FRAMES after 6 s".to_string() } else { format!("no frame wanted {} ms after the pointer left", t - 240 * 4) });
         return;
     }
     bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
@@ -583,16 +628,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let crop = if what == "toast" {
         let mut toast = ui::toast::Toast::new(scale, (sw, sh));
         toast.show(&mut gfx, text, side, (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3), 0);
-        let (win, _) = toast.frame(&mut gfx, t);
-        blend(&mut canvas, (sw, sh), toast.surface().pixels(), win.2, (win.0, win.1), 255);
+        let (win, _, alpha) = toast.frame(&mut gfx, t);
+        blend(&mut canvas, (sw, sh), toast.surface().pixels(), win.2, (win.0, win.1), alpha);
         around(win)
     } else if what == "tip" {
         let mut tip = ui::tip::Tip::new(scale, (sw, sh));
         let text = ["Claude", "File manager", "Microsoft Edge", "Spotify", "Task Manager", "Outlook", "Discord", "Telegram"][(at.max(1) as usize - 1) % 8];
         let along = if side == Side::Bottom { (r.0 + r.2) / 2 } else { (r.1 + r.3) / 2 };
         tip.show(&mut gfx, text, ui::tip::Place::button(side, r, along, scale), 0, 250, None);
-        let (win, _) = tip.frame(&mut gfx, t);
-        blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
+        let (win, _, alpha) = tip.frame(&mut gfx, t);
+        blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), alpha);
         around(win)
     } else {
         let content: Box<dyn ui::panel::Content> = if what == "quick" || what == "wifi" {
@@ -719,18 +764,28 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         if benchmarking {
             let mut bench = Bench::new();
             for i in 0..120 {
+                windows_sys::Win32::Graphics::Dwm::DwmFlush();
                 ui::gfx::bench_start();
                 let start = std::time::Instant::now();
                 let shown = popup.frame(&mut gfx, i * 4);
                 let elapsed = start.elapsed();
                 let end = ui::gfx::bench_end();
                 let start = std::time::Instant::now();
-                if let Some((_, alpha)) = shown.scrim { bench.show(popup.scrim_surface(), alpha); }
-                if shown.shadow.2 > 0 && shown.shadow.3 > 0 { bench.show(popup.surfaces().1, shown.shadow_alpha); }
-                bench.show(popup.surfaces().0, shown.alpha);
-                bench.record(elapsed, end, start.elapsed());
+                if let Some((_, alpha)) = shown.scrim { bench.show(2, popup.scrim_surface(), alpha); }
+                if shown.shadow.2 > 0 && shown.shadow.3 > 0 { bench.show(1, popup.surfaces().1, shown.shadow_alpha); }
+                ui::gfx::shape(whwnd(bench.win[0]), shown.shape.as_ref().map(std::slice::from_ref));
+                bench.show(0, popup.surfaces().0, shown.alpha);
+                ui::gfx::commit();
+                let present = start.elapsed();
+                bench.record(elapsed, end, present, ui::gfx::gpu_wait());
             }
             bench.report(&what);
+            let (mut t, mut busy) = (120 * 4, true);
+            while busy && t < 120 * 4 + 6000 {
+                busy = popup.frame(&mut gfx, t).busy;
+                t += 16;
+            }
+            println!("  {what} at rest: {}", if busy { "still asks for frames after 6 s (a content that animates by itself)".to_string() } else { format!("no frame wanted {} ms after the opening", t) });
             return;
         }
         let _ = popup.frame(&mut gfx, base); // the first frame stamps what opens with the panel (the rising blocks of the first page)
@@ -757,8 +812,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             let mut tip = ui::tip::Tip::new(scale, (sw, sh));
             let place = ui::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * scale).round() as i32 };
             tip.show(&mut gfx, &text, place, 0, 0, None);
-            let (win, _) = tip.frame(&mut gfx, 5000);
-            blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
+            let (win, _, alpha) = tip.frame(&mut gfx, 5000);
+            blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), alpha);
         }
         if whole { (0, 0, sw, sh) } else { around(popup.rect()) }
     };
@@ -898,12 +953,12 @@ type Hi = windows::Win32::UI::WindowsAndMessaging::HICON;
 
 const DEMO_EXES: [&str; 3] = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Windows\explorer.exe", r"C:\Windows\System32\notepad.exe"];
 
-fn demo_icon(icon: &dyn Fn(&str) -> Hi, i: usize) -> Hi {
+pub(crate) fn demo_icon(icon: &dyn Fn(&str) -> Hi, i: usize) -> Hi {
     let ic = icon(DEMO_EXES[i % 3]);
     if ic.0.is_null() { icon(r"C:\Windows\System32\notepad.exe") } else { ic }
 }
 
-fn demo_jump(side: Side, n_wins: usize, recent: bool, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui::panel::Content> {
+pub(crate) fn demo_jump(side: Side, n_wins: usize, recent: bool, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui::panel::Content> {
     use ui::jump::{Act, Data, JumpPanel, Recent, Win};
     let titles = ["Lemxy/WinRust \u{b7} GitHub", "heydamir/unslop \u{b7} GitHub", "New Tab"];
     let wins: Vec<Win> = (0..n_wins.min(3)).map(|i| Win { hwnd: i as isize + 1, title: titles[i].into(), active: i == 0 }).collect();
@@ -945,7 +1000,7 @@ fn demo_preview(n_wins: usize, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui
     Box::new(PreviewPanel::new(cards, demo_icon(icon, 0), ui::gfx::Rgba::hex(color), false, |_| {}))
 }
 
-fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
+pub(crate) fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
     use std::rc::Rc;
     use ui::taskview::{Desk, OwnedIcon, TaskView, WinCard};
     let fr = |l: f32, t: f32, w: f32, h: f32| ((l * scale) as i32, (t * scale) as i32, ((l + w) * scale) as i32, ((t + h) * scale) as i32);
