@@ -73,9 +73,12 @@ impl Mic {
             level.store(0f32.to_bits(), Ordering::Relaxed);
             if com { CoUninitialize(); }
         }).map_err(|e| e.to_string())?;
-        match init.recv() {
+        // a device that never answers must not hold the recording: the thread is left to end by itself (its `ready.send`
+        // then fails and it stops the client; `stop` makes it leave its loop if it got that far)
+        match init.recv_timeout(Duration::from_secs(4)) {
             Ok(Ok(())) => Ok(Self { stop, thread: Some(thread), packets }),
             Ok(Err(e)) => { let _ = thread.join(); Err(e) },
+            Err(mpsc::RecvTimeoutError::Timeout) => { stop.store(true, Ordering::Release); Err("Microphone did not start in time".into()) },
             Err(_) => { let _ = thread.join(); Err("Microphone thread ended during start".into()) },
         }
     }

@@ -95,8 +95,11 @@ unsafe fn run_inner(options: &RecOptions, size: (u32, u32), stop: &AtomicBool, l
     // Declared in the order they are released backwards: encoder first (finalized), then the capture and its D3D device.
     let capture = Capture::new(options.area, size.0, size.1)?;
     let mut writer = Writer::new(&options.out, size.0, size.1, options.fps, options.mic, Some(&capture.device))?;
+    let mut mic_failed = false;
     let started = (|| -> Result<(Option<Mic>, i64, Instant), String> {
-        let mic = if options.mic { Some(Mic::start(level)?) } else { None };
+        // no microphone, a privacy-blocked one or one that does not answer must not stop the screen recording: it goes on
+        // with a silent audio track (counted as a lost microphone in the stats)
+        let mic = if options.mic { Mic::start(level).map_err(|_| mic_failed = true).ok() } else { None };
         // the first picture before the clock starts, so the file does not open on a black frame
         let wait = Instant::now();
         while !capture.update(&mut pixels)? && wait.elapsed() < Duration::from_millis(1000) { thread::sleep(Duration::from_millis(10)); }
@@ -111,7 +114,7 @@ unsafe fn run_inner(options: &RecOptions, size: (u32, u32), stop: &AtomicBool, l
     };
     if ready.take().unwrap().send(Ok(start)).is_err() { drop(writer); let _ = std::fs::remove_file(&options.out); return Err("Recorder was dropped during start".into()); }
 
-    let mut audio = Audio { mic, aligner: Aligner::default(), origin, failed: false };
+    let mut audio = Audio { mic, aligner: Aligner::default(), origin, failed: mic_failed };
     let mut stats = RecStats { has_audio: options.mic, ..Default::default() };
     let (next, result) = pump(&Clock { fps, start, stop }, &mut pixels, &mut |p| capture.update(p), &writer, &mut audio, &mut stats);
     // Everything below runs on success and on error alike: the file is closed with what was recorded.

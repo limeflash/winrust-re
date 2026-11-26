@@ -274,7 +274,20 @@ unsafe fn bitmap_of(px: &[u32], w: i32, h: i32) -> HBITMAP {
 fn temp_png(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("winrust-snip");
     let _ = std::fs::create_dir_all(&dir);
+    // previews and cover pictures only live as long as the notification that shows them: anything a day old is stale (once per run)
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| sweep_old(&dir, Duration::from_secs(24 * 3600)));
     dir.join(format!("{tag}-{}.png", unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }))
+}
+
+/// Deletes the files of `dir` last written more than `age` ago.
+fn sweep_old(dir: &std::path::Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        if e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|t| t > age) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Saves what was taken and tells the bar (its own thread: the encoder and the clipboard take a moment).
@@ -333,9 +346,10 @@ unsafe fn show(h: HWND, activate: bool) {
 
 impl View {
     fn new(m: Mon, mon: usize, class: &str, ex: u32, interactive: bool) -> Option<Self> {
+        let gfx = Gfx::new(m.scale).ok()?; // before the window: a failure here must not leave a topmost window behind
         // SAFETY: window creation on this thread.
         let hwnd = unsafe { make_window(class, ex, m.rect, interactive)? };
-        Some(Self { hwnd, mon, gfx: Gfx::new(m.scale).ok()?, surf: Surface::composed(), pic: None, shown: false })
+        Some(Self { hwnd, mon, gfx, surf: Surface::composed(), pic: None, shown: false })
     }
 }
 
@@ -399,6 +413,9 @@ struct Host {
     pick: Option<Pick>,
     count: Option<Count>,
     rec: Option<Rec>,
+    /// A recording is being started on a thread of its own (the microphone and the first picture can take a while): the flag is
+    /// set when Esc cancels it. The overlay thread stays alive meanwhile.
+    starting: Option<std::sync::Arc<AtomicBool>>,
 }
 
 thread_local! {
@@ -430,7 +447,7 @@ fn thread_main() {
             l.queue.clear();
             return;
         }
-        HOST.set(Some(Host { ctl, pick: None, count: None, rec: None }));
+        HOST.set(Some(Host { ctl, pick: None, count: None, rec: None, starting: None }));
         {
             let mut l = LINK.lock().unwrap_or_else(|e| e.into_inner());
             l.hwnd = ctl as isize;
@@ -497,7 +514,7 @@ fn cursor_pos() -> (i32, i32) {
 
 impl Host {
     fn idle(&self) -> bool {
-        self.pick.is_none() && self.count.is_none() && self.rec.is_none()
+        self.pick.is_none() && self.count.is_none() && self.rec.is_none() && self.starting.is_none()
     }
 
     /// Wants a frame at the screen's next tick.
@@ -513,6 +530,12 @@ impl Host {
             Cmd::ToggleRec => self.open(Kind::Rec),
             Cmd::StopRec => self.stop_rec(),
             Cmd::Cancel => {
+                if let Some(cancelled) = &self.starting {
+                    cancelled.store(true, Relaxed); // the recording that is starting is thrown away when it is up
+                    if let Some(p) = &mut self.pick {
+                        p.snip.counting = false;
+                    }
+                }
                 if self.count.is_some() {
                     self.drop_count();
                 }
@@ -522,6 +545,9 @@ impl Host {
     }
 
     unsafe fn open(&mut self, kind: Kind) {
+        if self.starting.is_some() {
+            return;
+        }
         if self.count.is_some() {
             return self.command(Cmd::Cancel); // a second press of the key during the countdown cancels it
         }
@@ -895,14 +921,47 @@ impl Host {
             }
             ok.then(|| path.to_string_lossy().into_owned())
         };
-        let recorder = match rec::Recorder::start(rec::RecOptions { area: (area.l, area.t, area.r, area.b), mic: opts.mic, out: rec::default_path(), fps: 30 }) {
-            Ok(r) => r,
+        // Recorder::start waits for the microphone and the first picture: not on the overlay's thread, or a stuck device would freeze
+        // the picker (Esc included). It stays up, locked, until the recording is there; Esc throws the start away.
+        p.snip.counting = true;
+        p.snip.dirty = true;
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        self.starting = Some(cancelled.clone());
+        let options = rec::RecOptions { area: (area.l, area.t, area.r, area.b), mic: opts.mic, out: rec::default_path(), fps: 30 };
+        let out = options.out.clone();
+        let spawned = thread::Builder::new().name("rec-start".into()).spawn(move || {
+            let recorder = rec::Recorder::start(options);
+            send(Cmd::Run(Box::new(move |h| unsafe { h.rec_started(recorder, out, cancelled, (area, m, opts.mic, opts.notify), thumb) })));
+        });
+        if spawned.is_err() {
+            self.starting = None;
+            outcome(Outcome::RecFailed("Cannot start the recording thread".into()));
+            self.end_pick(false);
+        }
+        self.request();
+    }
+
+    /// The answer of the start thread: the recording is up (or not) and the picker goes.
+    unsafe fn rec_started(&mut self, recorder: Result<rec::Recorder, String>, out: PathBuf, cancelled: std::sync::Arc<AtomicBool>, (area, m, mic, notify): (IRect, Mon, bool, bool), thumb: Option<String>) {
+        self.starting = None;
+        let recorder = match recorder {
+            Ok(r) if !cancelled.load(Relaxed) => r,
+            Ok(r) => {
+                // Esc came first: end it and take its file away, off this thread
+                thread::spawn(move || {
+                    let _ = r.stop();
+                    let _ = std::fs::remove_file(out);
+                });
+                return self.end_pick(false);
+            }
             Err(e) => {
-                outcome(Outcome::RecFailed(e));
+                if !cancelled.load(Relaxed) {
+                    outcome(Outcome::RecFailed(e));
+                }
                 return self.end_pick(false);
             }
         };
-        if !self.show_rec(Some(recorder), area, m, (opts.mic, opts.notify), thumb) {
+        if !self.show_rec(Some(recorder), area, m, (mic, notify), thumb) {
             return self.end_pick(false);
         }
         self.end_pick(true);
@@ -978,7 +1037,7 @@ impl Host {
         let _ = r.frame.surf.present(ui::panel::whwnd(r.frame.hwnd), fr.l, fr.t, 255);
         // the control: a box with room for its shadow, cut to the control itself so the rest does not catch the mouse
         let g = &mut r.pill.gfx;
-        let width = model::pill_width(&mut |s, f| g.measure(s, f), r.mic);
+        let width = model::pill_width(&mut |s, f| g.measure(s, f), r.mic, &view.time);
         let (wd, ht) = (((width + 2.0 * PAD) * k).round() as i32, ((44.0 + 2.0 * PAD) * k).round() as i32);
         let top = model::pill_top(r.area.dip(m.rect, k), m.rect.h() as f32 / k, r.area == m.rect);
         let (x, y) = (m.rect.l + ((m.rect.w() - (width * k).round() as i32) / 2) - (PAD * k).round() as i32, m.rect.t + (top * k).round() as i32 - (PAD * k).round() as i32);
@@ -1006,7 +1065,7 @@ impl Host {
         let Some(r) = &mut self.rec else { return false };
         let m = r.mon;
         let g = &mut r.pill.gfx;
-        let s = model::stop_rect(&mut |t, f| g.measure(t, f), r.mic);
+        let s = model::stop_rect(&mut |t, f| g.measure(t, f), r.mic, &r.last);
         let (dx, dy) = (x as f32 / m.scale - PAD, y as f32 / m.scale - PAD);
         let over = s.contains(dx, dy);
         let was = r.hot;
@@ -1308,7 +1367,7 @@ pub(crate) unsafe fn render(args: &[String]) {
             let ad = area.dip(fr, scale);
             let _ = gfx.paint(&mut s1, fr.w(), fr.h(), |c| model::paint_rec_frame(c, ad, &view, base + t));
             crate::render::blend(&mut out, (w, h), s1.pixels(), fr.w(), (fr.l, fr.t), 255);
-            let width = model::pill_width(&mut |s, f| gfx.measure(s, f), !flag("nomic"));
+            let width = model::pill_width(&mut |s, f| gfx.measure(s, f), !flag("nomic"), "0:00");
             let (wd, ht) = (((width + 2.0 * PAD) * scale).round() as i32, ((44.0 + 2.0 * PAD) * scale).round() as i32);
             let top = model::pill_top(area.dip(m.rect, scale), 900.0, false);
             let mut s2 = Surface::new();
@@ -1374,7 +1433,7 @@ pub(crate) unsafe fn smoke(args: &[String]) {
     let dimmed = |c: (i32, i32, i32)| ((c.0 + 5) / 2, (c.1 + 7) / 2, (c.2 + 12) / 2);
     let (l, r) = (pixel(40, 200), pixel(440, 200));
     check("the frozen picture shows, dimmed", near(l, dimmed(red), 8) && near(r, dimmed(blue), 8), format!("left {l:?} want {:?}, right {r:?} want {:?}", dimmed(red), dimmed(blue)));
-    let bar = pixel(240, 40);
+    let bar = pixel(388, 40); // glass between the mode buttons and the gear: the 480-wide stage is narrower than the toolbar, which then keeps its right end on it
     check("the toolbar is drawn over it", bar.0 < 60 && bar.1 < 60 && bar.2 < 70, format!("{bar:?}"));
     // drag a selection through the handlers
     let (tx, rx) = mpsc::channel();
@@ -1416,8 +1475,8 @@ pub(crate) unsafe fn smoke(args: &[String]) {
     check("the frame's ring is red just outside the area", near(ring, (229, 72, 77), 24), format!("{ring:?}"));
     // the control: centred at the top, its Stop button is red
     let mut gfx = Gfx::new(1.0).expect("the renderer");
-    let width = model::pill_width(&mut |s, f| gfx.measure(s, f), true);
-    let stop = model::stop_rect(&mut |s, f| gfx.measure(s, f), true);
+    let width = model::pill_width(&mut |s, f| gfx.measure(s, f), true, "0:00");
+    let stop = model::stop_rect(&mut |s, f| gfx.measure(s, f), true, "0:00");
     let x0 = ((480.0 - width) / 2.0).round();
     let at = pixel((x0 + stop.x + 3.0) as i32, (16.0 + stop.cy()) as i32);
     check("the control's Stop button is red", near(at, (229, 72, 77), 24), format!("{at:?} at {:.0},{:.0}", x0 + stop.x + 3.0, 16.0 + stop.cy()));

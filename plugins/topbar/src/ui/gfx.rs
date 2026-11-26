@@ -783,12 +783,10 @@ pub struct Rgn {
 }
 
 /// Cuts a composed window to the union of `parts` (what is outside neither shows nor catches the mouse) or, with `None`, gives
-/// it back whole. A rounded part is one pixel wider on every side, so the smooth edge of what is drawn is not clipped. Does
-/// nothing while the windows are layered (their transparent pixels click through anyway), and only when the shape changed.
+/// it back whole. A rounded part is one pixel wider on every side, so the smooth edge of what is drawn is not clipped. Only when
+/// the shape changed. Layered windows (`WINRUST_ULW=1`) are cut too: their faint shadow pixels are not transparent enough to
+/// click through, so a control with a wide shadow margin would swallow the clicks round it.
 pub fn shape(hwnd: HWND, parts: Option<&[Rgn]>) {
-    if !composing() {
-        return;
-    }
     let (key, parts) = (hwnd.0 as isize, parts.filter(|p| !p.is_empty()).map(<[Rgn]>::to_vec));
     if SHAPES.with_borrow(|m| m.get(&key) == Some(&parts)) {
         return;
