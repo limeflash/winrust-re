@@ -326,16 +326,24 @@ pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32
     let gap_left = if vert { 2.0 } else { 0.0 };
     let mut gs = groups(g, v, &sh, None, clock_extra);
     let (mut l1, mut l2, mut l3) = (group_len(&gs[0], gap_left), group_len(&gs[1], gap_mid), group_len(&gs[2], gap_right));
-    // too long for the bar: the app buttons give way (ponytail: no scrolling when even the shrunk buttons do not fit)
+    // too long for the bar: the app buttons give way, first by shrinking, then (nothing to scroll to yet: ponytail, an overflow
+    // menu would be the way) the last ones are left off, so that nothing overlaps the right group or leaves the screen. The dock
+    // is as long as its content, so its limit is the screen.
     let pad = if dock { 8.0 } else { 10.0 };
-    if let Some(len) = bar_len {
-        let room = len - 2.0 * pad - l1 - l3 - if !vert && v.align_left { 12.0 } else { 0.0 };
-        let n = v.apps.len();
-        if n > 0 && l2 > room {
-            let cur = gs[1][4].main;
-            let shrink = ((l2 - room) / n as f32).ceil();
-            gs = groups(g, v, &sh, Some((cur - shrink).max(20.0)), clock_extra);
-            (l1, l2, l3) = (group_len(&gs[0], gap_left), group_len(&gs[1], gap_mid), group_len(&gs[2], gap_right));
+    let n = v.apps.len();
+    let room = match bar_len {
+        Some(len) => len - 2.0 * pad - l1 - l3 - if !vert && v.align_left { 12.0 } else { 0.0 },
+        None if (if vert { v.screen.1 } else { v.screen.0 }) > 0.0 => (if vert { v.screen.1 } else { v.screen.0 }) - 2.0 * pad - l1 - l3 - 40.0, // 40: the dock's own spacers, and some air
+        None => f32::INFINITY,
+    };
+    if n > 0 && l2 > room {
+        let cur = gs[1][4].main;
+        let shrink = ((l2 - room) / n as f32).ceil();
+        gs = groups(g, v, &sh, Some((cur - shrink).max(20.0)), clock_extra);
+        (l1, l2, l3) = (group_len(&gs[0], gap_left), group_len(&gs[1], gap_mid), group_len(&gs[2], gap_right));
+        while l2 > room && gs[1].len() > 4 {
+            gs[1].pop();
+            l2 = group_len(&gs[1], gap_mid);
         }
     }
 

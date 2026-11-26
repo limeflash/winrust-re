@@ -675,7 +675,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             });
         }
         WM_CHAR => {
-            if let Some(ch) = char::from_u32(wp as u32).filter(|c| *c >= ' ' || matches!(c, '\u{8}')) {
+            if let Some(ch) = super::panel::wm_char(wp).filter(|c| *c >= ' ' || matches!(c, '\u{8}')) {
                 input(|s, _| {
                     s.text(ch);
                     true

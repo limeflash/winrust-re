@@ -862,8 +862,29 @@ struct Device {
     brush: ID2D1SolidColorBrush,
     icons: HashMap<usize, ID2D1Bitmap>,
     shadows: HashMap<[u32; 6], (ID2D1Bitmap, f32)>,
+    /// The last number of `RETIRED` this device has applied to `icons` and `shadows`.
+    retired: u64,
     /// Gradient stop collections by their stops (a separator's gradient is the same every frame).
     grads: HashMap<Vec<u32>, ID2D1GradientStopCollection>,
+}
+
+/// Icons destroyed by their owners, numbered in order. A handle value is reused by the next icon the system creates, so a cache
+/// keyed by it must drop an icon's bitmaps before that: every device applies what it has not seen at its next icon lookup.
+static RETIRED: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// An icon is about to be destroyed (call this before `DestroyIcon`, from any thread): its cached bitmaps and shadow go.
+pub fn retire_icon(icon: HICON) {
+    let mut r = RETIRED.lock().unwrap();
+    let n = r.last().map_or(1, |e| e.0 + 1);
+    r.push((n, icon.0 as usize));
+    if r.len() > 512 {
+        r.remove(0);
+    }
+}
+
+fn drop_icon(d: &mut Device, key: usize) {
+    d.icons.remove(&key);
+    d.shadows.retain(|k, _| !(k[5] == 1 && (k[0] as usize | (k[1] as usize) << 32) == key)); // the icon's silhouettes (`icon_shadow`)
 }
 
 type LayoutKey = (String, u32, u16, u32, bool, u32, u32, u8, bool);
@@ -913,6 +934,7 @@ impl Gfx {
     pub fn forget_icons(&mut self) {
         if let Some(d) = self.dev.as_mut() {
             d.icons.clear();
+            d.shadows.retain(|k, _| k[5] != 1);
         }
     }
 
@@ -945,7 +967,7 @@ impl Gfx {
                     },
                 )?;
                 ctx.SetTarget(&idle);
-                Device { epoch: d.epoch, cur: ctx.clone(), ctx, idle, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new(), grads: HashMap::new() }
+                Device { epoch: d.epoch, cur: ctx.clone(), ctx, idle, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new(), retired: 0, grads: HashMap::new() }
             };
             self.dev = Some(dev);
         }
@@ -1610,7 +1632,27 @@ impl Canvas<'_> {
         }
     }
 
+    /// Applies the icons retired since this device last looked.
+    fn sync_retired(&mut self) {
+        let dev = self.dev();
+        let log = RETIRED.lock().unwrap();
+        let latest = log.last().map_or(0, |e| e.0);
+        if dev.retired == latest {
+            return;
+        }
+        if log.first().is_some_and(|e| e.0 > dev.retired + 1) {
+            dev.icons.clear(); // the log was trimmed past what this device saw
+            dev.shadows.clear();
+        }
+        let seen = dev.retired;
+        for &(_, h) in log.iter().filter(|e| e.0 > seen) {
+            drop_icon(dev, h);
+        }
+        dev.retired = latest;
+    }
+
     fn bitmap_of(&mut self, icon: HICON) -> Option<ID2D1Bitmap> {
+        self.sync_retired();
         let key = icon.0 as usize;
         if let Some(b) = self.dev().icons.get(&key) {
             return Some(b.clone());
@@ -1657,6 +1699,7 @@ impl Canvas<'_> {
         if icon.is_invalid() || c.a <= 0.0 || r.w <= 0.0 {
             return;
         }
+        self.sync_retired();
         let (sigma, k) = (blur / 2.0, icon.0 as usize);
         let pad = (sigma * 3.0).ceil();
         let key = [k as u32, (k >> 32) as u32, r.w.to_bits(), sigma.to_bits(), c.a.to_bits(), 1];
@@ -1688,9 +1731,9 @@ impl Canvas<'_> {
         unsafe { ctx.DrawBitmap(&bmp, Some(&dst.d2d()), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None) };
     }
 
-    /// Drops the cached bitmap of an icon that is about to be destroyed.
+    /// Drops the cached bitmap and shadow of an icon that is about to be destroyed.
     pub fn forget_icon(&mut self, icon: HICON) {
-        self.dev().icons.remove(&(icon.0 as usize));
+        drop_icon(self.dev(), icon.0 as usize);
     }
 
     fn icon_bitmap(&mut self, icon: HICON) -> Option<ID2D1Bitmap> {
@@ -2008,6 +2051,11 @@ impl Canvas<'_> {
         }
     }
 
+    /// The picture was made on a device that has been lost since: it is not drawn, and must be made again.
+    pub fn picture_stale(&mut self, p: &Picture) -> bool {
+        p.epoch != self.dev().epoch
+    }
+
     /// Draws a baked picture with its top left corner at `(x, y)`, pixel for pixel.
     pub fn picture(&mut self, p: &Picture, x: f32, y: f32) {
         if p.epoch != self.dev().epoch {
@@ -2161,6 +2209,9 @@ impl Canvas<'_> {
     /// Like [`Canvas::picture_cover`], with the picture's own place in the box: `v` is the CSS `object-position` y (0 top, 1 bottom).
     pub fn picture_cover_at(&mut self, p: &Picture, r: Rect, radius: f32, opacity: f32, v: f32) {
         use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BRUSH_PROPERTIES};
+        if p.epoch != self.dev().epoch {
+            return; // made on a device that was lost since, as in `picture_cover`
+        }
         let rt = self.rt();
         let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
         let brush = D2D1_BRUSH_PROPERTIES { opacity, transform: Matrix3x2::translation(r.cx() - p.w / 2.0, r.y - (p.h - r.h) * v) };

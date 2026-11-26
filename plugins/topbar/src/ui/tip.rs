@@ -99,7 +99,7 @@ impl Tip {
         if self.op.value(now) > 0.02 && delay > 0 {
             // another label is still on its way out: this one waits for it, counting its delay from now
             self.pending = Some((text.to_string(), place, now + u64::from(delay), hold));
-            return self.hide(now);
+            return self.fade(now);
         }
         self.pending = None;
         self.lines = text.split('\n').map(str::to_string).collect();
@@ -116,8 +116,14 @@ impl Tip {
         self.painted = None;
     }
 
-    /// Fades the label out (`opacity .2s ease`; it also slides back down).
+    /// Fades the label out (`opacity .2s ease`; it also slides back down), and drops the one that waited for it: whoever hides
+    /// the tip has left the thing the waiting label was for.
     pub fn hide(&mut self, now: u64) {
+        self.pending = None;
+        self.fade(now);
+    }
+
+    fn fade(&mut self, now: u64) {
         self.hide_at = None;
         if self.op.target() <= 0.0 {
             return;
