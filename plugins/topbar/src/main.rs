@@ -251,7 +251,7 @@ unsafe fn tip_text(h: i32) -> String {
         POW_S => t!("Завершение работы", "Shut down", ja: "シャットダウン", pt: "Desligar", zh: "关机").into(),
         0 => "Start".into(),
         TAPP => "Hidden icons".into(),
-        GEAR => t!("Стиль", "Style", ja: "スタイル", pt: "Estilo", zh: "样式").into(),
+        GEAR => t!("Настройки панели", "Bar settings", ja: "バーの設定", pt: "Configurações da barra", zh: "任务栏设置").into(),
         SHOWDESK => t!("Показать рабочий стол", "Show desktop", ja: "デスクトップを表示", pt: "Mostrar a área de trabalho", zh: "显示桌面").into(),
         CLOCK => {
             let mut t: SYSTEMTIME = zeroed();
@@ -1614,12 +1614,11 @@ unsafe fn build_view() -> barui::View {
 unsafe fn build_live() -> barui::Live {
     let now = now_ms();
     let (pk, pt) = PRESS.get();
-    let menu_at = |key: i32| fly::menu_at().is_some_and(|cx| (cx - tip_cx(key)).abs() <= 3); // a menu that opened at that button
     barui::Live {
         now,
         hot: HOT.get(),
         press: if now.saturating_sub(pt) < 220 { pk } else { NONE },
-        gear: menu_at(GEAR),
+        gear: ui::panel::is_open(ui::panel::Id::Bar),
         start: ui::panel::is_open(ui::panel::Id::Start),
         search: ui::panel::is_open(ui::panel::Id::Search),
         qs: ui::panel::is_open(ui::panel::Id::Qs),
@@ -2309,7 +2308,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         }
         SHOWDESK if left => winrust_common::desktop::toggle(),
         POW_R | POW_S if left => power_click(h),
-        GEAR => style_menu(),
+        GEAR => settings_toggle(),
         TAPP..=-900 => {
             let slot = (h - TAPP) as usize;
             if slot == 0 {
@@ -2652,6 +2651,7 @@ fn main() {
         }
         ui::panel::init(hi, SCALE.get(), hwnd, panel_changed);
         ui::tip::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
+        ui::toast::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
         let swc = wide("topbar_alttab");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(sw_proc), hInstance: hi, lpszClassName: swc.as_ptr(), ..zeroed() });
         SWWND.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, swc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
