@@ -6,6 +6,13 @@
 
 use std::collections::HashMap;
 
+thread_local! {
+    static BENCH_END: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn bench_start() { BENCH_END.set(Some(std::time::Duration::ZERO)); }
+pub(crate) fn bench_end() -> std::time::Duration { BENCH_END.replace(None).unwrap_or_default() }
+
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
@@ -20,7 +27,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
     D2D1_SHADOW_PROP_COLOR, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
     D2D1CreateFactory, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, ID2D1Bitmap, ID2D1BitmapRenderTarget, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1Factory1, ID2D1PathGeometry, ID2D1RenderTarget,
     ID2D1SolidColorBrush, ID2D1StrokeStyle1,
@@ -383,6 +390,8 @@ struct Device {
     shadows: HashMap<[u32; 6], (ID2D1Bitmap, f32)>,
 }
 
+type LayoutKey = (String, u32, u16, u32, bool, u32, u32, u8, bool);
+
 /// The renderer: factories, the device, and caches of geometry and text formats.
 pub struct Gfx {
     factory: ID2D1Factory1,
@@ -392,10 +401,12 @@ pub struct Gfx {
     dev: Option<Device>,
     paths: HashMap<&'static str, Option<ID2D1PathGeometry>>,
     formats: HashMap<(u32, u16), IDWriteTextFormat>,
+    layouts: HashMap<LayoutKey, IDWriteTextLayout1>,
     /// The built-in Inter, when the system can use it.
     inter: Option<(IDWriteFactory6, IDWriteFontCollection2)>,
     face: &'static str,
     scale: f32,
+    software: bool,
 }
 
 impl Gfx {
@@ -420,7 +431,7 @@ impl Gfx {
                 None,
             )?;
             let (inter, face) = (inter(&dwrite), pick_face(&dwrite));
-            Ok(Self { factory, dwrite, wic, round, dev: None, paths: HashMap::new(), formats: HashMap::new(), inter, face, scale })
+            Ok(Self { factory, dwrite, wic, round, dev: None, paths: HashMap::new(), formats: HashMap::new(), layouts: HashMap::new(), inter, face, scale, software: false })
         }
     }
 
@@ -428,6 +439,15 @@ impl Gfx {
     #[must_use]
     pub const fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Select a target before creating a new popup's device-dependent backdrop.
+    pub fn target_for(&mut self, w: i32, h: i32) {
+        let software = i64::from(w) * i64::from(h) <= 2_000_000;
+        if self.software != software {
+            self.dev = None;
+            self.software = software;
+        }
     }
 
     /// Drops every cached icon bitmap (a panel that drew icons it does not own, whose handles may be reused).
@@ -446,7 +466,7 @@ impl Gfx {
     fn device(&mut self) -> Result<&mut Device> {
         if self.dev.is_none() {
             let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                r#type: if self.software { D2D1_RENDER_TARGET_TYPE_SOFTWARE } else { D2D1_RENDER_TARGET_TYPE_DEFAULT },
                 pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
                 dpiX: 96.0 * self.scale,
                 dpiY: 96.0 * self.scale,
@@ -483,7 +503,11 @@ impl Gfx {
         }
         draw(&mut Canvas { g: self });
         // SAFETY: matches the BeginDraw above.
+        let started = BENCH_END.with(|b| b.get().map(|_| std::time::Instant::now()));
         let end = unsafe { rt.EndDraw(None, None) };
+        if let Some(started) = started {
+            BENCH_END.with(|b| b.set(b.get().map(|d| d + started.elapsed())));
+        }
         if end.is_err() {
             self.dev = None; // device lost or target broken: rebuild on the next frame
         }
@@ -509,6 +533,8 @@ impl Gfx {
 
     /// Lays out one line of text; `None` if the font could not be made.
     fn layout(&mut self, s: &str, f: Font, w: f32, h: f32, align: Align, trim: bool) -> Option<IDWriteTextLayout1> {
+        let key = (s.to_owned(), f.size.to_bits(), f.weight, f.tracking.to_bits(), f.tabular, w.to_bits(), h.to_bits(), align as u8, trim);
+        if let Some(layout) = self.layouts.get(&key) { return Some(layout.clone()); }
         let fmt = self.format(f)?;
         let wide: Vec<u16> = s.encode_utf16().collect();
         // SAFETY: plain DirectWrite layout creation.
@@ -536,6 +562,8 @@ impl Gfx {
                 let _ = ty.AddFontFeature(DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 });
                 let _ = lay.SetTypography(&ty, all);
             }
+            if self.layouts.len() >= 2048 { self.layouts.clear(); }
+            self.layouts.insert(key, lay.clone());
             Some(lay)
         }
     }

@@ -621,6 +621,7 @@ pub struct ScreenHole {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Shown {
     pub win: (i32, i32, i32, i32),
+    pub alpha: u8,
     pub shadow: (i32, i32, i32, i32),
     pub shadow_alpha: u8,
     /// How many times the shadow was painted anew (its window must be presented again).
@@ -680,6 +681,7 @@ pub struct Popup {
     /// The pose of the last frame and the point it scales around, for the holes.
     posed: Option<(Pose, (f32, f32))>,
     act: bool,
+    fade_cached: bool,
 }
 
 /// The pixels of a screen rectangle that may reach beyond the screen: the part on the screen comes from `grab`, the rest
@@ -728,6 +730,7 @@ impl Popup {
         let modal = content.modal();
         let (w, h) = content.size(g);
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
+        g.target_for(bw, bh);
         let size = (bw as f32 / s, bh as f32 / s);
         let at = place_box(&anchor, (bw, bh), place, s);
         let b = anchor.button;
@@ -801,6 +804,7 @@ impl Popup {
             screen: anchor.screen,
             last: Shown::default(),
             posed: None,
+            fade_cached: false,
             act,
         }
     }
@@ -1182,8 +1186,14 @@ impl Popup {
             ((0, 0, self.screen.0, self.screen.1), (255.0 * k).round() as u8)
         });
 
+        // Search's exit changes only whole-window opacity once its entry has settled.
+        // Freeze its last exit frame; input is already disabled while closing.
+        let fade_only = self.id == Id::Search && self.closing.is_some_and(|(tc, _)|
+            tc.saturating_sub(self.t0) >= u64::from(self.entry.dur.max(self.content.settle())));
+        let paint = !fade_only || !self.fade_cached;
+        self.fade_cached = fade_only;
         let Self { content, mo, cap, glass, surf, .. } = self;
-        let _ = g.paint(surf, win.2, win.3, |c| {
+        if paint { let _ = g.paint(surf, win.2, win.3, |c| {
             if let Some((px, (cx, cy, cw, ch))) = cap.take() {
                 *glass = c.glass(&px, cw, ch, look.blur, look.saturate).map(|p| (p, cx, cy));
             }
@@ -1191,7 +1201,7 @@ impl Popup {
             let clip = pose.clip.map_or(Rect::new(m, m, w, h), |i| Rect::new(m + i.left, m + i.top, w - i.left - i.right, h - i.top - i.bottom));
             let radius = pose.clip.map_or(look.radius, |i| i.radius);
             let xf = Xf { cx: m + ox, cy: m + oy, k: pose.k, dx: pose.dx, dy: pose.dy };
-            c.faded(pose.opacity, |c| {
+            c.faded(1.0, |c| {
                 c.masked(clip, radius, xf, |c| {
                     if let Some((p, gx, gy)) = glass.as_ref() {
                         c.picture(p, (*gx - win.0) as f32 / s, (*gy - win.1) as f32 / s);
@@ -1207,12 +1217,13 @@ impl Popup {
                     });
                 });
             });
-        });
+        }); }
 
         self.posed = Some((pose, (ox, oy)));
         let shadow_k = if pose.clip.is_some() { open } else { pose.opacity };
         let shown = Shown {
             win: self.win,
+            alpha: (255.0 * pose.opacity.clamp(0.0, 1.0)).round() as u8,
             shadow: self.sh,
             shadow_alpha: (255.0 * shadow_k.clamp(0.0, 1.0)).round() as u8,
             shadow_gen: self.shade_gen,
@@ -1626,7 +1637,7 @@ impl Host {
             self.scrim_shown = a;
             let _ = p.scrim_surface().present(whwnd(self.scrim), r.0, r.1, a);
         }
-        let _ = p.surfaces().0.present(whwnd(self.panel), win.0, win.1, 255);
+        let _ = p.surfaces().0.present(whwnd(self.panel), win.0, win.1, shown.alpha);
         let done = shown.done;
         if live && !done {
             self.live();
@@ -1654,17 +1665,8 @@ impl Host {
     }
 
     fn timer(&mut self, on: bool) {
-        if on != self.timer {
-            self.timer = on;
-            // SAFETY: a timer on our own window.
-            unsafe {
-                if on {
-                    SetTimer(self.panel, 1, 16, None);
-                } else {
-                    KillTimer(self.panel, 1);
-                }
-            }
-        }
+        self.timer = on;
+        crate::pacing::set(self.panel as isize, on);
     }
 
     fn hide(&mut self) {
@@ -1834,6 +1836,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
             }
         }
+        crate::pacing::FRAME => {
+            if crate::pacing::received(hwnd as isize) {
+                with(|h| h.frame(now()));
+                if let Some(cx) = with(|h| h.popup.as_mut().map(|p| p.tick(now()))).flatten() { apply(cx); }
+            }
+        }
         WM_USER => _ = with(|h| h.frame(now())),
         WM_TIMER => {
             with(|h| h.frame(now()));
@@ -1921,6 +1929,10 @@ mod tests {
         search.close(5000);
         let mid = search.frame(&mut g, 5090);
         assert!(mid.scrim.is_some_and(|s| s.1 > 0 && s.1 < 255) && !mid.done, "the scrim fades with the box");
+        let pixels = search.surfaces().0.pixels().to_vec();
+        let later = search.frame(&mut g, 5130);
+        assert!(later.alpha < mid.alpha, "the exit fades the window as a whole");
+        assert_eq!(pixels, search.surfaces().0.pixels(), "an opacity-only exit reuses its pixels");
         assert!(search.frame(&mut g, 5200).done);
     }
 }

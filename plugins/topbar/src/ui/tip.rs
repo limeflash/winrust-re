@@ -8,8 +8,8 @@ use std::cell::RefCell;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, HWND_TOPMOST, KillTimer, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer,
-    SetWindowPos, ShowWindow, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, HWND_TOPMOST, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SetWindowPos, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use winrust_common::style::{self, Side};
 
@@ -291,23 +291,14 @@ impl Host {
             unsafe { ShowWindow(self.wnd, SW_HIDE) };
         }
         let busy = self.tip.busy(t);
-        if busy != self.timer {
-            self.timer = busy;
-            // SAFETY: a timer on our own window.
-            unsafe {
-                if busy {
-                    SetTimer(self.wnd, 1, 16, None);
-                } else {
-                    KillTimer(self.wnd, 1);
-                }
-            }
-        }
+        self.timer = busy;
+        crate::pacing::set(self.wnd as isize, busy);
     }
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_TIMER {
-        with(|h| h.frame(now()));
+    if msg == crate::pacing::FRAME {
+        if crate::pacing::received(hwnd as isize) { with(|h| h.frame(now())); }
         return 0;
     }
     // SAFETY: the default procedure of our own window.
