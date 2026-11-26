@@ -46,7 +46,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4,
     D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
     D2D1_SHADOW_PROP_COLOR, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-    D2D1CreateFactory, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, ID2D1Bitmap, ID2D1Bitmap1, ID2D1BitmapRenderTarget, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1PathGeometry, ID2D1RenderTarget,
+    D2D1CreateFactory, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, ID2D1Bitmap, ID2D1Bitmap1, ID2D1BitmapRenderTarget, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1GradientStopCollection, ID2D1PathGeometry, ID2D1RenderTarget,
     ID2D1SolidColorBrush, ID2D1StrokeStyle1, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_TARGET,
     D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_MAP_OPTIONS_READ,
 };
@@ -700,6 +700,45 @@ fn make_target(dev: &Dev, hwnd: HWND) -> Result<Tgt> {
     }
 }
 
+/// How much video memory this process uses on the device's adapter, MB: (local, non-local). For the benchmark and self-test.
+pub(crate) fn gpu_memory() -> Option<(f64, f64)> {
+    use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, IDXGIAdapter3};
+    let d = current_dev()?;
+    // SAFETY: plain queries on the device's adapter.
+    unsafe {
+        let a: IDXGIAdapter3 = d.d3d.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()?.cast().ok()?;
+        let use_of = |g| {
+            let mut i = windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            a.QueryVideoMemoryInfo(0, g, &mut i).map(|()| i.CurrentUsage as f64 / 1_048_576.0)
+        };
+        Some((use_of(DXGI_MEMORY_SEGMENT_GROUP_LOCAL).ok()?, use_of(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL).ok()?))
+    }
+}
+
+/// Waits until the GPU has finished everything queued so far and says how long that took (the benchmark's measure of what a
+/// frame still costs the GPU after the CPU is done with it). Never used by the bar itself.
+pub(crate) fn gpu_wait() -> std::time::Duration {
+    use windows::Win32::Graphics::Direct3D11::{D3D11_QUERY_DESC, D3D11_QUERY_EVENT, ID3D11Query};
+    let Some(d) = current_dev() else { return std::time::Duration::ZERO };
+    // SAFETY: an event query on the thread's device, polled with the raw vtable because `GetData` answers S_FALSE while the
+    // work is still running and the bindings fold that into success.
+    unsafe {
+        let Ok(ctx) = d.d3d.GetImmediateContext() else { return std::time::Duration::ZERO };
+        let mut q: Option<ID3D11Query> = None;
+        if d.d3d.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut q)).is_err() {
+            return std::time::Duration::ZERO;
+        }
+        let Some(q) = q else { return std::time::Duration::ZERO };
+        ctx.End(&q);
+        ctx.Flush();
+        let started = std::time::Instant::now();
+        while (Interface::vtable(&ctx).GetData)(Interface::as_raw(&ctx), Interface::as_raw(&q), std::ptr::null_mut(), 0, 0).0 != 0 {
+            std::hint::spin_loop();
+        }
+        started.elapsed()
+    }
+}
+
 /// Gives back what the devices cache (the memory of panels that are closed): once a panel is gone.
 pub fn trim() {
     let Some(d) = current_dev() else { return };
@@ -813,6 +852,8 @@ struct Device {
     brush: ID2D1SolidColorBrush,
     icons: HashMap<usize, ID2D1Bitmap>,
     shadows: HashMap<[u32; 6], (ID2D1Bitmap, f32)>,
+    /// Gradient stop collections by their stops (a separator's gradient is the same every frame).
+    grads: HashMap<Vec<u32>, ID2D1GradientStopCollection>,
 }
 
 type LayoutKey = (String, u32, u16, u32, bool, u32, u32, u8, bool);
@@ -894,7 +935,7 @@ impl Gfx {
                     },
                 )?;
                 ctx.SetTarget(&idle);
-                Device { epoch: d.epoch, cur: ctx.clone(), ctx, idle, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new() }
+                Device { epoch: d.epoch, cur: ctx.clone(), ctx, idle, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new(), grads: HashMap::new() }
             };
             self.dev = Some(dev);
         }
@@ -1232,6 +1273,23 @@ impl Canvas<'_> {
         b
     }
 
+    /// The gradient stop collection of stops (made once, kept: the same gradient is drawn every frame).
+    fn stops(&mut self, stops: &[D2D1_GRADIENT_STOP]) -> Option<ID2D1GradientStopCollection> {
+        let key: Vec<u32> = stops.iter().flat_map(|s| [s.position.to_bits(), s.color.r.to_bits(), s.color.g.to_bits(), s.color.b.to_bits(), s.color.a.to_bits()]).collect();
+        if let Some(c) = self.dev().grads.get(&key) {
+            return Some(c.clone());
+        }
+        let rt = self.own();
+        // SAFETY: a stop collection on the thread's device.
+        let coll = unsafe { rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP).ok()? };
+        let grads = &mut self.dev().grads;
+        if grads.len() > 64 {
+            grads.clear();
+        }
+        grads.insert(key, coll.clone());
+        Some(coll)
+    }
+
     /// The context of the frame in progress (what is drawn goes through it).
     fn rt(&mut self) -> ID2D1RenderTarget {
         self.dev().cur.clone().into()
@@ -1362,7 +1420,7 @@ impl Canvas<'_> {
         };
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
-            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let Some(coll) = self.stops(&stops) else { return };
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: start, endPoint: end };
             if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
                 rt.FillRectangle(&r.d2d(), &b);
@@ -1380,7 +1438,7 @@ impl Canvas<'_> {
         let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
-            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let Some(coll) = self.stops(&stops) else { return };
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.cx(), Y: r.y }, endPoint: Vector2 { X: r.cx(), Y: r.y + r.h } };
             if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
                 rt.FillRoundedRectangle(&rr, &b);
@@ -1398,7 +1456,7 @@ impl Canvas<'_> {
         let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
-            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let Some(coll) = self.stops(&stops) else { return };
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.x, Y: r.y }, endPoint: Vector2 { X: r.x + r.w, Y: r.y + r.h } };
             if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
                 rt.FillRoundedRectangle(&rr, &b);
@@ -1421,7 +1479,7 @@ impl Canvas<'_> {
         let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
-            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let Some(coll) = self.stops(&stops) else { return };
             let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
                 center: Vector2 { X: cx, Y: cy },
                 gradientOriginOffset: Vector2 { X: 0.0, Y: 0.0 },

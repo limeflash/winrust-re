@@ -136,6 +136,9 @@ pub(crate) unsafe fn run(args: &[String]) {
     SCALE.set(1.0);
     let st = Stage::new(&dir);
     let all = which == "all";
+    if which == "memory" {
+        memory(&st);
+    }
     if all || which == "panels" {
         panels(&st);
     }
@@ -236,7 +239,7 @@ fn compare_except(a: &[u32], b: &[u32], skip: &[(i32, i32, i32, i32)]) -> (u32, 
 
 /// One panel: the same frame through the layered-window path (`Popup` into DIBs, blended) and through the real panel host on
 /// composed windows. `src` is a window whose thumbnail the panel's holes show (checked: left half red, right half blue).
-unsafe fn panel_scene(st: &Stage, name: &str, anchor: ui::panel::Anchor, make: &dyn Fn() -> Box<dyn ui::panel::Content>, src: Option<isize>) {
+unsafe fn panel_scene(st: &Stage, name: &str, anchor: ui::panel::Anchor, make: &dyn Fn() -> Box<dyn ui::panel::Content>, src: Option<isize>, moving: &[(i32, i32, i32, i32)]) {
     use ui::panel::{self, Popup};
     gfx::compose_off();
     let mut g = Gfx::new(1.0).expect("the renderer");
@@ -252,7 +255,7 @@ unsafe fn panel_scene(st: &Stage, name: &str, anchor: ui::panel::Anchor, make: &
     let (panel_s, shade_s) = popup.surfaces();
     blend(&mut want, (W, H), shade_s.pixels(), shown.shadow.2, (shown.shadow.0, shown.shadow.1), shown.shadow_alpha);
     blend(&mut want, (W, H), panel_s.pixels(), shown.win.2, (shown.win.0, shown.win.1), shown.alpha);
-    let holes: Vec<_> = popup.holes().iter().map(|h| h.rect).collect();
+    let holes: Vec<_> = popup.holes().iter().map(|h| h.rect).chain(moving.iter().copied()).collect();
     let (bx, by, bw, bh) = popup.rect();
     gfx::compose_windows();
 
@@ -262,7 +265,7 @@ unsafe fn panel_scene(st: &Stage, name: &str, anchor: ui::panel::Anchor, make: &
     st.png(&format!("live-{name}"), &got);
     st.png(&format!("ref-{name}"), &want);
     let (max, n2, n8) = compare_except(&got, &want, &holes);
-    st.say(&format!("{name:10} pixels: max channel difference {max:3}, {n2} pixels off by more than 2, {n8} by more than 8 (the holes of the glass left out)"));
+    st.say(&format!("{name:10} pixels: max channel difference {max:3}, {n2} pixels off by more than 2, {n8} by more than 8 (the holes of the glass and what moves by itself left out)"));
 
     // who catches the mouse: the box, not the room around it, not its corners, not its shadow
     let win = shown.win;
@@ -316,7 +319,7 @@ unsafe fn panels(st: &Stage) {
         let items = rows.iter().enumerate().map(|(i, &(code, name, sub, on))| ui::lang_popup::Layout { id: i as isize, code: code.into(), name: name.into(), sub: sub.into(), on }).collect();
         Box::new(ui::lang_popup::LangPanel::new(items, |_| {}, || {}))
     };
-    panel_scene(st, "lang", anchor, &lang, None);
+    panel_scene(st, "lang", anchor, &lang, None, &[]);
 
     // preview: cards with holes, a real window's thumbnail shows through one (the window stands right of the stage: not in the picture)
     let src_c = wide("topbar_selftest_src");
@@ -344,14 +347,76 @@ unsafe fn panels(st: &Stage) {
         let cards = vec![Card { hwnd: src as isize, title: "Source window".into(), src: (300, 180), minimized: false, current: true }];
         Box::new(PreviewPanel::new(cards, render::demo_icon(&icon, 0), ui::gfx::Rgba::hex(0x3cc4f2), false, |_| {}))
     };
-    panel_scene(st, "preview", Anchor { button: (500, H - 48, 548, H - 6), ..anchor }, &preview, Some(src as isize));
+    panel_scene(st, "preview", Anchor { button: (500, H - 48, 548, H - 6), ..anchor }, &preview, Some(src as isize), &[]);
     DestroyWindow(src);
 
     // Task view: the whole screen under a scrim, one box that is the stage
     let task = || render::demo_taskview(1.0, (W, H), 3, 2, &icon);
-    panel_scene(st, "taskview", anchor, &task, None);
+    panel_scene(st, "taskview", anchor, &task, None, &[]);
     // the power dialog: modal, the card in the middle of a scrim
     let power = || -> Box<dyn ui::panel::Content> { Box::new(ui::power_popup::PowerPanel::new(ui::power_popup::Kind::Restart, |_| {})) };
-    panel_scene(st, "power", anchor, &power, None);
+    panel_scene(st, "power", anchor, &power, None, &[(440, 25, 610, 205)]); // the countdown ring and its seconds run by the clock
+    DestroyWindow(bar_w);
+}
+
+/// 20 openings and closings of each panel on real composed windows: what the process holds (working set, private bytes, video
+/// memory) must not grow after the first cycle. `topbar --selftest <dir> memory`.
+unsafe fn memory(st: &Stage) {
+    use ui::panel::{self, Anchor};
+    let (ws0, pv0) = render::memory();
+    let composed = gfx::compose_windows();
+    let hi = GetModuleHandleW(null());
+    let cls = wide("topbar_selftest_bar");
+    RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: hi, lpszClassName: cls.as_ptr(), ..zeroed() });
+    let bar_w = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, cls.as_ptr(), null(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), hi, null());
+    let _bar = barui::Bar::new(1.0).expect("the renderer"); // the bar's renderer, as the real one holds it
+    let up = panel::init(hi, 1.0, bar_w, || {}) && ui::tip::init(hi, 1.0, (W, H)) && ui::toast::init(hi, 1.0, (W, H));
+    panel::NO_FOCUS.store(true, Relaxed);
+    let gpu = || gfx::gpu_memory().map_or(0.0, |g| g.0);
+    let (ws1, pv1) = render::memory();
+    st.say(&format!("memory ({}): process start {ws0:.0} / {pv0:.0} MB (working set / private); with the devices, the bar's renderer and the windows of the panels, tip and toast ({up}) {ws1:.0} / {pv1:.0} MB, video {:.0} MB", if composed { "composed" } else { "layered" }, gpu()));
+    let anchor = Anchor { side: Side::Bottom, button: (700, H - 48, 748, H - 6), bar: (0, H - 54, W, H), screen: (W, H) };
+    let icon = |path: &str| {
+        let ic = if std::path::Path::new(path).exists() { item_icon(path, bar_icon_px()) } else { null_mut() };
+        wicon(ic)
+    };
+    type Make<'a> = &'a dyn Fn() -> Box<dyn ui::panel::Content>;
+    let lang: Make = &|| {
+        let rows = [("RUS", "Русский", "Russian", true), ("ENG", "English", "United States", false)];
+        let items = rows.iter().enumerate().map(|(i, &(code, name, sub, on))| ui::lang_popup::Layout { id: i as isize, code: code.into(), name: name.into(), sub: sub.into(), on }).collect();
+        Box::new(ui::lang_popup::LangPanel::new(items, |_| {}, || {}))
+    };
+    let task: Make = &|| render::demo_taskview(1.0, (W, H), 3, 2, &icon);
+    let power: Make = &|| Box::new(ui::power_popup::PowerPanel::new(ui::power_popup::Kind::Restart, |_| {}));
+    let search: Make = &|| Box::new(ui::search_panel::SearchPanel::with_query(900.0, "", Vec::new(), Vec::new()));
+    for (name, make) in [("lang", lang), ("taskview", task), ("power", power), ("search", search)] {
+        let mut first = (0.0, 0.0, 0.0);
+        for cycle in 1..=23 {
+            panel::open(make(), anchor);
+            pump(260);
+            panel::close_now();
+            pump(40);
+            if cycle == 3 {
+                // the first cycles warm things up (fonts, effect caches, the first surfaces); what must not grow is what follows
+                let (ws, pv) = render::memory();
+                first = (ws, pv, gpu());
+            }
+            if std::env::var_os("SELFTEST_SERIES").is_some() && [1, 2, 3, 5, 10, 15, 20].contains(&cycle) {
+                let (ws, pv) = render::memory();
+                st.say(&format!("  {name} cycle {cycle}: {ws:.1} / {pv:.1} MB, video {:.1}", gpu()));
+            }
+        }
+        let (ws, pv) = render::memory();
+        let (dws, dpv, dgpu) = (ws - first.0, pv - first.1, gpu() - first.2);
+        let ok = dpv.abs() <= 2.0 && dgpu.abs() <= 1.0;
+        st.say(&format!(
+            "memory {name:9} after cycle 3: {:.1} / {:.1} MB, video {:.1} MB; after 23: {ws:.1} / {pv:.1} MB, video {:.1} MB; growth {dws:+.1} / {dpv:+.1} MB, video {dgpu:+.1} MB: {}",
+            first.0,
+            first.1,
+            first.2,
+            gpu(),
+            if ok { "ok" } else { "GROWS" }
+        ));
+    }
     DestroyWindow(bar_w);
 }

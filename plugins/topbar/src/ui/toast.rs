@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HWND_TOPMOST, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetWindowPos, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    KillTimer, SetTimer, SetWindowPos, ShowWindow, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use winrust_common::style::{self, Anim, Side, pal};
 
@@ -89,9 +89,25 @@ impl Toast {
         self.since = None;
     }
 
+    /// The pill is moving (it comes in over the first 12 % of its life and goes out over the last 15 %): frames on every tick of
+    /// the screen. While it rests nothing changes: [`Toast::wake`] says when to look again.
     #[must_use]
     pub fn busy(&self, now: u64) -> bool {
-        self.since.is_some_and(|t| now < t + LIFE)
+        self.since.is_some_and(|t| {
+            let age = now.saturating_sub(t);
+            age < LIFE && style::anim() == Anim::Full && (age * 100 < LIFE * 12 || age * 100 >= LIFE * 85)
+        })
+    }
+
+    /// When the pill has to be looked at again though it stands still until then: when it starts to leave (or, with the motion off,
+    /// when it is over).
+    #[must_use]
+    pub fn wake(&self, now: u64) -> Option<u64> {
+        let t = self.since?;
+        if now.saturating_sub(t) >= LIFE || self.busy(now) {
+            return None;
+        }
+        Some(t + if style::anim() == Anim::Full { LIFE * 85 / 100 } else { LIFE })
     }
 
     /// Opacity and the drift (DIPs down) at `now`: the keyframes of `t2`. A reduced or off motion setting keeps the pill still.
@@ -244,12 +260,25 @@ impl Host {
         let busy = self.toast.busy(t);
         self.timer = busy;
         crate::pacing::set(self.wnd as isize, busy);
+        // SAFETY: a timer on our own window: a one-shot for the end of the pill's rest, which needs no frames until then.
+        unsafe {
+            match self.toast.wake(t) {
+                Some(at) => _ = SetTimer(self.wnd, 1, at.saturating_sub(t).max(1) as u32, None),
+                None => _ = KillTimer(self.wnd, 1),
+            }
+        }
     }
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == crate::pacing::FRAME {
         if crate::pacing::received(hwnd as isize) { with(|h| h.frame(now())); }
+        return 0;
+    }
+    if msg == WM_TIMER && wp == 1 {
+        // SAFETY: our own window's timer.
+        unsafe { KillTimer(hwnd, 1) };
+        with(|h| h.frame(now()));
         return 0;
     }
     // SAFETY: the default procedure of our own window.
@@ -259,6 +288,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resting_toast_asks_for_no_frames_only_for_a_timer() {
+        let mut t = Toast::new(1.0, (1440, 900));
+        t.since = Some(1000);
+        let full = style::anim() == Anim::Full;
+        assert_eq!(t.busy(1100), full, "coming in");
+        if full {
+            assert!(!t.busy(1000 + 1200) && t.wake(1000 + 1200) == Some(1000 + 2040), "resting until 85 %: a timer, no frames");
+            assert!(t.busy(1000 + 2100) && t.wake(1000 + 2100).is_none(), "leaving");
+        }
+        assert!(!t.busy(1000 + LIFE) && t.wake(1000 + LIFE).is_none(), "over");
+    }
 
     #[test]
     fn t2_keyframes() {

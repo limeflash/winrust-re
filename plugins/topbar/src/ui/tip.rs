@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HWND_TOPMOST, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetWindowPos, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    KillTimer, SetTimer, SetWindowPos, ShowWindow, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use winrust_common::style::{self, Side};
 
@@ -128,9 +128,16 @@ impl Tip {
         self.mv.set(SLIDE, now, md, 0, SPRING);
     }
 
+    /// Something is moving: frames on every tick of the screen. Waiting (the hold of a readout) is not that: see [`Tip::wake`].
     #[must_use]
     pub fn busy(&self, now: u64) -> bool {
-        self.op.running(now) || self.mv.running(now) || self.hide_at.is_some() || self.pending.is_some()
+        self.op.running(now) || self.mv.running(now) || self.pending.is_some()
+    }
+
+    /// When the label has to be looked at again though nothing moves until then (it hides itself after its hold).
+    #[must_use]
+    pub const fn wake(&self) -> Option<u64> {
+        self.hide_at
     }
 
     /// Where the label's box rests, in DIPs on the screen.
@@ -294,6 +301,13 @@ impl Host {
         let busy = self.tip.busy(t);
         self.timer = busy;
         crate::pacing::set(self.wnd as isize, busy);
+        // SAFETY: a timer on our own window: a one-shot for the end of the hold, which needs no frames until then.
+        unsafe {
+            match self.tip.wake() {
+                Some(at) => _ = SetTimer(self.wnd, 1, at.saturating_sub(t).max(1) as u32, None),
+                None => _ = KillTimer(self.wnd, 1),
+            }
+        }
     }
 }
 
@@ -302,6 +316,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         if crate::pacing::received(hwnd as isize) { with(|h| h.frame(now())); }
         return 0;
     }
+    if msg == WM_TIMER && wp == 1 {
+        // SAFETY: our own window's timer.
+        unsafe { KillTimer(hwnd, 1) };
+        with(|h| h.frame(now()));
+        return 0;
+    }
     // SAFETY: the default procedure of our own window.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_label_waiting_out_its_hold_asks_for_a_timer_not_for_frames() {
+        let mut t = Tip::new(1.0, (1440, 900));
+        t.hide_at = Some(5000);
+        assert!(!t.busy(1000), "nothing moves while the readout holds");
+        assert_eq!(t.wake(), Some(5000));
+        t.op.set(1.0, 1000, 200, 0, EASE);
+        assert!(t.busy(1100), "its fade in is motion");
+    }
 }
