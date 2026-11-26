@@ -136,6 +136,9 @@ pub(crate) unsafe fn run(args: &[String]) {
     SCALE.set(1.0);
     let st = Stage::new(&dir);
     let all = which == "all";
+    if all || which == "messages" {
+        messages(&st);
+    }
     if which == "memory" {
         memory(&st);
     }
@@ -419,4 +422,36 @@ unsafe fn memory(st: &Stage) {
         ));
     }
     DestroyWindow(bar_w);
+}
+
+static PAINTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+unsafe extern "system" fn count_paint(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if m == WM_PAINT {
+        PAINTS.fetch_add(1, Relaxed);
+        ValidateRect(h, null());
+        return 0;
+    }
+    DefWindowProcW(h, m, w, l)
+}
+
+/// The bar redraws on `InvalidateRect` (WM_PAINT): does a window without a redirection bitmap still get it, and the frame
+/// messages of the pacing thread?
+unsafe fn messages(st: &Stage) {
+    gfx::compose_windows();
+    let hi = GetModuleHandleW(null());
+    let cls = wide("topbar_selftest_paint");
+    RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(count_paint), hInstance: hi, lpszClassName: cls.as_ptr(), ..zeroed() });
+    let w = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | gfx::window_ex(), cls.as_ptr(), null(), WS_POPUP, 0, 0, 200, 40, null_mut(), null_mut(), hi, null());
+    ShowWindow(w, SW_SHOWNOACTIVATE);
+    pump(100);
+    let before = PAINTS.load(Relaxed);
+    InvalidateRect(w, null(), 0);
+    pump(100);
+    let painted = PAINTS.load(Relaxed) - before;
+    crate::pacing::set(w as isize, true);
+    pump(100);
+    crate::pacing::set(w as isize, false);
+    st.say(&format!("messages   WM_PAINT after InvalidateRect on a window without a redirection bitmap: {} ({painted})", if painted > 0 { "ok" } else { "WRONG" }));
+    DestroyWindow(w);
 }

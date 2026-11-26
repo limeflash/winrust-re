@@ -1,5 +1,19 @@
 //! Timing curves and transitions for UI animation.
 
+/// The clock every animation reads, in milliseconds: `GetTickCount64` as it was at the first call, plus the precise time since.
+/// `GetTickCount64` itself moves in steps of the system timer tick (15.6 ms), so a motion paced at the screen's 360 Hz would
+/// stand still for five frames and then jump; this moves with every frame. The values stay in `GetTickCount64`'s domain, so
+/// a zero kept for "long ago" and the comparisons with it mean what they did.
+#[must_use]
+pub fn now_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static BASE: OnceLock<(u64, Instant)> = OnceLock::new();
+    // SAFETY: plain query.
+    let (tick, at) = BASE.get_or_init(|| (unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }, Instant::now()));
+    tick + at.elapsed().as_millis() as u64
+}
+
 /// A CSS cubic-bezier timing curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CubicBezier {
@@ -160,6 +174,23 @@ pub fn timing(mode: winrust_common::style::Anim, dur_ms: u32, delay_ms: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_clock_moves_with_every_frame_not_with_the_timer_tick() {
+        let (mut last, mut steps, mut max_step) = (now_ms(), 0u32, 0u64);
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        while std::time::Instant::now() < end {
+            let t = now_ms();
+            assert!(t >= last, "the clock never goes back");
+            if t > last {
+                steps += 1;
+                max_step = max_step.max(t - last);
+            }
+            last = t;
+        }
+        // GetTickCount64 would step about 8 times in 120 ms (15.6 ms each); this one steps every millisecond
+        assert!(steps > 60 && max_step <= 3, "{steps} steps, the largest {max_step} ms");
+    }
+
     #[test]
     fn curves() {
         for c in [LINEAR, EASE, SNAP, SPRING, POP, EXIT, SINK] {

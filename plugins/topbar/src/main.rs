@@ -1117,7 +1117,7 @@ fn ease(t: f32) -> f32 {
 }
 
 unsafe fn now_ms() -> u64 {
-    GetTickCount64()
+    ui::anim::now_ms()
 }
 
 /// Eased 0..1 hover value of one element: glides toward `on` (1) / off (0) instead of jumping. Sets BUSY while it moves,

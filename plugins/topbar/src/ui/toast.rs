@@ -4,7 +4,7 @@
 //! fades out while it drifts 6 px away; each leg eases with `cubic-bezier(.2,.9,.1,1)`.
 //!
 //! A shared component: any panel or bar action can call [`show`]. [`Toast`] is the windowless core; [`show`] and [`hide`]
-//! drive the one real window (layered, click-through, never active), so a panel that is open keeps the focus.
+//! drive the one real window (click-through, never active; composed, or layered without DirectComposition), so a panel that is open keeps the focus.
 
 use std::cell::RefCell;
 
@@ -191,8 +191,7 @@ fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 fn now() -> u64 {
-    // SAFETY: plain query.
-    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    anim::now_ms()
 }
 
 /// Creates the toast's window; `screen` is the primary monitor in device pixels.

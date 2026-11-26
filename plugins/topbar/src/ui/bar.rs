@@ -1218,6 +1218,8 @@ mod tests {
     fn a_frame_reaches_a_composed_window() {
         use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
         use windows::core::w;
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
         if !gfx::compose_windows() {
             return; // no DirectComposition on this machine: the layered path above is the one that runs
         }
@@ -1232,6 +1234,12 @@ mod tests {
             gfx::commit();
             assert_eq!(b.surfaces().0.size(), (p.win.2, p.win.3));
             assert!(b.surfaces().0.pixels().is_empty(), "a composed frame lives on the GPU, not in a DIB");
+            // the GPU goes away: the next frame makes a device, surfaces and the window's visual anew, and the frame is shown again
+            gfx::lose_device();
+            assert!(!b.surfaces().0.is_current(), "the lost device took the pixels");
+            b.frame(&view(3), &live(10_016));
+            assert!(b.surfaces().0.is_current() && b.surfaces().0.present(hw, 0, 0, 255), "the frame after the loss did not reach the window");
+            gfx::commit();
             let _ = DestroyWindow(hw);
         }
         gfx::compose_off();

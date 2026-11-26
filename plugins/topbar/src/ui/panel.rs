@@ -3,8 +3,9 @@
 //! A panel is a [`Content`]: it says how big it is, how it looks ([`Look`]), how it comes and goes ([`Entry`], [`Exit`]),
 //! draws itself in its own DIP coordinates and answers hit tests and clicks. Everything else is done here:
 //!
-//! * the window: one layered window with per-pixel alpha for the panel and, under it, a click-through window that holds the
-//!   shadow (so a click beside the panel reaches what is under it);
+//! * the window: one DirectComposition window for the panel (cut to its box once it stands still, so a click beside it reaches
+//!   what is under it; a layered window with per-pixel alpha where DirectComposition is not available) and, under it, a
+//!   click-through window that holds the shadow, and one for the scrim;
 //! * the glass: the screen under the panel is grabbed before the window is shown, blurred and saturated on the GPU and
 //!   painted under the tint; it stays where it was grabbed while the panel moves or scales;
 //! * the motion: the open and close animations of the mockup (`qsIn`'s translate/scale/opacity, the `clip-path` reveal from the
@@ -12,7 +13,7 @@
 //! * the input: hover, clicks (left, right, middle), arrows/Enter/Esc, closing on lost focus, and the guard against a panel
 //!   that was just closed by the focus loss being opened again by the click on its own bar button.
 //!
-//! [`Popup`] is the windowless core (state, geometry, painting into two surfaces); the functions at the bottom ([`init`],
+//! [`Popup`] is the windowless core (state, geometry, painting into its surfaces); the functions at the bottom ([`init`],
 //! [`open`], [`toggle`], [`close`]) bind it to real windows. `topbar --render-panel` drives [`Popup`] directly.
 //!
 //! A new panel: implement [`Content`], build it where its button is clicked, and call
@@ -1394,8 +1395,7 @@ fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 fn now() -> u64 {
-    // SAFETY: plain query.
-    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    anim::now_ms()
 }
 
 pub(super) fn whwnd(h: HWND) -> windows::Win32::Foundation::HWND {

@@ -2,7 +2,7 @@
 //! `0 8px 24px` shadow, radius 8, padding 5×10, Inter 500 12 px) that fades in over .2 s and rises 6 px into place over .35 s
 //! (`SPRING`) once the pointer has rested .25 s, and fades out again when it leaves.
 //!
-//! [`Tip`] is the windowless core; [`show`] and [`hide`] drive the one real window (layered, click-through, never active).
+//! [`Tip`] is the windowless core; [`show`] and [`hide`] drive the one real window (click-through, never active; composed, or layered without DirectComposition).
 
 use std::cell::RefCell;
 
@@ -225,8 +225,7 @@ fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 fn now() -> u64 {
-    // SAFETY: plain query.
-    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    anim::now_ms()
 }
 
 /// Creates the label's window; `screen` is the primary monitor in device pixels.
