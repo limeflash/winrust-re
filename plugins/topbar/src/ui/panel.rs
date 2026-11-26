@@ -23,10 +23,10 @@ use std::collections::HashMap;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, WM_ACTIVATE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -102,6 +102,8 @@ pub enum Along {
     End,
     /// Left (or top) edges together.
     Start,
+    /// Against the far edge of the screen, `gap` from it (the mockup's `right: 12px` of quick settings and the calendar).
+    ScreenEnd,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -427,6 +429,20 @@ pub trait Content {
     /// The item under a point; its number is whatever the content chooses.
     fn hit(&self, x: f32, y: f32) -> Option<i32>;
     fn click(&mut self, _id: i32, _b: Button, _cx: &mut Cx) {}
+    /// The pointer moved to `(x, y)` with the button still down on item `id` (a slider's knob): the pointer is captured, so
+    /// the point can be outside the box.
+    fn drag(&mut self, _id: i32, _x: f32, _y: f32) {}
+    /// The button that went down on item `id` came up.
+    fn release(&mut self, _id: i32) {}
+    /// A key before the frame handles it (Esc closes, arrows move the hover, Enter and Space click): true = taken. A panel
+    /// with a text field takes its editing keys here.
+    fn key(&mut self, _vk: u32, _cx: &mut Cx) -> bool {
+        false
+    }
+    /// A typed character (never a control character).
+    fn text(&mut self, _c: char, _cx: &mut Cx) {}
+    /// The wheel turned over the panel: `up` is away from the user.
+    fn wheel(&mut self, _up: bool) {}
     /// The item an arrow key moves the hover to.
     fn nav(&self, _from: Option<i32>, _dir: Dir) -> Option<i32> {
         None
@@ -443,6 +459,10 @@ pub trait Content {
     fn animating(&self, _now: u64) -> bool {
         false
     }
+    /// A content that shows live values (a clock, the volume) asks for a frame this often, in ms, while it is open (0 = never).
+    fn pulse(&self) -> u32 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -458,6 +478,8 @@ pub struct Shown {
     pub busy: bool,
     /// The exit has finished: the windows can go.
     pub done: bool,
+    /// The content's own refresh period in ms (0 = none).
+    pub pulse: u32,
 }
 
 /// Pixels of a screen rectangle (left, top, width, height).
@@ -627,6 +649,10 @@ impl Popup {
             return false;
         }
         let (lx, ly) = self.local(x, y);
+        if let Some(id) = self.press {
+            self.content.drag(id, lx, ly); // the button is still down: the item owns the pointer
+            return true;
+        }
         let h = self.content.hit(lx, ly);
         std::mem::replace(&mut self.hover, h) != h
     }
@@ -658,19 +684,46 @@ impl Popup {
         if let Some(id) = self.hover {
             self.press = Some(id);
             self.content.click(id, b, &mut cx);
+            if b == Button::Left {
+                self.content.drag(id, lx, ly); // a slider takes the value under the pointer at once
+            }
         }
         cx
     }
 
     /// The button went up.
     pub fn release(&mut self) {
-        self.press = None;
+        if let Some(id) = self.press.take() {
+            self.content.release(id);
+        }
+    }
+
+    /// A button is held on an item (the host keeps the pointer captured).
+    #[must_use]
+    pub const fn pressed(&self) -> bool {
+        self.press.is_some()
+    }
+
+    /// The wheel turned.
+    pub fn wheel(&mut self, up: bool) {
+        if self.closing.is_none() {
+            self.content.wheel(up);
+        }
+    }
+
+    /// A character was typed.
+    pub fn text(&mut self, c: char) -> Cx {
+        let mut cx = Cx::default();
+        if self.closing.is_none() {
+            self.content.text(c, &mut cx);
+        }
+        cx
     }
 
     /// A key went down; Esc closes, arrows move the hover, Enter and Space click it.
     pub fn key(&mut self, vk: u32) -> Cx {
         let mut cx = Cx::default();
-        if self.closing.is_some() {
+        if self.closing.is_some() || self.content.key(vk, &mut cx) {
             return cx;
         }
         let dir = match vk {
@@ -828,6 +881,7 @@ impl Popup {
             shadow_alpha: (255.0 * shadow_k.clamp(0.0, 1.0)).round() as u8,
             busy: self.busy(now),
             done: self.finished(now),
+            pulse: if self.closing.is_some() { 0 } else { self.content.pulse() },
         };
         self.last = shown;
         shown
@@ -854,15 +908,16 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
     let gap = (p.gap * s).round() as i32;
     let (l, t, r, b) = a.button;
     let edge = (8.0 * s).round() as i32;
-    let along = |lo: i32, hi: i32, len: i32| match p.along {
+    let along = |lo: i32, hi: i32, len: i32, screen: i32| match p.along {
         Along::Center => (lo + hi) / 2 - len / 2,
         Along::Start => lo,
         Along::End => hi - len,
+        Along::ScreenEnd => screen - gap - len,
     };
     match a.side {
-        Side::Bottom => ((along(l, r, w)).clamp(edge, (a.screen.0 - edge - w).max(edge)), a.bar.1 - gap - h),
-        Side::Left => (a.bar.2 + gap, along(t, b, h).clamp(edge, (a.screen.1 - edge - h).max(edge))),
-        Side::Right => (a.bar.0 - gap - w, along(t, b, h).clamp(edge, (a.screen.1 - edge - h).max(edge))),
+        Side::Bottom => ((along(l, r, w, a.screen.0)).clamp(edge, (a.screen.0 - edge - w).max(edge)), a.bar.1 - gap - h),
+        Side::Left => (a.bar.2 + gap, along(t, b, h, a.screen.1).clamp(edge, (a.screen.1 - edge - h).max(edge))),
+        Side::Right => (a.bar.0 - gap - w, along(t, b, h, a.screen.1).clamp(edge, (a.screen.1 - edge - h).max(edge))),
     }
 }
 
@@ -881,6 +936,8 @@ struct Host {
     /// A panel closed by losing the focus, and when: its own button must not open it again at once.
     deact: Option<(Id, u64)>,
     timer: bool,
+    /// The period of the live-value timer (the content's `pulse`), 0 = none.
+    pulsing: u32,
     shown: (i32, i32, i32, i32, u8),
 }
 
@@ -932,7 +989,7 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
     if panel.is_null() || shadow.is_null() {
         return false;
     }
-    HOST.set(Some(Host { gfx, popup: None, grab: Surface::new(), panel, shadow, bar, notify, scale, deact: None, timer: false, shown: (0, 0, 0, 0, 0) }));
+    HOST.set(Some(Host { gfx, popup: None, grab: Surface::new(), panel, shadow, bar, notify, scale, deact: None, timer: false, pulsing: 0, shown: (0, 0, 0, 0, 0) }));
     true
 }
 
@@ -1044,6 +1101,21 @@ impl Host {
             self.hide();
         } else {
             self.timer(shown.busy);
+            self.pulse(shown.pulse);
+        }
+    }
+
+    fn pulse(&mut self, ms: u32) {
+        if ms != self.pulsing {
+            self.pulsing = ms;
+            // SAFETY: a timer on our own window.
+            unsafe {
+                if ms > 0 {
+                    SetTimer(self.panel, 2, ms, None);
+                } else {
+                    KillTimer(self.panel, 2);
+                }
+            }
         }
     }
 
@@ -1064,6 +1136,7 @@ impl Host {
     fn hide(&mut self) {
         let had = self.popup.take().is_some();
         self.timer(false);
+        self.pulse(0);
         // SAFETY: hiding our own windows.
         unsafe {
             ShowWindow(self.panel, SW_HIDE);
@@ -1112,10 +1185,39 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let cx = with(|h| h.popup.as_mut().map(|p| p.button(x, y, b))).flatten();
             if let Some(cx) = cx {
                 with(|h| h.frame(now()));
+                // a held item (a slider) follows the pointer beyond the window
+                if with(|h| h.popup.as_ref().is_some_and(Popup::pressed)).unwrap_or(false) {
+                    // SAFETY: capturing the mouse for our own window.
+                    unsafe { SetCapture(hwnd) };
+                }
                 apply(cx);
             }
         }
-        0x0202 | 0x0205 | 0x0208 => _ = with(|h| h.popup.as_mut().map(Popup::release)), // WM_xBUTTONUP
+        0x0202 | 0x0205 | 0x0208 => {
+            // WM_xBUTTONUP
+            // SAFETY: releases the capture taken above (a no-op without one).
+            unsafe { ReleaseCapture() };
+            with(|h| {
+                h.popup.as_mut().map(Popup::release);
+                h.frame(now());
+            });
+        }
+        WM_MOUSEWHEEL => {
+            let up = (wp >> 16) as i16 > 0;
+            with(|h| {
+                if let Some(p) = h.popup.as_mut() {
+                    p.wheel(up);
+                    h.frame(now());
+                }
+            });
+        }
+        WM_CHAR => {
+            let cx = char::from_u32(wp as u32).filter(|c| !c.is_control()).and_then(|c| with(|h| h.popup.as_mut().map(|p| p.text(c))).flatten());
+            if let Some(cx) = cx {
+                with(|h| h.frame(now()));
+                apply(cx);
+            }
+        }
         WM_KEYDOWN => {
             let cx = with(|h| h.popup.as_mut().map(|p| p.key(wp as u32))).flatten();
             if let Some(cx) = cx {

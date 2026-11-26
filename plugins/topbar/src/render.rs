@@ -7,6 +7,7 @@
 //! lang, wifi, volume, battery, restart, power, clock) or the number of an app button (1..).
 use super::*;
 use ui::bar::Net;
+use ui::quick_popup as qp;
 use winrust_common::style::{Side, Style};
 
 /// What the mockup's bar holds: name, colour of its indicators, windows, an exe whose icon stands in for the brand's.
@@ -181,8 +182,101 @@ fn demo_cells() -> Vec<ui::tray_popup::Cell> {
     DEMO.with_borrow(|d| d.iter().map(|c| ui::tray_popup::Cell { icon: c.icon, tip: c.tip.clone(), token: c.token }).collect())
 }
 
-/// `topbar --render-panel <file.png> tray|lang|tip [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>]
-/// [n=<icons>] [real] [at=<n>]`
+/// What the quick settings panel shows when it is drawn into a PNG: the mockup's state, not the machine's.
+struct Demo {
+    on: Vec<usize>,
+    vol: Option<(i32, bool)>,
+    bright: Option<i32>,
+    battery: Option<(i32, bool)>,
+    media: bool,
+    wifi_on: bool,
+}
+
+impl Demo {
+    fn from(args: &[String]) -> Self {
+        let get = |k: &str| args.iter().find_map(|a| a.strip_prefix(k).and_then(|v| v.strip_prefix('=')));
+        let num = |k: &str| get(k).and_then(|v| v.parse::<i32>().ok());
+        Self {
+            on: get("on").map_or(vec![1, 7], |v| v.split(',').filter_map(|n| n.parse().ok()).collect()),
+            vol: Some((num("vol").unwrap_or(72), args.iter().any(|a| a == "muted"))),
+            bright: num("bright"),
+            battery: if get("batt") == Some("none") { None } else { Some((num("batt").unwrap_or(98), args.iter().any(|a| a == "charging"))) },
+            media: args.iter().any(|a| a == "media"),
+            wifi_on: !args.iter().any(|a| a == "wifioff"),
+        }
+    }
+}
+
+impl qp::Host for Demo {
+    fn tick(&mut self, _wifi_page: bool) {}
+
+    fn state(&mut self) -> qp::State {
+        let status = ["Not connected", "Off", "Off", "Off", "Off", "Win+Ctrl+L", "Off", "Off", "Win+P"];
+        let on_text = ["Home network", "On", "On", "On", "On", "Win+Ctrl+L", "On", "On", "Win+P"];
+        let tiles = (0..9).map(|i| qp::Tile { on: self.on.contains(&i), status: (if self.on.contains(&i) { on_text[i] } else { status[i] }).into() }).collect();
+        qp::State {
+            tiles,
+            vol: self.vol,
+            bright: self.bright,
+            media: self.media.then(|| qp::Media { title: "Midnight City".into(), artist: "M83".into(), playing: true }),
+            battery: self.battery,
+        }
+    }
+
+    fn tile(&mut self, _i: usize, _cx: &mut ui::panel::Cx) {}
+    fn volume(&mut self, _percent: i32) {}
+    fn mute(&mut self) {}
+    fn brightness(&mut self, _percent: i32, _done: bool) {}
+    fn media(&mut self, _cmd: u8) {}
+    fn settings(&mut self, _uri: &'static str, _cx: &mut ui::panel::Cx) {}
+    fn wifi_open(&mut self) {}
+
+    fn wifi(&mut self) -> qp::Wifi {
+        let net = |ssid: &str, quality, secure, saved, connected| qp::Network { ssid: ssid.into(), quality, secure, saved, connected };
+        let nets = if self.wifi_on {
+            vec![net("Home network", 85, true, true, true), net("Office", 70, true, true, false), net("Cafe Guest", 62, false, false, false), net("Neighbour 5G", 45, true, false, false), net("DIRECT-roku-1F", 30, true, false, false)]
+        } else {
+            Vec::new()
+        };
+        qp::Wifi {
+            on: self.wifi_on,
+            link: self.wifi_on.then(|| qp::Link { phy: "Wi\u{2011}Fi 6".into(), down: 866, up: 866, auth: "WPA2\u{2011}Personal".into() }),
+            status: (!self.wifi_on).then(|| ("Turned off".to_string(), qp::Tone::Dim)),
+            nets,
+            joining: None,
+            offline: false,
+        }
+    }
+
+    fn wifi_power(&mut self, _on: bool) {}
+    fn wifi_pick(&mut self, _ssid: &str) -> qp::Join {
+        qp::Join::Started
+    }
+    fn wifi_join(&mut self, _ssid: &str, _password: &str) {}
+    fn wifi_leave(&mut self) {}
+    fn wifi_forget(&mut self, _ssid: &str) {}
+}
+
+thread_local! {
+    static DEMO_DATE: std::cell::Cell<(i32, i32, i32)> = const { std::cell::Cell::new((2026, 11, 26)) };
+}
+
+fn demo_now() -> ui::cal_popup::Now {
+    ui::cal_popup::Now { date: DEMO_DATE.get(), time: "03:57".into() }
+}
+
+/// `y-m-d` or `y-m` as numbers.
+fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
+    let mut p = v.split('-').map(|n| n.parse::<i32>().ok());
+    Some((p.next()??, p.next()??, p.next().flatten().unwrap_or(1)))
+}
+
+/// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar [classic|floating|dock] [bottom|left|right] [scale=1.25]
+/// [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]`
+///
+/// `quick` and `wifi` also take the state of the mockup's fake machine: `on=<tiles, 0..8>` `vol=<n>` `muted` `bright=<n>`
+/// `batt=<n|none>` `charging` `media` `wifioff`, and for `wifi` `ask=<ssid>` (the password prompt) or `menu=<ssid>` (the context
+/// menu); `calendar` takes `today=<y-m-d>`, `view=<y-m>` and `sel=<y-m-d>`.
 ///
 /// Draws a popup panel through the same frame as the live one, next to the bar, on a backdrop with something to blur, and
 /// writes the area around it to a PNG. `t` is the time since the panel opened (default: at rest), `hover` the hovered item,
@@ -237,7 +331,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         time: "03:57".into(),
         date: "11/26/2026".into(),
     };
-    let lit = barui::Live { now: 100_000, hot: if what == "tip" { at } else { NONE }, tray: what == "tray", lang: what == "lang", ..Default::default() };
+    let lit = barui::Live {
+        now: 100_000,
+        hot: if what == "tip" { at } else { NONE },
+        tray: what == "tray",
+        lang: what == "lang",
+        qs: what == "quick" || what == "wifi",
+        cal: what == "calendar",
+        ..Default::default()
+    };
     bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
     bar.frame(&view, &lit);
     let p = bar.frame(&view, &barui::Live { now: 110_000, ..lit });
@@ -270,6 +372,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let key = match what.as_str() {
         "lang" => LANG,
         "tip" => at,
+        "quick" | "wifi" => WIFI_I,
+        "calendar" => CLOCK,
         _ => TAPP,
     };
     let r = bar.screen_rect(key).unwrap_or((0, 0, 0, 0));
@@ -288,7 +392,21 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
         around(win)
     } else {
-        let content: Box<dyn ui::panel::Content> = if what == "lang" {
+        let content: Box<dyn ui::panel::Content> = if what == "quick" || what == "wifi" {
+            let get = |k: &str| args.iter().find_map(|a| a.strip_prefix(k).and_then(|v| v.strip_prefix('=')));
+            let panel = qp::QuickPanel::new(Box::new(Demo::from(args)), side, what == "wifi");
+            Box::new(match (get("ask"), get("menu")) {
+                (Some(ssid), _) => panel.asking(ssid),
+                (_, Some(ssid)) => panel.with_menu(ssid),
+                _ => panel,
+            })
+        } else if what == "calendar" {
+            let get = |k: &str| args.iter().find_map(|a| a.strip_prefix(k).and_then(|v| v.strip_prefix('=')));
+            let today = get("today").and_then(parse_date).unwrap_or((2026, 11, 26));
+            DEMO_DATE.set(today);
+            let view = get("view").and_then(parse_date).map_or((today.0, today.1), |d| (d.0, d.1));
+            Box::new(ui::cal_popup::CalPanel::new(demo_now, side).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
+        } else if what == "lang" {
             let items = if real {
                 layout_rows()
             } else {

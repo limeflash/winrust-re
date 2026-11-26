@@ -18,7 +18,7 @@ use std::{
 #[macro_use]
 extern crate winrust_common;
 use winrust_common as i18n;
-use winrust_common::style::{Side, Style, card, on_accent, pal, rgb, style, ui_face};
+use winrust_common::style::{Side, Style, card, pal, style, ui_face};
 mod clip;
 mod hist;
 mod fly;
@@ -28,12 +28,13 @@ mod status;
 mod run;
 mod shot;
 mod lang;
+mod qs;
 mod settings;
 mod thumbs;
 mod ui;
 mod render;
 use ui::bar::{self as barui, keys::*};
-use {tray::*, status::*, run::*, shot::*, lang::*, settings::*};
+use {tray::*, status::*, run::*, shot::*, lang::*, settings::*, qs::*};
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
@@ -51,7 +52,6 @@ use windows_sys::Win32::{
         GdiPlus::{
             FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipFillPath, GdipSetPixelOffsetMode,
             GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, GpPath, GpSolidFill, PixelOffsetModeHalf, SmoothingModeAntiAlias,
-            GdipCreatePen1, GdipDeletePen, GdipDrawArc, GdipDrawLine, GdipFillEllipse, GdipSetPenEndCap, GdipSetPenStartCap, GpPen, LineCapRound, UnitPixel,
         },
     },
     NetworkManagement::WiFi::*,
@@ -117,9 +117,7 @@ fn bar_visible() -> bool {
 fn bar_win() -> (i32, i32, i32, i32) {
     UI.with_borrow(|u| u.as_ref().map_or((0, 0, 0, 0), |b| b.placement().win))
 }
-const GOOD: u32 = winrust_common::style::GOOD;
 const BAD: u32 = winrust_common::style::BAD;
-const WARN: u32 = winrust_common::style::WARN;
 const CALLBACK: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -1627,8 +1625,8 @@ unsafe fn build_live() -> barui::Live {
         press: if now.saturating_sub(pt) < 220 { pk } else { NONE },
         gear: menu_at(GEAR),
         start: fly::is_open(fly::Kind::Start),
-        qs: fly::is_open(fly::Kind::Quick) || fly::is_open(fly::Kind::Wifi),
-        cal: fly::is_open(fly::Kind::Cal),
+        qs: ui::panel::is_open(ui::panel::Id::Qs),
+        cal: ui::panel::is_open(ui::panel::Id::Cal),
         lang: ui::panel::is_open(ui::panel::Id::Lang),
         tray: ui::panel::is_open(ui::panel::Id::Tray),
         hidden: FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)),
@@ -2301,9 +2299,10 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         // left: the language picker; right: straight to the next one (Win+Space is explorer's, gone under rs-shell)
         LANG if left => lang_toggle(),
         LANG => next_lang(BAR.load(Relaxed) as HWND, false),
-        WIFI_I => fly::toggle_click(if left { fly::Kind::Quick } else { fly::Kind::Wifi }), // right click: the network list
-        VOL_I | BAT_I => fly::toggle_click(fly::Kind::Quick),
-        CLOCK if left => fly::toggle_click(fly::Kind::Cal),
+        WIFI_I if left => quick_toggle(h),
+        WIFI_I => wifi_toggle(), // right click: the network list
+        VOL_I | BAT_I => quick_toggle(h),
+        CLOCK if left => cal_toggle(),
         CLOCK => {
             // right click: like Windows 11, a menu with the date and time and notification settings (#126)
             let items = vec![
@@ -2602,22 +2601,6 @@ fn main() {
             screenshot();
             return;
         }
-        // `topbar --preview quick|wifi`: one flyout on its own (no bar, no hooks), to look at a style change; the process is closed by hand
-        if let Some(p) = std::env::args().skip_while(|a| a != "--preview").nth(1) {
-            SetProcessDPIAware();
-            let (mut tok, mut inp): (usize, GdiplusStartupInput) = (0, zeroed());
-            inp.GdiplusVersion = 1;
-            GdiplusStartup(&mut tok, &inp, null_mut());
-            fly::init(GetModuleHandleW(null()));
-            fly::PREVIEW.store(true, Relaxed);
-            fly::toggle(if p == "wifi" { fly::Kind::Wifi } else { fly::Kind::Quick });
-            let mut msg: MSG = zeroed();
-            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            return;
-        }
         // Atomic single-instance guard (FindWindow alone raced when two launchers started us at once); the handle lives until exit.
         let m = windows_sys::Win32::System::Threading::CreateMutexW(null(), 0, wide("Local\\topbar-single").as_ptr());
         if m.is_null() || GetLastError() == ERROR_ALREADY_EXISTS || !FindWindowW(wide("topbar").as_ptr(), null()).is_null() {
@@ -2765,7 +2748,7 @@ mod tests {
 
     #[test]
     fn network_icon_state() {
-        use super::{INET, Link, WIFI, arcs_lit, net};
+        use super::{INET, Link, WIFI, net};
         let at = |q: i32, inet: bool| {
             WIFI.set(q);
             INET.set(inet);
@@ -2775,7 +2758,6 @@ mod tests {
         assert!(at(80, false) == Link::NoInternet(80)); // wifi without a way out: the warning icon
         assert!(at(-1, true) == Link::Cable);
         assert!(at(-1, false) == Link::Offline); // nothing at all: the crossed-out wifi icon
-        assert_eq!((arcs_lit(0), arcs_lit(40), arcs_lit(100)), (1, 2, 3));
     }
 
     #[test]
@@ -2789,9 +2771,10 @@ mod tests {
 
     #[test]
     fn mix_blends() {
-        assert_eq!(super::mix(super::rgb(0, 0, 0), super::rgb(200, 100, 50), 0.0), super::rgb(0, 0, 0));
-        assert_eq!(super::mix(super::rgb(0, 0, 0), super::rgb(200, 100, 50), 1.0), super::rgb(200, 100, 50));
-        assert_eq!(super::mix(super::rgb(0, 0, 0), super::rgb(200, 100, 50), 0.5), super::rgb(100, 50, 25));
+        use winrust_common::style::rgb;
+        assert_eq!(super::mix(rgb(0, 0, 0), rgb(200, 100, 50), 0.0), rgb(0, 0, 0));
+        assert_eq!(super::mix(rgb(0, 0, 0), rgb(200, 100, 50), 1.0), rgb(200, 100, 50));
+        assert_eq!(super::mix(rgb(0, 0, 0), rgb(200, 100, 50), 0.5), rgb(100, 50, 25));
     }
 
     #[test]

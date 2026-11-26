@@ -737,6 +737,27 @@ impl Canvas<'_> {
         unsafe { rt.DrawLine(Vector2 { X: x0, Y: y0 }, Vector2 { X: x1, Y: y1 }, &b, w, None) };
     }
 
+    /// The part of a disc (centre, radius) that lies inside the rounded rectangle `r`: the `clip-path: circle(..)` fill of an
+    /// `overflow: hidden` tile (quick settings' tiles fill from the chip outwards).
+    pub fn fill_disc_in(&mut self, r: Rect, radius: f32, (cx, cy): (f32, f32), disc: f32, c: Rgba) {
+        if c.a <= 0.0 || disc <= 0.0 {
+            return;
+        }
+        let (rt, b) = (self.rt(), self.brush(c));
+        let f = &self.g.factory;
+        // SAFETY: geometry creation on the factory; the result is drawn inside BeginDraw/EndDraw.
+        unsafe {
+            let Ok(rr) = f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius }) else { return };
+            let Ok(el) = f.CreateEllipseGeometry(&D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: disc, radiusY: disc }) else { return };
+            let Ok(out) = f.CreatePathGeometry() else { return };
+            let Ok(sink) = out.Open() else { return };
+            let combined = rr.CombineWithGeometry(&el, windows::Win32::Graphics::Direct2D::D2D1_COMBINE_MODE_INTERSECT, None, 0.1, &sink);
+            if combined.is_ok() && sink.Close().is_ok() {
+                rt.FillGeometry(&out, &b, None);
+            }
+        }
+    }
+
     pub fn circle(&mut self, cx: f32, cy: f32, r: f32, c: Rgba) {
         let (rt, b) = (self.rt(), self.brush(c));
         // SAFETY: drawing inside BeginDraw/EndDraw.
