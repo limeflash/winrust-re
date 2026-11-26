@@ -113,12 +113,16 @@ impl Choice {
     }
     /// The index `parse` makes of the file's text.
     fn get(&self, parse: impl Fn(&str) -> usize) -> usize {
-        if self.cur.load(Relaxed) == u8::MAX || now_ms().saturating_sub(self.at.load(Relaxed)) > 1000 {
-            let text = self.path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
-            self.cur.store(parse(&text) as u8, Relaxed);
-            self.at.store(now_ms(), Relaxed);
+        // one load, used as it is: a second load could see the MAX that another thread's `forget` stored in between
+        let cur = self.cur.load(Relaxed);
+        if cur != u8::MAX && now_ms().saturating_sub(self.at.load(Relaxed)) <= 1000 {
+            return cur as usize;
         }
-        self.cur.load(Relaxed) as usize
+        let text = self.path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        let v = parse(&text);
+        self.cur.store(v as u8, Relaxed);
+        self.at.store(now_ms(), Relaxed);
+        v
     }
     /// Switches this process, writes the choice and tells the other WinRust windows to repaint.
     fn set(&self, index: usize, name: &str) {
@@ -377,7 +381,7 @@ pub fn pal() -> &'static Pal {
     static CACHE: std::sync::Mutex<Vec<(usize, [u32; 7], &'static Pal)>> = std::sync::Mutex::new(Vec::new());
     let key = base as *const Pal as usize;
     let mut v = CACHE.lock().unwrap();
-    if let Some(e) = v.iter().find(|e| e.0 == key && e.1 == o) {
+    if let Some(e) = v.iter().rev().find(|e| e.0 == key && e.1 == o) { // the newest first: a colour being dragged in the editor is the last one
         return e.2;
     }
     let p: &'static Pal = Box::leak(Box::new(custom_pal(base, o)));
@@ -599,6 +603,16 @@ pub fn icon_face() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_choice_always_answers_with_a_parsed_index() {
+        // `forget` (another thread's reload) leaves the cache at MAX: the answer must come from the parse, never from MAX
+        let c = Choice::new("winrust-test-no-such-file.txt");
+        assert_eq!(c.get(|_| 2), 2);
+        c.forget();
+        assert_eq!(c.get(|_| 1), 1);
+        assert_eq!(c.get(|_| 0), 1, "a fresh answer is kept for the second");
+    }
 
     #[test]
     fn names_round_trip_and_junk_is_normal() {

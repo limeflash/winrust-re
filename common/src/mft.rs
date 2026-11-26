@@ -101,10 +101,19 @@ pub fn merge(recs: &mut HashMap<u32, Rec>, id: u32, r: Rec) {
     }
 }
 
+/// The open volume, closed on every way out of `scan` (the error returns used to leave it open: a rescan leaked one each time).
+struct Volume(HANDLE);
+impl Drop for Volume {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
 pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
     let path: Vec<u16> = format!("\\\\.\\{drive}:").encode_utf16().chain([0]).collect();
     let h = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ptr::null(), OPEN_EXISTING, 0, ptr::null_mut()) };
     if h == INVALID_HANDLE_VALUE { return Err(tf!("не удалось открыть том {0}: (нужны права администратора), код {1}", "cannot open volume {0}: (run as administrator), error {1}", ja: "ボリューム {0}: を開けません (管理者として実行してください)、エラー {1}", pt: "não foi possível abrir o volume {0}: (execute como administrador), erro {1}", zh: "无法打开卷 {0}:（请以管理员身份运行），错误 {1}", drive, unsafe { GetLastError() })); }
+    let _volume = Volume(h);
     let mut vd: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
     let mut n = 0u32;
     let ok = unsafe { DeviceIoControl(h, FSCTL_GET_NTFS_VOLUME_DATA, ptr::null(), 0, &mut vd as *mut _ as _, size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32, &mut n, ptr::null_mut()) };
@@ -142,7 +151,6 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
             len -= want as u64;
         }
     }
-    unsafe { CloseHandle(h) };
     recs.retain(|_, r| !r.name.is_empty()); // no $FILE_NAME anywhere (e.g. attribute list in a record we never saw)
     eprintln!("mft: {seen} slots read, {magic} with FILE magic, {} named", recs.len());
     Ok(recs)
