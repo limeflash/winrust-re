@@ -31,6 +31,8 @@ pub mod keys {
     pub const GEAR: i32 = -12;
     pub const POW_R: i32 = -15;
     pub const POW_S: i32 = -16;
+    /// The red button of a recording in progress, before the clock.
+    pub const REC_I: i32 = -17;
     /// The one quick-settings button around Wi-Fi, volume and battery.
     pub const SYS_GRP: i32 = -11;
 }
@@ -129,6 +131,8 @@ pub struct View {
     pub unread: usize,
     /// Do not disturb is on: the clock wears a little moon.
     pub dnd: bool,
+    /// The time of the recording in progress (`0:24`): a red button with it stands before the clock.
+    pub rec: Option<String>,
 }
 
 /// The pointer and the panels that are open.
@@ -168,6 +172,8 @@ pub enum Kind {
     Qs,
     Restart,
     Power,
+    /// The recording button (`recbar`): a pulsing dot and the time; it stops the recording.
+    Rec,
     Clock,
     /// The thin click zone at the far end (show the desktop); drawn as nothing.
     ShowDesk,
@@ -207,6 +213,7 @@ const FONT_LANG: Font = Font::new(12.0, 600).tracking(0.03);
 const FONT_TIME: Font = Font::new(13.0, 600).tabular();
 const FONT_TIME_DOCK: Font = Font::new(14.0, 600).tabular();
 const FONT_DATE: Font = Font::new(12.0, 400).tabular();
+const FONT_REC: Font = Font::new(12.0, 600).tabular();
 const FONT_LANG_V: Font = Font::new(11.0, 600).tracking(0.03);
 const FONT_STACK: Font = Font::new(15.0, 600).tracking(0.01).tabular();
 
@@ -293,6 +300,13 @@ fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>, clock_extra:
     right.push(b(Kind::Restart, POW_R, 0, 38.0, 40.0, 36.0));
     right.push(b(Kind::Power, POW_S, 0, 38.0, 40.0, 36.0));
     right.push(rsep());
+    if let Some(t) = &v.rec {
+        // `recbar`: 30 high, `padding: 0 10px 0 9px`, an 8 px dot, 7 px gap, 6 px before the clock
+        let w = 9.0 + 8.0 + 7.0 + g.measure(t, FONT_REC) + 10.0;
+        let mut cell = if vert { Cell::btn(Kind::Rec, REC_I, 0, 30.0, bw) } else { Cell::btn(Kind::Rec, REC_I, 0, w, 30.0) };
+        cell.ma = 6.0;
+        right.push(cell);
+    }
     let (clock_w, clock_h) = if dock {
         (g.measure(&v.time, FONT_TIME_DOCK) + 20.0 + clock_extra, 44.0)
     } else {
@@ -934,7 +948,7 @@ fn button(c: &mut Canvas<'_>, it: &Item, lay: &Layout, v: &View, live: &Live, m:
     let a = m.val(it.key, BG, now);
     let power = it.kind == Kind::Power;
     let hover = if it.kind == Kind::Qs { matches!(live.hot, WIFI_I | VOL_I | BAT_I) } else { live.hot == it.key };
-    if a > 0.0 {
+    if a > 0.0 && it.kind != Kind::Rec {
         let base = if power { RED_HOVER } else { Rgba::white(1.0) };
         c.fill(r, 10.0, base.alpha(a));
     }
@@ -975,7 +989,29 @@ fn button(c: &mut Canvas<'_>, it: &Item, lay: &Layout, v: &View, live: &Live, m:
         Kind::Restart => c.icon(icons::RESTART, (cx, cy), 18.0, 1.9, ink, 0.0),
         Kind::Power => c.icon(icons::POWER, (cx, cy), 18.0, 1.9, ink, 0.0),
         Kind::Clock => clock(c, r, v, pal, dock, vert, (m, now)),
+        Kind::Rec => rec_button(c, r, v, a, vert, now),
         Kind::App | Kind::ShowDesk => {}
+    }
+}
+
+/// The recording button: `rgba(229,72,77,.16)`, the time in `#ff9a9e`, a dot that pulses (`recPulse`, 1.3 s).
+fn rec_button(c: &mut Canvas<'_>, r: Rect, v: &View, hover: f32, vert: bool, now: u64) {
+    let Some(t) = &v.rec else { return };
+    c.fill(r, 15.0, Rgba::css(229, 72, 77, 0.16));
+    if hover > 0.0 {
+        c.fill(r, 15.0, Rgba::white(hover));
+    }
+    let ph = (now % 1300) as f32 / 1300.0;
+    let e = CubicBezier::new(0.42, 0.0, 0.58, 1.0).ease(1.0 - (2.0 * ph - 1.0).abs());
+    let d = 8.0 * (1.0 - 0.18 * e);
+    let red = Rgba::css(229, 72, 77, 1.0).fade(1.0 - 0.55 * e);
+    let ink = Rgba::css(255, 154, 158, 1.0);
+    if vert {
+        c.text(t, r, FONT_REC, ink, Align::Center);
+        c.fill(Rect::new(r.cx() - d / 2.0, r.y + 4.0 - d / 2.0, d, d), d / 2.0, red);
+    } else {
+        c.fill(Rect::new(r.x + 9.0 + 4.0 - d / 2.0, r.cy() - d / 2.0, d, d), d / 2.0, red);
+        c.text(t, Rect::new(r.x + 9.0 + 8.0 + 7.0, r.y, r.w, r.h), FONT_REC, ink, Align::Start);
     }
 }
 
@@ -1158,6 +1194,7 @@ mod tests {
             date: "11/26/2026".into(),
             unread: 0,
             dnd: false,
+            rec: None,
         }
     }
 
@@ -1346,5 +1383,21 @@ mod tests {
         assert_eq!((s.thick, s.inset, s.radius, s.outer(), s.reserve()), (72.0, 10.0, 22.0, 82.0, 82.0));
         let s = shape(Style::Floating, Side::Left, 0);
         assert_eq!((s.thick, s.outer(), s.reserve(), s.vert, s.left), (46.0, 54.0, 54.0, true, true));
+    }
+
+    #[test]
+    fn the_recording_button_stands_before_the_clock_and_takes_room_only_while_recording() {
+        let mut g = Gfx::new(1.0).expect("the renderer");
+        let sh = shape(Style::Classic, Side::Bottom, 1);
+        let mut v = view(3);
+        let plain = layout(&mut g, &v, &sh, 54.0, Some(1440.0), 0.0);
+        assert!(plain.rect_of(REC_I).is_none());
+        v.rec = Some("0:24".into());
+        let on = layout(&mut g, &v, &sh, 54.0, Some(1440.0), 0.0);
+        let (rec, clock) = (on.rect_of(REC_I).expect("the button"), on.rect_of(CLOCK).expect("the clock"));
+        assert_eq!(rec.h, 30.0, "`recbar` is 30 high");
+        assert!((clock.x - (rec.x + rec.w) - 8.0).abs() < 0.01, "6 px of margin and the row's 2 px gap before the clock: {rec:?} {clock:?}");
+        assert!(rec.w > 55.0 && rec.w < 70.0, "dot, time and padding: {}", rec.w);
+        assert_eq!(on.hit(rec.cx(), rec.cy()), REC_I);
     }
 }

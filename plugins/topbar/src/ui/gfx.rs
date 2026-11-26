@@ -39,10 +39,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1ColorMatrix, CLSID_D2D1GaussianBlur, CLSID_D2D1Shadow, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_PROPERTIES,
     D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND, D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_INTERSECT,
-    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND, D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_INTERSECT,
+    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_CUSTOM, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
-    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
+    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_MITER, D2D1_LINE_JOIN_ROUND,
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4,
     D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
     D2D1_SHADOW_PROP_COLOR, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
@@ -1351,6 +1351,30 @@ impl Canvas<'_> {
         }
     }
 
+    /// A dashed border (CSS `border: <w>px dashed`) centred on the rectangle `r`'s edge; `dash` and `gap` are in units of `w`.
+    pub fn dashed_rect(&mut self, r: Rect, w: f32, dash: f32, gap: f32, c: Rgba) {
+        if c.a <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let (rt, b) = (self.rt(), self.brush(c));
+        let props = D2D1_STROKE_STYLE_PROPERTIES1 {
+            startCap: D2D1_CAP_STYLE_FLAT,
+            endCap: D2D1_CAP_STYLE_FLAT,
+            dashCap: D2D1_CAP_STYLE_FLAT,
+            lineJoin: D2D1_LINE_JOIN_MITER,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_CUSTOM,
+            dashOffset: 0.0,
+            transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        // SAFETY: a stroke style made and used inside BeginDraw/EndDraw.
+        unsafe {
+            if let Ok(style) = self.g.factory.CreateStrokeStyle(&props, Some(&[dash, gap])) {
+                rt.DrawRectangle(&r.d2d(), &b, w, &style);
+            }
+        }
+    }
+
     pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: Rgba) {
         let (rt, b) = (self.rt(), self.brush(c));
         // SAFETY: drawing inside BeginDraw/EndDraw.
@@ -1936,6 +1960,27 @@ impl Canvas<'_> {
             bctx.EndDraw(None, None).ok()?;
             Some(Picture { bmp: baked.GetBitmap().ok()?, epoch: self.dev().epoch, w: size.width, h: size.height })
         }
+    }
+
+    /// A screen grab (`w`×`h` device pixels, opaque) as a picture that [`Canvas::picture`] draws pixel for pixel; no blur.
+    pub fn pixels(&mut self, px: &[u32], w: i32, h: i32) -> Option<Picture> {
+        if w <= 0 || h <= 0 || px.len() < (w * h) as usize {
+            return None;
+        }
+        let (rt, s) = (self.own(), self.g.scale);
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0 * s,
+            dpiY: 96.0 * s,
+        };
+        // SAFETY: the pixels are read once by CreateBitmap.
+        let bmp = unsafe { rt.CreateBitmap(D2D_SIZE_U { width: w as u32, height: h as u32 }, Some(px.as_ptr().cast()), (w * 4) as u32, &props).ok()? };
+        Some(Picture { bmp, epoch: self.dev().epoch, w: w as f32 / s, h: h as f32 / s })
+    }
+
+    /// Whether `p` was made on the device in use now (after a lost device it draws nothing and must be made again).
+    pub fn is_current(&mut self, p: &Picture) -> bool {
+        p.epoch == self.dev().epoch
     }
 
     /// An image file (JPEG, PNG, ...) scaled to cover `w` × `h` DIPs, as a picture to draw with [`Canvas::picture`]; it is

@@ -475,6 +475,7 @@ fn draw_card(c: &mut Canvas<'_>, (tw, pics): (&mut Tw, &nc::Pictures), hov: Opti
     }
     if let (Some(path), Some(r)) = (n.image.as_deref(), p.image) {
         nc::picture(c, pics, path, r);
+        nc::video_badge(c, n, r);
     }
     let reply = notify::with(|s| s.reply().filter(|r| r.id == card.id).map(|r| r.text.clone()));
     if let (Some(text), Some(r)) = (reply.as_deref(), p.reply) {

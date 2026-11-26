@@ -16,6 +16,7 @@ pub mod power_popup;
 pub mod preview;
 pub mod quick_popup;
 pub mod search_panel;
+pub mod snip;
 pub mod settings_panel;
 pub mod start_panel;
 pub mod svg;

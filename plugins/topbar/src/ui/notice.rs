@@ -428,6 +428,18 @@ pub fn picture(c: &mut Canvas<'_>, pics: &Pictures, path: &str, r: Rect) {
     c.ring(r, 10.0, 1.0, Rgba::white(0.08));
 }
 
+/// The cover of a video: a play button over the middle of its picture and its length in the lower right corner.
+pub fn video_badge(c: &mut Canvas<'_>, n: &Note, r: Rect) {
+    let Some(len) = n.video.as_deref() else { return };
+    c.fill(Rect::new(r.cx() - 17.0, r.cy() - 17.0, 34.0, 34.0), 17.0, Rgba::css(12, 13, 18, 0.72));
+    c.glyph("M8 5v14l11-7z", (r.cx(), r.cy()), 13.0, Rgba::white(1.0));
+    let f = Font::new(11.0, 600).tabular();
+    let w = c.measure(len, f) + 12.0;
+    let chip = Rect::new(r.x + r.w - 6.0 - w, r.y + r.h - 6.0 - 18.0, w, 18.0);
+    c.fill(chip, 5.0, Rgba::css(12, 13, 18, 0.78));
+    c.text(len, chip, f, Rgba::white(1.0), Align::Center);
+}
+
 /// `.ncr`: the field an answer is typed in, with the caret and the send button.
 #[allow(clippy::too_many_arguments)]
 pub fn reply_field(c: &mut Canvas<'_>, tw: &mut dyn Tween, hov: Option<Hit>, id: u64, n: &Note, text: &str, r: (Rect, Rect), pop: bool, since: u64, now: u64) {
@@ -1097,6 +1109,7 @@ impl Centre {
                     }
                     if let (Some(path), Some(r)) = (n.image.as_deref(), p.image) {
                         picture(c, &self.pics, path, at(r));
+                        video_badge(c, n, at(r));
                     }
                     if let (Some(rep), Some(r)) = (snap.reply.as_ref().filter(|r| r.id == it.id), p.reply) {
                         reply_field(c, tw, hov, it.id, n, &rep.text, (at(r.0), at(r.1)), false, self.reply_since.unwrap_or(now), now);

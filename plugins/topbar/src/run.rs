@@ -53,11 +53,24 @@ pub(crate) unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LR
             }
         }
         if k.flags & LLKHF_INJECTED == 0 {
-            // Win+Shift+S is our own region clipper (also under Explorer); without explorer nobody opens the screen
+            // Win+Shift+S is our own screenshot picker (also under Explorer); without explorer nobody opens the screen
             // capture either: PrtSc (when Windows is set to snip with it; otherwise it copies the screen by itself) does it here
             let held = |vk: u16| GetAsyncKeyState(vk as i32) < 0;
             let snip_key = !EXPLORER_UP.load(Relaxed) && k.vkCode == VK_SNAPSHOT as u32;
             let win_shift_s = k.vkCode == b'S' as u32 && down0 && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_SHIFT);
+            // Win+Shift+R is the screen recording: starts the picker for one, or stops the one in progress
+            let win_shift_r = k.vkCode == b'R' as u32 && down0 && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_SHIFT) && !held(VK_CONTROL) && !held(VK_MENU);
+            if win_shift_r {
+                WIN_ALONE.store(false, Relaxed);
+                keybd_event(0xE8, 0, 0, 0); // a key between Win down and up, so Windows does not open its Start menu on the release
+                keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+                PostMessageW(BAR.load(Relaxed) as HWND, SNIP, 3, 0);
+                return 1;
+            }
+            // Esc during a screenshot's delay or a recording's countdown stops it (the disc has no window that could take keys)
+            if k.vkCode == VK_ESCAPE as u32 && down0 && snip::COUNTING.load(Relaxed) {
+                snip::cancel();
+            }
             if snip_key || win_shift_s {
                 if down0 {
                     WIN_ALONE.store(false, Relaxed);
