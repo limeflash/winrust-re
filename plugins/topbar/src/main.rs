@@ -418,8 +418,8 @@ unsafe fn place(hwnd: HWND) {
     let mut ab: APPBARDATA = zeroed();
     ab.cbSize = size_of::<APPBARDATA>() as u32;
     ab.hWnd = hwnd;
-    // classic: the bar, floating: the bar and its gap, the dock reserves nothing (maximized windows take the whole screen and
-    // the dock slides away over them); auto-hide reserves nothing either
+    // the bar and its gap to the screen edge (classic: no gap): maximized windows end above it, the dock included;
+    // auto-hide reserves nothing (the bar slides in over the windows)
     let strip = if i18n::style::autohide() { 0 } else { dp(shape().reserve()) };
     if vert() {
         let left = i18n::style::side() == i18n::style::Side::Left;

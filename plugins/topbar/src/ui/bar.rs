@@ -72,10 +72,11 @@ impl Shape {
         self.thick + self.inset
     }
 
-    /// What the bar reserves from the work area: the dock reserves nothing, a floating bar its gap as well.
+    /// What the bar reserves from the work area: the bar and its gap to the screen edge, so maximized windows end above it
+    /// (the dock too, like macOS's: windows must not slide under it). Auto-hide reserves nothing (see `place`).
     #[must_use]
     pub fn reserve(&self) -> f32 {
-        if self.dock { 0.0 } else { self.outer() }
+        self.outer()
     }
 }
 
@@ -1146,7 +1147,7 @@ mod tests {
     #[test]
     fn shapes() {
         let s = shape(Style::Dock, Side::Bottom, 2);
-        assert_eq!((s.thick, s.inset, s.radius, s.outer(), s.reserve()), (72.0, 10.0, 22.0, 82.0, 0.0));
+        assert_eq!((s.thick, s.inset, s.radius, s.outer(), s.reserve()), (72.0, 10.0, 22.0, 82.0, 82.0));
         let s = shape(Style::Floating, Side::Left, 0);
         assert_eq!((s.thick, s.outer(), s.reserve(), s.vert, s.left), (46.0, 54.0, 54.0, true, true));
     }
