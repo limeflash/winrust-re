@@ -1262,11 +1262,13 @@ impl Popup {
         if paint { let _ = g.paint(surf, win.2, win.3, |c| {
             if let Some((px, (cx, cy, cw, ch))) = cap.take() {
                 *glass = c.glass(&px, cw, ch, look.blur, look.saturate).map(|p| (p, cx, cy));
-                *cap_kept = Some((px, (cx, cy, cw, ch)));
-            } else if let Some((px, (cx, cy, cw, ch))) = cap_kept.as_ref()
-                && glass.as_ref().is_some_and(|(p, ..)| c.picture_stale(p))
-            {
-                *glass = c.glass(px, *cw, *ch, look.blur, look.saturate).map(|p| (p, *cx, *cy));
+                // kept to bake the glass again after a lost device, but not a full-screen grab (15 MB held for a rare event):
+                // such a panel falls back to its opaque tint
+                if i64::from(cw) * i64::from(ch) <= 2_000_000 {
+                    *cap_kept = Some((px, (cx, cy, cw, ch)));
+                }
+            } else if glass.as_ref().is_some_and(|(p, ..)| c.picture_stale(p)) {
+                *glass = cap_kept.as_ref().and_then(|(px, (cx, cy, cw, ch))| c.glass(px, *cw, *ch, look.blur, look.saturate).map(|p| (p, *cx, *cy)));
             }
             let mut f = Frame { now, age, leaving, hover, press, size: (w, h), opacity: pose.opacity, mo };
             let clip = pose.clip.map_or(Rect::new(mx, my, w, h), |i| Rect::new(mx + i.left, my + i.top, w - i.left - i.right, h - i.top - i.bottom));
