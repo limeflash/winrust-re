@@ -547,8 +547,9 @@ pub trait Content {
     fn max_size(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
         None
     }
-    /// Asked before every frame: the new box when the content has changed size (the panel keeps to its button's side).
-    fn resized(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
+    /// Asked before every frame (`now` is the time of that frame): the new box when the content has changed size (the panel
+    /// keeps to its button's side).
+    fn resized(&mut self, _g: &mut Gfx, _now: u64) -> Option<(f32, f32)> {
         None
     }
     /// The screen's size in DIPs, told before `size` to a content placed with [`Along::Fill`].
@@ -604,6 +605,14 @@ pub trait Content {
     fn holes(&self) -> Vec<Hole> {
         Vec::new()
     }
+    /// How far past the box (DIPs, on every side) the content draws in [`Content::overlay`]: the room the window keeps for it.
+    fn reach(&self) -> f32 {
+        0.0
+    }
+    /// Drawn after the box, outside its glass and its clip, still under the panel's own pose and fade: a submenu that stands
+    /// beside the menu on a glass of its own. What it draws answers `hit` like the rest (a point beyond the box is negative or
+    /// past the width).
+    fn overlay(&mut self, _c: &mut Canvas<'_>, _f: &mut Frame<'_>) {}
 }
 
 /// A place where a live thumbnail of a window shows through the panel (DWM draws it in a window under the panel's own).
@@ -739,6 +748,7 @@ impl Popup {
         }
         let modal = content.modal();
         let (w, h) = content.size(g);
+        let place = content.place(); // asked again: a content that finds its place from its size (the switcher) knows it now
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
         g.target_for(bw, bh);
         let size = (bw as f32 / s, bh as f32 / s);
@@ -754,7 +764,7 @@ impl Popup {
         };
         let (b0, b1) = (pose_bounds(&entry.from, size, origin(entry.origin)), pose_bounds(&exit.to, size, origin(exit.origin)));
         let reach = |r: Rect| (-r.x).max(-r.y).max(r.x + r.w - size.0).max(r.y + r.h - size.1).max(0.0);
-        let m_px = ((reach(b0).max(reach(b1)) + 2.0) * s).ceil() as i32;
+        let m_px = ((reach(b0).max(reach(b1)).max(content.reach()) + 2.0) * s).ceil() as i32;
         let m = m_px as f32 / s;
         let win = (at.0 - m_px, at.1 - m_px, bw + 2 * m_px, bh + 2 * m_px);
         // the shadow window: the box and as far as the shadow reaches
@@ -1155,7 +1165,7 @@ impl Popup {
     /// Moves everything to `now` and paints both surfaces.
     pub fn frame(&mut self, g: &mut Gfx, now: u64) -> Shown {
         self.mo.mode = Some(style::anim());
-        if let Some(sz) = self.content.resized(g) {
+        if let Some(sz) = self.content.resized(g, now) {
             self.resize(sz);
         }
         let (pose, open) = self.pose(now);
@@ -1234,6 +1244,7 @@ impl Popup {
                         });
                     });
                 });
+                c.transformed(0.0, 0.0, 1.0, m, m, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.overlay(c, &mut f)));
             });
         }); }
 

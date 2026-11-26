@@ -278,12 +278,14 @@ impl qp::Host for Demo {
             bright: self.bright,
             media: self.media.then(|| qp::Media { title: "Midnight City".into(), artist: "M83".into(), playing: true }),
             battery: self.battery,
+            audio: std::rc::Rc::new(demo_audio()),
         }
     }
 
     fn tile(&mut self, _i: usize, _cx: &mut ui::panel::Cx) {}
     fn volume(&mut self, _percent: i32) {}
     fn mute(&mut self) {}
+    fn audio_set(&mut self, _input: bool, _id: &str) {}
     fn brightness(&mut self, _percent: i32, _done: bool) {}
     fn media(&mut self, _cmd: u8) {}
     fn settings(&mut self, _uri: &'static str, _cx: &mut ui::panel::Cx) {}
@@ -315,6 +317,16 @@ impl qp::Host for Demo {
     fn wifi_forget(&mut self, _ssid: &str) {}
 }
 
+/// The devices of the mockup's fake machine.
+fn demo_audio() -> qp::Audio {
+    use qp::Kind::{Headphones, Microphone, Monitor, Speakers};
+    let d = |name: &str, sub: &str, kind, current| qp::Device { id: name.into(), name: name.into(), sub: sub.into(), kind, current };
+    qp::Audio {
+        outputs: vec![d("Speakers", "Realtek Audio \u{b7} built-in", Speakers, true), d("WH-1000XM5", "Bluetooth \u{b7} battery 80%", Headphones, false), d("DELL U2723QE", "Monitor speakers \u{b7} HDMI", Monitor, false)],
+        inputs: vec![d("Microphone Array", "Realtek Audio \u{b7} built-in", Microphone, true), d("WH-1000XM5", "Bluetooth headset", Headphones, false)],
+    }
+}
+
 thread_local! {
     static DEMO_DATE: std::cell::Cell<(i32, i32, i32)> = const { std::cell::Cell::new((2026, 11, 26)) };
 }
@@ -332,6 +344,9 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
 /// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|start|search|settings[:<page>]|toast|jumplist|preview|taskview|
 /// switcher|menu|power-restart|power-shutdown|power-busy [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]
 /// [q=<text>] [page=<n>] [pins=<n>] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
+///
+/// `quick` shows the list of sound devices after a click on the Sound card's button: `click=23 after=800`. `switcher` takes
+/// `permon` (the list is one monitor's), `menu kind=winx` shows the sign-out submenu with `hover=23`.
 ///
 /// `quick` and `wifi` also take the state of the mockup's fake machine: `on=<tiles, 0..8>` `vol=<n>` `muted` `bright=<n>`
 /// `batt=<n|none>` `charging` `media` `wifioff`, and for `wifi` `ask=<ssid>` (the password prompt) or `menu=<ssid>` (the context
@@ -362,7 +377,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let mut dir_arg = "";
-    let (mut click, mut after, mut busy) = (None::<i32>, 0u64, false);
+    let (mut click, mut after, mut busy, mut per_monitor) = (None::<i32>, 0u64, false, false);
     let (mut n_wins, mut recent, mut kind, mut n_desks) = (3usize, false, "ctx", 2usize);
     for a in args.iter().skip(2) {
         match a.split_once('=') {
@@ -396,6 +411,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             _ => match a.as_str() {
                 "real" => real = true,
                 "busy" => busy = true,
+                "permon" => per_monitor = true,
                 "tiled" => tiled = true,
                 "del" => del = true,
                 "hide" => hide = true,
@@ -615,9 +631,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         } else if what == "taskview" {
             demo_taskview(scale, (sw, sh), n_wins, n_desks, &icon)
         } else if what == "switcher" {
-            demo_switcher(scale, (sw, sh), n_wins, &icon)
+            demo_switcher(scale, (sw, sh), n_wins, per_monitor, &icon)
         } else if what == "menu" {
-            demo_menu(kind, side, (sh as f32 / scale) - 130.0)
+            demo_menu(kind, side, (sh as f32 / scale) - 130.0, side == Side::Right)
         } else if let Some(which) = what.strip_prefix("power-") {
             let kind = if which == "shutdown" { ui::power_popup::Kind::Shutdown } else { ui::power_popup::Kind::Restart };
             let panel = ui::power_popup::PowerPanel::new(kind, |_| {});
@@ -782,7 +798,7 @@ fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, 
     Box::new(TaskView::new(scale, screen, desks, n_desks < 4, cards, false, |_| {}))
 }
 
-fn demo_switcher(scale: f32, screen: (i32, i32), n_wins: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
+fn demo_switcher(scale: f32, screen: (i32, i32), n_wins: usize, per_monitor: bool, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
     use std::rc::Rc;
     use ui::taskview::{OwnedIcon, Switch, Switcher, WinCard};
     let fr = |l: f32, t: f32, w: f32, h: f32| ((l * scale) as i32, (t * scale) as i32, ((l + w) * scale) as i32, ((t + h) * scale) as i32);
@@ -791,10 +807,14 @@ fn demo_switcher(scale: f32, screen: (i32, i32), n_wins: usize, icon: &dyn Fn(&s
     let cards: Vec<WinCard> = (0..n_wins)
         .map(|i| WinCard { hwnd: i as isize + 1, title: titles[i % 4].into(), icon: Rc::new(OwnedIcon(demo_icon(icon, i + 1))), frame: frames[i % 4], minimized: i == 3 })
         .collect();
-    Box::new(Switcher::new(scale, (0, 0, screen.0, screen.1), cards, Switch { selected: || 1, point: |_| {}, pick: |_| {} }))
+    Box::new(Switcher::new(scale, (0, 0, screen.0, screen.1), cards, per_monitor, Switch { selected: || 1, point: |_| {}, pick: |_| {} }))
 }
 
-fn demo_menu(kind: &str, side: Side, max_h: f32) -> Box<dyn ui::panel::Content> {
+fn demo_menu(kind: &str, side: Side, max_h: f32, sub_left: bool) -> Box<dyn ui::panel::Content> {
+    if kind == "winx" {
+        // SAFETY: reads the machine's icons for the tiles, on the renderer's thread.
+        return unsafe { menus::winx_content(side, max_h, sub_left) };
+    }
     let (items, w) = menus::bar_menu_items(kind);
     Box::new(ui::menu::MenuPanel::new(items, w, max_h, side, |_| {}))
 }

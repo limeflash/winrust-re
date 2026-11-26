@@ -23,6 +23,7 @@ mod clip;
 mod hist;
 mod fly;
 mod apps;
+mod audio;
 mod quick;
 mod tray;
 mod status;
@@ -1997,7 +1998,7 @@ pub(crate) unsafe fn search_toggle() {
 /// Right click on Start, and Win+X: the power-user menu (Explorer's own is gone with the bar).
 unsafe fn start_menu() {
     if let Some(a) = anchor(0) {
-        menus::bar_menu("winx", a);
+        menus::winx_menu(a);
     }
 }
 

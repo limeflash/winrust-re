@@ -870,6 +870,24 @@ impl Canvas<'_> {
         }
     }
 
+    /// A rounded rectangle filled with a diagonal gradient, CSS `linear-gradient(135deg, from, to)` of a square.
+    pub fn gradient_diagonal(&mut self, r: Rect, radius: f32, from: Rgba, to: Rgba) {
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let rt = self.rt();
+        let stops = [D2D1_GRADIENT_STOP { position: 0.0, color: from.d2d() }, D2D1_GRADIENT_STOP { position: 1.0, color: to.d2d() }];
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe {
+            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.x, Y: r.y }, endPoint: Vector2 { X: r.x + r.w, Y: r.y + r.h } };
+            if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
+                rt.FillRoundedRectangle(&rr, &b);
+            }
+        }
+    }
+
     /// A rounded rectangle with a radial gradient, CSS `radial-gradient(rx ry at (cx, cy), c, transparent <end>)`: `c` at the
     /// centre fading out to nothing at `end` (0..1 of the radius) and staying clear beyond.
     pub fn radial(&mut self, r: Rect, radius: f32, (cx, cy): (f32, f32), (rx, ry): (f32, f32), c: Rgba, end: f32) {

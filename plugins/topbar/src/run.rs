@@ -152,12 +152,12 @@ pub(crate) unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LR
                     return 1;
                 }
                 // the switcher owns these keys while open (they must not reach the app behind it, #92)
-                if matches!(k.vkCode as u16, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_DELETE | VK_RETURN) {
+                if matches!(k.vkCode as u16, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_DELETE | VK_Q | VK_RETURN) {
                     if down {
                         match k.vkCode as u16 {
                             VK_LEFT | VK_UP => { PostMessageW(bar, ALT_TAB, 1, 0); }
                             VK_RIGHT | VK_DOWN => { PostMessageW(bar, ALT_TAB, 0, 0); }
-                            VK_DELETE => { PostMessageW(bar, ALT_UP, 2, 0); }
+                            VK_DELETE | VK_Q => { PostMessageW(bar, ALT_UP, 2, 0); } // Q closes the chosen window, as the hint says
                             _ => {
                                 // Enter: switch now; the Alt release afterwards must not open the menu bar
                                 SWITCHING.store(false, Relaxed);

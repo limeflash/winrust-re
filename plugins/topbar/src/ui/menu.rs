@@ -1,4 +1,4 @@
-//! The menus of the bar: right click on an empty spot, on the clock, Win+X. The mockup's menus in one piece: the jump list's
+//! The menus of the bar: right click on an empty spot and on the clock (Win+X has its own panel, `winx`). The mockup's menus in one piece: the jump list's
 //! glass (`rgba(16,17,24,.82)`, blur 40, radius 20, padding 8) and the desktop menu's rows (`.dmr`: 38 px, a 17 px icon,
 //! the label, a hint on the right, `rgba(255,255,255,.08)` on hover, red for what destroys something), the sections divided
 //! by a hairline and rising one after the other. It opens like the jump list does: unrolls from the bar.
@@ -87,14 +87,25 @@ pub const fn look() -> Look {
     Look::glass(20.0, 0.82, Shadow { dy: 30.0, blur: 80.0, color: Rgba::css(0, 0, 0, 0.6) })
 }
 
-/// One key cap (`kbd`: 11 px, weight 500, padding 1 × 6, radius 4); returns where the next one to its left ends.
-pub fn kbd(c: &mut Canvas<'_>, right: f32, cy: f32, text: &str) -> f32 {
-    let font = Font::new(11.0, 500);
-    let w = c.measure(text, font).ceil() + 12.0;
-    let r = Rect::new(right - w, cy - 7.5, w, 15.0);
-    c.fill(r, 4.0, Rgba::white(0.07));
+/// The width of the key cap of `text` (`kbd`: 11 px, weight 500, padding 1 x 6).
+pub fn cap_width(c: &mut Canvas<'_>, text: &str) -> f32 {
+    c.measure(text, Font::new(11.0, 500)).ceil() + 12.0
+}
+
+/// One key cap with its left edge at `x`, centred on `cy`: radius 4, `plate` white behind it and a lit lower edge.
+pub fn cap(c: &mut Canvas<'_>, x: f32, cy: f32, text: &str, ink: Rgba, plate: f32) -> f32 {
+    let w = cap_width(c, text);
+    let r = Rect::new(x, cy - 7.5, w, 15.0);
+    c.fill(r, 4.0, Rgba::white(plate));
     c.fill(Rect::new(r.x + 1.5, r.y + r.h - 1.0, r.w - 3.0, 1.0), 0.0, Rgba::white(0.08));
-    c.text(text, r, font, DIM, Align::Center);
+    c.text(text, r, Font::new(11.0, 500), ink, Align::Center);
+    w
+}
+
+/// One key cap of a row's hint; returns where the next one to its left ends.
+pub fn kbd(c: &mut Canvas<'_>, right: f32, cy: f32, text: &str) -> f32 {
+    let w = cap_width(c, text);
+    cap(c, right - w, cy, text, DIM, 0.07);
     right - w - 3.0
 }
 
