@@ -9,7 +9,7 @@
 use winrust_common::style::{Side, pal};
 
 use super::anim::{EASE, SNAP, SPRING};
-use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba};
+use super::gfx::{Align, Canvas, Font, Gfx, Picture, Rect, Rgba};
 use super::icons;
 use super::menu::Item;
 use super::panel::{Button, Content, Cx, Dir, Entry, Exit, Frame, Id, Inset, Look, Mods, Origin, Place, Pose, Shadow, Along};
@@ -57,6 +57,11 @@ pub struct StartPanel {
     /// The first result (or the one the keys moved to) while typing.
     sel: usize,
     recent: Vec<Recent>,
+    recent_view: bool,
+    recent_filter: usize,
+    recent_scroll: usize,
+    filter_rects: [Rect; 4],
+    pictures: std::collections::HashMap<String, Option<Picture>>,
     user: (String, String),
     gen_seen: u32,
     button: Rect,
@@ -70,7 +75,7 @@ pub struct StartPanel {
 impl StartPanel {
     #[must_use]
     pub fn new() -> Self {
-        let mut p = Self::blank(apps::recent(4), apps::user());
+        let mut p = Self::blank(apps::recent(60), apps::user());
         p.update();
         p
     }
@@ -85,6 +90,11 @@ impl StartPanel {
             all_apps: false,
             sel: 0,
             recent,
+            recent_view: false,
+            recent_filter: 0,
+            recent_scroll: 0,
+            filter_rects: [Rect::new(0.0, 0.0, 0.0, 0.0); 4],
+            pictures: std::collections::HashMap::new(),
             user,
             gen_seen: 0,
             button: Rect::new(W / 2.0 - 21.0, H + 12.0, 42.0, 42.0),
@@ -102,6 +112,12 @@ impl StartPanel {
         (p.query, p.focus, p.page, p.items) = (query.to_string(), !query.is_empty(), page, items);
         p.gen_seen = apps::GEN.load(std::sync::atomic::Ordering::Relaxed);
         p
+    }
+
+    pub fn with_recent_view(mut self, filter: usize) -> Self {
+        self.recent_view = true;
+        self.recent_filter = filter.min(3);
+        self
     }
 
     fn searching(&self) -> bool {
@@ -274,16 +290,22 @@ impl StartPanel {
             c.text(t!("Здесь появятся недавно открытые файлы", "Files you open will show up here", ja: "最近開いたファイルがここに表示されます", pt: "Os arquivos abertos recentemente aparecem aqui", zh: "最近打开的文件会显示在这里"), r, Font::new(13.0, 400), DIM, Align::Center);
             return;
         }
-        for (n, it) in self.recent.iter().enumerate() {
+        for (n, it) in self.recent.iter().take(4).enumerate() {
             let r = Self::recent_rect(n);
             let id = RECENT + n as i32;
             c.fill(r, 12.0, Rgba::white(0.07 * f.hover(id, 160, SPRING)));
             let lift = f.tween(id, 1, -3.0 * f32::from(f.hover == Some(id)), 250, SPRING);
             let k = f.tween(id, 2, if f.press == Some(id) { 0.94 } else { 1.0 }, 250, SPRING);
             let tile = Rect::new(r.x + 8.0, r.cy() - 20.0, 40.0, 40.0);
+            if Self::recent_kind(it) == 2 {
+                self.pictures.entry(it.path.clone()).or_insert_with(|| c.image(&it.path, 40.0, 40.0));
+            }
+            let picture = self.pictures.get(&it.path).and_then(Option::as_ref);
             c.transformed(tile.cx(), tile.cy(), k, 0.0, lift, |c| {
                 c.fill(tile, 10.0, Rgba::white(0.06));
-                if let Some(img) = apps::image(&it.path) {
+                if let Some(p) = picture {
+                    c.picture_cover(p, tile, 10.0, 1.0);
+                } else if let Some(img) = apps::image(&it.path) {
                     let s = c.scale();
                     let (iw, ih) = (img.w as f32 / s, img.h as f32 / s);
                     if img.thumb {
@@ -337,6 +359,90 @@ impl StartPanel {
         for (id, r, glyph) in [(SETTINGS, Self::settings_rect(), icons::GEAR), (POWER, Self::power_rect(), icons::POWER)] {
             c.fill(r, 10.0, Rgba::white(0.1 * f.hover(id, 250, EASE)));
             c.icon(glyph, (r.cx(), r.cy()), 18.0, 1.8, MUTED, 0.0);
+        }
+    }
+
+    fn recent_kind(it: &Recent) -> usize {
+        if it.dir { return 3; }
+        let ext = std::path::Path::new(&it.path).extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+        if ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"].contains(&ext.as_str()) { 2 } else { 1 }
+    }
+
+    fn recent_indices(&self) -> Vec<usize> {
+        let q = self.query.to_lowercase();
+        self.recent.iter().enumerate().filter(|(_, r)| (self.recent_filter == 0 || Self::recent_kind(r) == self.recent_filter) && r.name.to_lowercase().contains(&q)).map(|(i, _)| i).collect()
+    }
+
+    fn draw_recent_page(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, progress: f32) {
+        let back = Rect::new(16.0, 76.0, 100.0, 32.0);
+        c.fill(back, 9.0, Rgba::white(0.07 * f.hover(3000, 140, EASE)));
+        c.icon("M15 6l-6 6 6 6", (28.0, 92.0), 16.0, 2.2, INK, 0.0);
+        c.text(t!("????????", "Recent", ja: "??", pt: "Recentes", zh: "??"), Rect::new(40.0, 76.0, 76.0, 32.0), Font::new(13.0, 600), INK, Align::Start);
+        let labels = [t!("???", "All", ja: "???", pt: "Todos", zh: "??"), t!("?????????", "Documents", ja: "??", pt: "Documentos", zh: "??"), t!("???????????", "Images", ja: "??", pt: "Imagens", zh: "??"), t!("?????", "Folders", ja: "?????", pt: "Pastas", zh: "???")];
+        let mut x = 624.0;
+        for k in (0..4).rev() {
+            let count = self.recent.iter().filter(|r| k == 0 || Self::recent_kind(r) == k).count();
+            let text = format!("{}  {}", labels[k], count);
+            let w = c.measure(&text, Font::new(12.0, 500)) + 22.0;
+            x -= w;
+            let r = Rect::new(x, 78.0, w, 28.0);
+            self.filter_rects[k] = r;
+            c.fill(r, 14.0, Rgba::white(if self.recent_filter == k { 0.14 } else { 0.05 }));
+            c.text(&text, r, Font::new(12.0, 500), MUTED, Align::Center);
+            x -= 4.0;
+        }
+        let indices = self.recent_indices();
+        let area = Rect::new(16.0, 116.0, 616.0, 384.0);
+        for &i in indices.iter().skip(self.recent_scroll).take(6) {
+            let item = &self.recent[i];
+            if Self::recent_kind(item) == 2 { self.pictures.entry(item.path.clone()).or_insert_with(|| c.image(&item.path, 40.0, 40.0)); }
+        }
+        c.clipped(area, |c| {
+            let mut y = 116.0;
+            let mut last_day = None;
+            for (row, &i) in indices.iter().skip(self.recent_scroll).take(6).enumerate() {
+                let it = &self.recent[i];
+                if last_day != Some(it.day) {
+                    let title = match it.day { 0 => t!("???????", "Today", ja: "??", pt: "Hoje", zh: "??"), 1 => t!("?????", "Yesterday", ja: "??", pt: "Ontem", zh: "??"), _ => t!("?????", "Earlier", ja: "??", pt: "Anteriormente", zh: "??") };
+                    c.text(title, Rect::new(26.0, y, 300.0, 28.0), Font::new(11.5, 600), DIM, Align::Start);
+                    y += 28.0;
+                    last_day = Some(it.day);
+                }
+                let r = Rect::new(16.0, y, 616.0, 52.0);
+                y += 52.0;
+                let hot = f.hover(10000 + i as i32, 140, EASE).max(f32::from(f.hover == Some(1000000 + i as i32) || f.hover == Some(2000000 + i as i32)));
+                let delay = row as f32 * 0.035;
+                let appear = ((progress - delay) / (1.0 - delay)).clamp(0.0, 1.0);
+                c.faded(appear, |c| c.transformed(0.0, 0.0, 1.0, 0.0, 6.0 * (1.0 - appear), |c| {
+                c.fill(r, 12.0, Rgba::white(0.07 * hot));
+                let tile = Rect::new(r.x + 8.0, r.y + 8.0, 36.0, 36.0);
+                c.fill(tile, 9.0, Rgba::white(0.06));
+                if let Some(Some(picture)) = self.pictures.get(&it.path) {
+                    c.picture_cover(picture, tile, 9.0, 1.0);
+                } else if let Some(img) = apps::image(&it.path) {
+                    if img.thumb {
+                        let k = (36.0 / img.w as f32).max(36.0 / img.h as f32);
+                        let dst = Rect::new(tile.cx() - img.w as f32 * k / 2.0, tile.cy() - img.h as f32 * k / 2.0, img.w as f32 * k, img.h as f32 * k);
+                        c.clipped(tile, |c| c.hicon(img.icon, dst, 1.0));
+                    } else { c.hicon(img.icon, Rect::new(tile.x + 7.0, tile.y + 7.0, 22.0, 22.0), 1.0); }
+                } else {
+                    c.icon(if Self::recent_kind(it) == 3 { FOLDER } else { "M6 3h8l4 4v14H6zM14 3v5h4M9 12h6M9 16h6" }, (tile.cx(), tile.cy()), 22.0, 1.7, MUTED, 0.0);
+                }
+                c.text_fit(&it.name, Rect::new(72.0, r.y + 8.0, 400.0, 18.0), Font::new(13.0, 500), INK, Align::Start);
+                let parent = std::path::Path::new(&it.path).parent().map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+                c.text_fit(&parent, Rect::new(72.0, r.y + 27.0, 400.0, 17.0), Font::new(12.0, 400), DIM, Align::Start);
+                if hot > 0.01 {
+                    c.icon(FOLDER, (581.0, r.cy()), 15.0, 1.9, MUTED, 0.0);
+                    c.icon("M7 7l10 10M17 7L7 17", (611.0, r.cy()), 11.0, 2.6, MUTED, 0.0);
+                } else { c.text_fit(it.when.rsplit_once(", ").map_or(it.when.as_str(), |(_, time)| time), Rect::new(475.0, r.y, 140.0, 52.0), Font::new(12.0, 400), DIM, Align::End); }
+                }));
+            }
+            if indices.is_empty() { c.text(t!("??? ???????? ??????", "Nothing here yet", ja: "???????????????", pt: "Nada por aqui ainda", zh: "??????"), Rect::new(16.0, 200.0, 616.0, 100.0), Font::new(13.0, 500), DIM, Align::Center); }
+        });
+        if indices.len() > 6 {
+            let h = (area.h * 6.0 / indices.len() as f32).max(20.0);
+            let y = area.y + (area.h - h) * self.recent_scroll as f32 / (indices.len() - 6) as f32;
+            c.fill(Rect::new(628.0, y, 3.0, h), 1.5, Rgba::white(0.14));
         }
     }
 
@@ -426,6 +532,10 @@ impl Content for StartPanel {
                 self.page = h as usize / PER_PAGE;
             }
         }
+        if self.recent_view && let Some(id) = f.hover.filter(|h| (10000..1000000).contains(h)) && let Some(pos) = self.recent_indices().iter().position(|&i| 10000 + i as i32 == id) {
+            if pos < self.recent_scroll { self.recent_scroll = pos; }
+            if pos >= self.recent_scroll + 6 { self.recent_scroll = pos.saturating_sub(5); }
+        }
         let accent = Rgba::colorref(pal().accent);
         let origin = |bottom: f32| (SEARCH.x + 0.28 * SEARCH.w, bottom);
         // `.stOut .sti{ opacity: 0 }` over .12 s: the blocks go before the glass does
@@ -435,6 +545,9 @@ impl Content for StartPanel {
             let rise = |f: &Frame<'_>, delay| f.rise(delay, 340, SNAP, 18.0, 0.96);
             let r = rise(f, 0);
             r.draw(c, origin(SEARCH.y + SEARCH.h), |c| self.draw_field(c, f, accent));
+            let view = f.tween(7000, 0, f32::from(self.recent_view), 340, SNAP);
+            if view > 0.0 { c.faded(view, |c| c.transformed(0.0, 0.0, 1.0, 22.0 * (1.0 - view), 0.0, |c| self.draw_recent_page(c, f, view))); }
+            if view < 1.0 { c.faded(1.0 - view, |c| c.transformed(0.0, 0.0, 1.0, -22.0 * view, 0.0, |c| {
             let r = rise(f, 70);
             r.draw(c, origin(TITLE_Y + 32.0), |c| self.draw_title(c, f, accent));
             let r = rise(f, 90);
@@ -443,6 +556,7 @@ impl Content for StartPanel {
             r.draw(c, origin(RECENT_Y + 32.0), |c| self.draw_recent_head(c, f));
             let r = rise(f, 130);
             r.draw(c, origin(RECENT_GRID_Y + 116.0), |c| self.draw_recent(c, f));
+            })); }
             let r = rise(f, 150);
             r.draw(c, origin(H), |c| self.draw_bottom(c, f, accent));
         });
@@ -451,6 +565,20 @@ impl Content for StartPanel {
     fn hit(&self, x: f32, y: f32) -> Option<i32> {
         if SEARCH.contains(x, y) {
             return Some(FIELD);
+        }
+        if self.recent_view {
+            if Rect::new(16.0, 76.0, 100.0, 32.0).contains(x, y) { return Some(3000); }
+            if let Some(k) = self.filter_rects.iter().position(|r| r.contains(x, y)) { return Some(3100 + k as i32); }
+            if (116.0..500.0).contains(&y) && (16.0..632.0).contains(&x) {
+                let mut top = 116.0;
+                let mut day = None;
+                for i in self.recent_indices().into_iter().skip(self.recent_scroll).take(6) {
+                    if day != Some(self.recent[i].day) { top += 28.0; day = Some(self.recent[i].day); }
+                    if y >= top && y < top + 52.0 { return Some(if x >= 596.0 { 2000000 + i as i32 } else if x >= 566.0 { 1000000 + i as i32 } else { 10000 + i as i32 }); }
+                    top += 52.0;
+                }
+            }
+            return [(USER, self.user_rect()), (SETTINGS, Self::settings_rect()), (POWER, Self::power_rect())].into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| id);
         }
         if GRID.contains(x, y) {
             let i = (0..self.items.len()).filter(|i| i / PER_PAGE == self.page).find(|&i| Self::pin_rect(i, self.page as f32).contains(x, y))?;
@@ -462,7 +590,7 @@ impl Content for StartPanel {
         if self.show_all_rect().contains(x, y) {
             return Some(SHOW_ALL);
         }
-        if let Some(n) = (0..self.recent.len()).find(|&n| Self::recent_rect(n).contains(x, y)) {
+        if let Some(n) = (0..self.recent.len().min(4)).find(|&n| Self::recent_rect(n).contains(x, y)) {
             return Some(RECENT + n as i32);
         }
         [(USER, self.user_rect()), (SETTINGS, Self::settings_rect()), (POWER, Self::power_rect())].into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| id)
@@ -471,7 +599,12 @@ impl Content for StartPanel {
     fn click(&mut self, id: i32, b: Button, cx: &mut Cx) {
         match id {
             FIELD => self.focus = true,
-            SHOW_ALL => cx.close_then(|| open_str("shell:Recent")),
+            3000 => { self.recent_view = false; self.set_query(String::new()); },
+            n if (3100..3104).contains(&n) => { self.recent_filter = (n - 3100) as usize; self.recent_scroll = 0; },
+            n if (10000..1000000).contains(&n) => { if let Some(path) = self.recent.get((n - 10000) as usize).map(|r| r.path.clone()) { cx.close_then(move || open_str(&path)); } },
+            n if (1000000..2000000).contains(&n) => { if let Some(path) = self.recent.get((n - 1000000) as usize).map(|r| r.path.clone()) { cx.close_then(move || winrust_common::reveal(&path)); } },
+            n if (2000000..3000000).contains(&n) => { let i = (n - 2000000) as usize; if let Some(item) = self.recent.get(i) && apps::remove_recent(&item.path) { self.recent.remove(i); self.recent_scroll = self.recent_scroll.min(self.recent_indices().len().saturating_sub(6)); } },
+            SHOW_ALL => { self.recent_view = true; self.recent_filter = 0; self.recent_scroll = 0; },
             USER => cx.close_then(|| open_str("ms-settings:yourinfo")),
             SETTINGS => cx.close_then(|| open_str("ms-settings:")),
             POWER => cx.close_then(power_menu),
@@ -493,6 +626,7 @@ impl Content for StartPanel {
     }
 
     fn enter(&mut self, hover: Option<i32>, _mods: Mods, cx: &mut Cx) {
+        if self.recent_view { if let Some(id) = hover.filter(|h| (10000..1000000).contains(h)) { self.click(id, Button::Left, cx); } return; }
         let i = if self.searching() { Some(self.sel) } else { hover.filter(|&h| h < FIELD).map(|h| h as usize) };
         if let Some(i) = i {
             self.click(i as i32, Button::Left, cx);
@@ -500,6 +634,13 @@ impl Content for StartPanel {
     }
 
     fn nav(&self, from: Option<i32>, dir: Dir) -> Option<i32> {
+        if self.recent_view {
+            let indices = self.recent_indices();
+            if indices.is_empty() { return None; }
+            let at = from.and_then(|h| indices.iter().position(|i| 10000 + *i as i32 == h));
+            let next = match dir { Dir::First => 0, Dir::Last => indices.len() - 1, Dir::Up | Dir::Left => at.unwrap_or(0).saturating_sub(1), Dir::Down | Dir::Right => at.map_or(0, |n| (n + 1).min(indices.len() - 1)) };
+            return Some(10000 + indices[next] as i32);
+        }
         let n = self.items.len() as i32;
         if n == 0 {
             return None;
@@ -555,6 +696,7 @@ impl Content for StartPanel {
     }
 
     fn escape(&mut self) -> bool {
+        if self.recent_view { self.recent_view = false; self.set_query(String::new()); return true; }
         if self.query.is_empty() {
             return false;
         }
@@ -564,6 +706,7 @@ impl Content for StartPanel {
     }
 
     fn wheel(&mut self, _x: f32, y: f32, up: bool) {
+        if self.recent_view { self.recent_scroll = if up { self.recent_scroll.saturating_sub(1) } else { (self.recent_scroll + 1).min(self.recent_indices().len().saturating_sub(6)) }; return; }
         if self.searching() || !(GRID.y..GRID.y + GRID.h).contains(&y) {
             return;
         }
@@ -694,5 +837,19 @@ mod tests {
         assert!(p.escape(), "the first Esc clears the field");
         assert!(p.query.is_empty());
         assert!(!p.escape(), "the next one closes the panel");
+    }
+}
+#[cfg(test)]
+mod recent_page_tests {
+    use super::*;
+    #[test]
+    fn category_filters_and_counts() {
+        let make = |name: &str, path: &str| Recent { name: name.into(), path: path.into(), when: String::new(), day: 0, dir: std::path::Path::new(path).is_dir() };
+        let mut panel = StartPanel::blank(vec![make("document", "x.docx"), make("photo", "x.JPG"), make("folder", ".")], (String::new(), String::new()));
+        assert_eq!(panel.recent_indices().len(), 3);
+        for filter in 1..=3 { panel.recent_filter = filter; assert_eq!(panel.recent_indices().len(), 1); }
+        panel.recent_filter = 0;
+        panel.query = "PHOTO".into();
+        assert_eq!(panel.recent_indices(), vec![1]);
     }
 }

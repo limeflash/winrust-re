@@ -1023,6 +1023,25 @@ impl Canvas<'_> {
         }
     }
 
+    /// Draw a window snapshot with cover fitting and rounded corners.
+    pub fn hicon_cover(&mut self, icon: HICON, r: Rect, radius: f32) {
+        use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BRUSH_PROPERTIES};
+        if icon.is_invalid() { return; }
+        let Some(bmp) = self.bitmap_of(icon) else { return };
+        // SAFETY: the bitmap belongs to this render target and is used inside BeginDraw/EndDraw.
+        unsafe {
+            let size = bmp.GetSize();
+            if size.width <= 0.0 || size.height <= 0.0 { return; }
+            let k = (r.w / size.width).max(r.h / size.height);
+            let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+            let brush = D2D1_BRUSH_PROPERTIES { opacity: 1.0, transform: Matrix3x2::scale(k, k) * Matrix3x2::translation(r.cx() - size.width * k / 2.0, r.cy() - size.height * k / 2.0) };
+            let rt = self.rt();
+            if let Ok(b) = rt.CreateBitmapBrush(&bmp, Some(&props), Some(&brush)) {
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius }, &b);
+            }
+        }
+    }
+
     /// CSS `filter: drop-shadow(0 <dy>px <blur>px <c>)` of an icon: its own silhouette, blurred. Cached per icon and size.
     pub fn icon_shadow(&mut self, icon: HICON, r: Rect, dy: f32, blur: f32, c: Rgba) {
         if icon.is_invalid() || c.a <= 0.0 || r.w <= 0.0 {

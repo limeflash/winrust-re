@@ -205,8 +205,13 @@ fn draw_label(c: &mut Canvas<'_>, card: &WinCard, cx: f32, y: f32, max_w: f32, f
 fn draw_plate(c: &mut Canvas<'_>, card: &WinCard, r: Rect) {
     c.fill(r, 14.0, Rgba::css(29, 30, 36, 1.0));
     c.ring(r, 14.0, 1.0, Rgba::white(0.08));
-    let k = 48.0f32.min(r.w - 8.0).min(r.h - 8.0).max(16.0);
-    c.hicon(card.icon.0, Rect::new(r.cx() - k / 2.0, r.cy() - k / 2.0, k, k), 1.0);
+    if let Some((picture, _, _)) = crate::snapshots::get(card.hwnd) {
+        c.hicon_cover(picture.0, r, 14.0);
+        c.forget_icon(picture.0);
+    } else {
+        let k = 48.0f32.min(r.w - 8.0).min(r.h - 8.0).max(16.0);
+        c.hicon(card.icon.0, Rect::new(r.cx() - k / 2.0, r.cy() - k / 2.0, k, k), 1.0);
+    }
 }
 
 /// Cuts the hole a live picture shows through; a hair of alpha keeps the pointer on the panel.
@@ -673,10 +678,15 @@ impl Content for Switcher {
             c.fill(frame, 11.0, THUMB);
             c.ring(frame, 11.0, 1.0, Rgba::white(0.07));
             if card.minimized {
-                let k = 46.0;
-                let at = Rect::new(frame.cx() - k / 2.0, frame.cy() - k / 2.0, k, k);
-                c.icon_shadow(card.icon.0, at, 8.0, 18.0, Rgba::css(0, 0, 0, 0.45));
-                c.hicon(card.icon.0, at, 1.0);
+                if let Some((picture, _, _)) = crate::snapshots::get(card.hwnd) {
+                    c.hicon_cover(picture.0, frame, 11.0);
+                    c.forget_icon(picture.0);
+                } else {
+                    let k = 46.0;
+                    let at = Rect::new(frame.cx() - k / 2.0, frame.cy() - k / 2.0, k, k);
+                    c.icon_shadow(card.icon.0, at, 8.0, 18.0, Rgba::css(0, 0, 0, 0.45));
+                    c.hicon(card.icon.0, at, 1.0);
+                }
                 let word = t!("Свёрнуто", "Minimized", ja: "最小化", pt: "Minimizada", zh: "已最小化");
                 let font = Font::new(11.0, 500);
                 let w = c.measure(word, font).ceil() + 16.0;
