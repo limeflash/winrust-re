@@ -6,8 +6,6 @@
 //! thumbnail belongs ([`super::panel::Hole`]), and DWM shows the thumbnails through them. The window's region is the union of
 //! the thumbnails' rectangles, so nothing of it is seen but the pictures (a panel that fades does not show a black box).
 
-use std::collections::HashMap;
-
 use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
@@ -75,8 +73,10 @@ unsafe fn visible_part(id: isize, w: isize) -> (RECT, u32) {
 /// The thumbnails of the panel's holes and the window that shows them.
 pub struct Thumbs {
     host: HWND,
-    /// Source window → thumbnail id.
-    reg: HashMap<isize, isize>,
+    /// Each hole's window and how many holes before it show the same window, in the order of the holes.
+    keys: Vec<(isize, usize)>,
+    /// The thumbnail of each of `keys` (0: DWM refused it).
+    ids: Vec<isize>,
     rects: Vec<(i32, i32, i32, i32)>,
     shown: bool,
 }
@@ -84,7 +84,7 @@ pub struct Thumbs {
 impl Thumbs {
     #[must_use]
     pub fn new(host: HWND) -> Self {
-        Self { host, reg: HashMap::new(), rects: Vec::new(), shown: false }
+        Self { host, keys: Vec::new(), ids: Vec::new(), rects: Vec::new(), shown: false }
     }
 
     #[must_use]
@@ -101,12 +101,21 @@ impl Thumbs {
     /// Puts the thumbnails where `holes` are. True when the window has just appeared (its place in the z-order must be set).
     pub fn update(&mut self, holes: &[ScreenHole]) -> bool {
         let live: Vec<&ScreenHole> = holes.iter().filter(|h| h.rect.2 > h.rect.0 && h.rect.3 > h.rect.1 && h.opacity > 0).collect();
-        let gone: Vec<isize> = self.reg.keys().copied().filter(|k| !live.iter().any(|h| h.win == *k)).collect();
-        for k in gone {
-            if let Some(id) = self.reg.remove(&k) {
-                // SAFETY: the id came from DwmRegisterThumbnail.
-                unsafe { DwmUnregisterThumbnail(id) };
+        // One thumbnail per hole: a window can show twice (its card in Task view and its miniature in the desktop's tile). DWM
+        // draws the thumbnails of a window in the order they were registered, the last on top, so when the holes change they
+        // are all registered again in their order (the miniatures of a desktop overlap, back to front).
+        let keys: Vec<(isize, usize)> = live.iter().enumerate().map(|(i, h)| (h.win, live[..i].iter().filter(|o| o.win == h.win).count())).collect();
+        if keys != self.keys {
+            self.release();
+            for &(w, _) in &keys {
+                let mut id = 0isize;
+                // SAFETY: our window and another program's; a failed registration leaves 0, which is skipped below.
+                if unsafe { DwmRegisterThumbnail(self.host, w as HWND, &mut id) } != 0 {
+                    id = 0;
+                }
+                self.ids.push(id);
             }
+            self.keys = keys;
         }
         if live.is_empty() {
             self.hide();
@@ -130,18 +139,7 @@ impl Thumbs {
                 self.rects = rects;
                 self.shown = true;
             }
-            for h in live {
-                let id = match self.reg.get(&h.win) {
-                    Some(&id) => id,
-                    None => {
-                        let mut id = 0isize;
-                        if DwmRegisterThumbnail(self.host, h.win as HWND, &mut id) != 0 {
-                            continue;
-                        }
-                        self.reg.insert(h.win, id);
-                        id
-                    }
-                };
+            for (h, &id) in live.iter().zip(&self.ids).filter(|(_, id)| **id != 0) {
                 // what the thumbnail shows is the window with its invisible resize borders; the picture is the visible frame
                 let (src, flags) = visible_part(id, h.win);
                 let p = DWM_THUMBNAIL_PROPERTIES {
@@ -167,12 +165,17 @@ impl Thumbs {
         }
     }
 
-    /// Takes every thumbnail down and hides the window.
-    pub fn clear(&mut self) {
-        for (_, id) in self.reg.drain() {
+    fn release(&mut self) {
+        for id in self.ids.drain(..).filter(|&id| id != 0) {
             // SAFETY: the id came from DwmRegisterThumbnail.
             unsafe { DwmUnregisterThumbnail(id) };
         }
+        self.keys.clear();
+    }
+
+    /// Takes every thumbnail down and hides the window.
+    pub fn clear(&mut self) {
+        self.release();
         self.hide();
     }
 }

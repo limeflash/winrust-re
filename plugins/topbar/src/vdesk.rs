@@ -117,7 +117,7 @@ pub(crate) unsafe fn desktop_of(w: HWND) -> Option<Id> {
 /// Every window that sits on a desktop's surface, as rectangles in fractions of the screen, back to front, one list per desktop
 /// (`cur` is the current one): for the miniatures of Task view. The windows DWM cloaks for the shell are on another desktop:
 /// Windows names which one when it answers, and with two desktops it can only be the other one.
-pub(crate) unsafe fn miniatures(desks: &[Desktop], cur: usize) -> Vec<Vec<(f32, f32, f32, f32)>> {
+pub(crate) unsafe fn miniatures(desks: &[Desktop], cur: usize) -> Vec<Vec<(isize, (f32, f32, f32, f32))>> {
     struct Acc(Vec<HWND>);
     unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> i32 {
         let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
@@ -145,7 +145,7 @@ pub(crate) unsafe fn miniatures(desks: &[Desktop], cur: usize) -> Vec<Vec<(f32, 
         if let Some(i) = at.filter(|&i| i < out.len()) {
             let f = |v: i32, m: f32| (v as f32 / m).clamp(0.0, 1.0);
             let (x0, y0, x1, y1) = (f(l, sw), f(t, sh), f(r, sw), f(b, sh));
-            out[i].push((x0, y0, x1 - x0, y1 - y0));
+            out[i].push((h as isize, (x0, y0, x1 - x0, y1 - y0)));
         }
     }
     out

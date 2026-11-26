@@ -61,8 +61,14 @@ pub struct Desk {
     pub current: bool,
     /// The wallpaper file behind its tile.
     pub wallpaper: String,
-    /// The windows on it as rectangles in fractions of the screen (left, top, width, height), back to front.
-    pub wins: Vec<(f32, f32, f32, f32)>,
+    /// The windows on it, back to front: the window (0 = none to show live) and its rectangle in fractions of the screen (left,
+    /// top, width, height).
+    pub wins: Vec<(isize, (f32, f32, f32, f32))>,
+}
+
+/// A window's miniature in a desktop's tile.
+fn mini(tile: Rect, (x, y, w, h): (f32, f32, f32, f32)) -> Rect {
+    Rect::new((tile.x + x * tile.w).round(), (tile.y + y * tile.h).round(), (w * tile.w).max(6.0).round(), (h * tile.h).max(4.0).round())
 }
 
 const CLOSE_BASE: i32 = 100;
@@ -273,12 +279,13 @@ impl TaskView {
             c.ring(r.inset(-1.0), 13.0, 1.0, Rgba::white(0.12));
         }
         c.fill(r, 12.0, Rgba::css(11, 13, 20, 1.0));
+        if let Some(Some(p)) = self.walls.as_ref().and_then(|w| w.get(i)) {
+            c.picture_cover(p, r, 12.0, 1.0);
+        }
         c.clipped(r, |c| {
-            if let Some(Some(p)) = self.walls.as_ref().and_then(|w| w.get(i)) {
-                c.picture(p, (r.cx() - p.w / 2.0).round(), (r.cy() - p.h / 2.0).round());
-            }
-            for &(x, y, w, h) in &d.wins {
-                let m = Rect::new((r.x + x * r.w).round(), (r.y + y * r.h).round(), (w * r.w).max(6.0).round(), (h * r.h).max(4.0).round());
+            // the current desktop's windows are live pictures (cut in `draw`); the others' are drawn like the mockup's
+            for &(_, m) in d.wins.iter().filter(|w| !(d.current && w.0 != 0)) {
+                let m = mini(r, m);
                 c.fill(m.inset(-0.5), 3.0, Rgba::css(0, 0, 0, 0.5));
                 c.fill(m, 3.0, Rgba::css(29, 30, 36, 1.0));
                 c.fill(Rect::new(m.x, m.y, m.w, (m.h * 0.12).clamp(2.0, 8.0)), 0.0, Rgba::css(38, 39, 47, 1.0));
@@ -369,6 +376,16 @@ impl Content for TaskView {
                 }
             });
         });
+        // the current desktop's windows show live in its tile, back to front (the later thumbnail is drawn on top), cut out of
+        // the tile's round corners and kept under its bottom edge; outside the strip's fade, which a cut could not go through
+        for (i, t) in tiles.iter().enumerate().filter(|(i, _)| self.desks[*i].current) {
+            let t = t.shift(0.0, strip.dy - 2.0 * f.hover(DESK_BASE + i as i32, 200, SPRING));
+            for &(win, m) in self.desks[i].wins.iter().filter(|w| w.0 != 0) {
+                let m = mini(t, m);
+                c.clipped(Rect::new(t.x, t.y, t.w, t.h - 7.0), |c| c.erase_within(m, 3.0, t, 12.0, Rgba::new(0.0, 0.0, 0.0, 1.0 / 255.0)));
+                self.holes.push(Hole { win, rect: m, opacity: strip.opacity });
+            }
+        }
 
         if self.cards.is_empty() {
             c.faded(strip.opacity, |c| c.text_fit(&self.empty, Rect::new(0.0, 430.0 - 10.0, self.screen.0, 20.0), Font::new(15.0, 400), DIM, Align::Center));

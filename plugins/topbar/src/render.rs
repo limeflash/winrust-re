@@ -793,7 +793,7 @@ fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, 
         .collect();
     let on_first = [(0.2, 0.13, 0.59, 0.62), (0.36, 0.22, 0.52, 0.33)];
     let desks: Vec<Desk> = (0..n_desks)
-        .map(|i| Desk { name: format!("Desktop {}", i + 1), current: i == 0, wallpaper: r"C:\Windows\Web\Wallpaper\Windows\img19.jpg".into(), wins: if i == 0 { on_first.to_vec() } else { Vec::new() } })
+        .map(|i| Desk { name: format!("Desktop {}", i + 1), current: i == 0, wallpaper: r"C:\Windows\Web\Wallpaper\Windows\img19.jpg".into(), wins: if i == 0 { on_first.iter().map(|&r| (0, r)).collect() } else { Vec::new() } })
         .collect();
     Box::new(TaskView::new(scale, screen, desks, n_desks < 4, cards, false, |_| {}))
 }

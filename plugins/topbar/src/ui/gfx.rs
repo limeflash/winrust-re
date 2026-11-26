@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1ColorMatrix, CLSID_D2D1GaussianBlur, CLSID_D2D1Shadow, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_PROPERTIES,
     D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND, D2D1_COMBINE_MODE_EXCLUDE,
+    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND, D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_INTERSECT,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
@@ -1163,6 +1163,35 @@ impl Canvas<'_> {
         unsafe {
             ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
             ctx.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius }, &b);
+            ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        }
+    }
+
+    /// Sets the pixels of the rounded rectangle `r` that lie inside the rounded rectangle `within` to `to` (a hole cut in a box
+    /// with round corners: transparent, or a hair of alpha that keeps the pointer on the window).
+    pub fn erase_within(&mut self, r: Rect, radius: f32, within: Rect, within_radius: f32, to: Rgba) {
+        let rr = |r: Rect, k: f32| D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: k, radiusY: k };
+        let f_ = &self.g.factory;
+        // SAFETY: plain geometry work on the factory.
+        let shape = unsafe {
+            (|| -> Result<ID2D1Geometry> {
+                let a = f_.CreateRoundedRectangleGeometry(&rr(r, radius))?;
+                let b = f_.CreateRoundedRectangleGeometry(&rr(within, within_radius))?;
+                let path = f_.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                a.CombineWithGeometry(&b, D2D1_COMBINE_MODE_INTERSECT, None, 0.1, &sink)?;
+                sink.Close()?;
+                path.cast()
+            })()
+            .ok()
+        };
+        let Some(shape) = shape else { return };
+        let ctx = self.dev().ctx.clone();
+        let b = self.brush(to);
+        // SAFETY: drawing inside BeginDraw/EndDraw; the blend mode is restored.
+        unsafe {
+            ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            ctx.FillGeometry(&shape, &b, None);
             ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
         }
     }
