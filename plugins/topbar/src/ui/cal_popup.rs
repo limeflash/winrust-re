@@ -1,6 +1,8 @@
 //! The calendar panel (the clock on the bar): the big clock and the date, a month card (title, "Today", arrows, a week from
 //! Monday, six rows of days with today in the accent circle and the picked day in a ring) and a card for the picked day's
 //! events. Dense glass, radius 22, `qsIn` from the bottom right corner, 380 px wide, against the right edge of the screen.
+//! Above it, 10 px apart on a glass of its own, stands the notification centre ([`super::notice::Centre`]); the two are one
+//! window (the column of the mockup) whose box is both cards.
 //!
 //! The month changes at once, like in the mockup (it animates nothing but the hover and the fill of the day circles). The
 //! names of days and months and the clock come from Windows' own locale; the panel's own words from the interface language.
@@ -8,21 +10,27 @@
 
 use super::anim::EASE;
 use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba};
-use super::panel::{Along, Button, Content, Cx, Dir, Entry, Frame, Id, Look, Origin, Place, Shadow};
+use super::notice::Centre;
+use super::panel::{Along, Button, Content, Cx, Dir, Entry, Frame, Id, Look, Mods, Origin, Place, Shadow};
 use winrust_common::style::{Side, pal};
 
 const W: f32 = 380.0;
 const PAD: f32 = 12.0;
 const GAP: f32 = 8.0;
 const COL: f32 = 48.0;
-const CELL: f32 = 38.0;
-const HEAD_H: f32 = 8.0 + 40.0 + 2.0 + 17.0 + 6.0;
+const CELL: f32 = 34.0;
+const CLOCK_H: f32 = 34.0;
+const HEAD_H: f32 = 8.0 + CLOCK_H + 2.0 + 17.0 + 6.0;
 const CARD_Y: f32 = PAD + HEAD_H + GAP;
 const CARD_H: f32 = 10.0 + 32.0 + 6.0 + 26.0 + 2.0 + 6.0 * CELL + 5.0 * 2.0 + 12.0;
 const EV_Y: f32 = CARD_Y + CARD_H + GAP;
 const EV_H: f32 = 58.0;
 const H: f32 = EV_Y + EV_H + PAD;
 
+/// Ids from here on belong to the notification centre.
+const CENTRE: i32 = 1000;
+/// The gap between the two cards of the column.
+const COLUMN_GAP: f32 = 10.0;
 const TODAY: i32 = 50;
 const PREV: i32 = 51;
 const NEXT: i32 = 52;
@@ -43,6 +51,8 @@ pub type Date = (i32, i32, i32);
 pub struct Now {
     pub date: Date,
     pub time: String,
+    /// The clock of the notifications (`GetTickCount64`), ms.
+    pub tick: u64,
 }
 
 /// Days in month `m` (1..=12) of year `y`.
@@ -154,7 +164,9 @@ mod locale {
         let mut t = SYSTEMTIME { wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0 };
         // SAFETY: fills a local.
         unsafe { GetLocalTime(&mut t) };
-        super::Now { date: (i32::from(t.wYear), i32::from(t.wMonth), i32::from(t.wDay)), time: clock(t.wHour, t.wMinute) }
+        // SAFETY: a plain clock read.
+        let tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        super::Now { date: (i32::from(t.wYear), i32::from(t.wMonth), i32::from(t.wDay)), time: clock(t.wHour, t.wMinute), tick }
     }
 }
 
@@ -179,13 +191,37 @@ pub struct CalPanel {
     day: Option<(Date, String)>,
     /// How wide the "Today" button is in the current language.
     today_w: f32,
+    centre: Centre,
+    /// Height of the centre's card, and where the calendar's card begins.
+    centre_h: f32,
+    /// The room the whole column has.
+    room: f32,
+    /// The time of the last frame, for what a click needs to know.
+    t: u64,
 }
 
 impl CalPanel {
+    /// `room` is the height the whole column may take: the notification centre gives way to the calendar.
     #[must_use]
-    pub fn new(now: fn() -> Now, side: Side) -> Self {
+    pub fn new(now: fn() -> Now, side: Side, room: f32) -> Self {
         let today = now().date;
-        Self { now, side, view: (today.0, today.1), sel: today, weekdays: locale::weekdays(), title: None, day: None, today_w: 56.0 }
+        let centre_room = (room - COLUMN_GAP - H).max(0.0);
+        let mut me = Self {
+            now,
+            side,
+            view: (today.0, today.1),
+            sel: today,
+            weekdays: locale::weekdays(),
+            title: None,
+            day: None,
+            today_w: 56.0,
+            centre: Centre::new(centre_room),
+            centre_h: 0.0,
+            room,
+            t: 0,
+        };
+        me.t = (me.now)().tick;
+        me
     }
 
     /// The month on show and the picked day (for tests and the renderer).
@@ -230,22 +266,108 @@ impl Content for CalPanel {
         Place { along: Along::ScreenEnd, ..Place::default() }
     }
 
-    fn size(&mut self, _g: &mut Gfx) -> (f32, f32) {
-        (W, H)
+    fn size(&mut self, g: &mut Gfx) -> (f32, f32) {
+        let now = (self.now)().tick;
+        self.lay_out(g, now)
+    }
+
+    fn max_size(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
+        Some((W, self.room))
+    }
+
+    /// The column's height follows the notification centre's.
+    fn resized(&mut self, g: &mut Gfx, now: u64) -> Option<(f32, f32)> {
+        self.t = now;
+        let before = self.centre_h;
+        let size = self.lay_out(g, now);
+        ((self.centre_h - before).abs() > 0.01).then_some(size)
+    }
+
+    fn cards(&self) -> Vec<Rect> {
+        vec![Rect::new(0.0, 0.0, W, self.centre_h), Rect::new(0.0, self.centre_h + COLUMN_GAP, W, H)]
     }
 
     fn pulse(&self) -> u32 {
-        1000
+        if self.centre.typing() { 500 } else { 1000 }
+    }
+
+    fn animating(&self, now: u64) -> bool {
+        self.centre.animating(now)
+    }
+
+    fn typing(&self) -> bool {
+        self.centre.typing()
+    }
+
+    fn text(&mut self, ch: char, _cx: &mut Cx) {
+        self.centre.text(ch);
+    }
+
+    fn escape(&mut self) -> bool {
+        self.centre.escape()
+    }
+
+    fn enter(&mut self, hover: Option<i32>, _mods: Mods, cx: &mut Cx) {
+        if self.centre.typing() {
+            self.centre.enter(self.t, cx);
+        } else if let Some(id) = hover {
+            self.click(id, Button::Left, cx);
+        }
+    }
+
+    fn wheel(&mut self, _x: f32, y: f32, up: bool) {
+        if y < self.centre_h {
+            self.centre.wheel(up);
+        }
+    }
+
+    fn tip(&self, id: i32) -> Option<(String, Rect)> {
+        self.centre.tip(id - CENTRE)
     }
 
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
+        let now = f.now;
+        let hover = f.hover.filter(|&h| h >= CENTRE).map(|h| h - CENTRE);
+        self.centre.draw(c, f, hover, now);
+        let top = self.centre_h + COLUMN_GAP;
+        c.transformed(0.0, 0.0, 1.0, 0.0, top, |c| self.draw_calendar(c, f));
+    }
+
+    fn hit(&self, x: f32, y: f32) -> Option<i32> {
+        if y < self.centre_h {
+            return self.centre.hit(x, y).map(|i| i + CENTRE);
+        }
+        self.hit_calendar(x, y - self.centre_h - COLUMN_GAP)
+    }
+
+    fn click(&mut self, id: i32, b: Button, cx: &mut Cx) {
+        if id >= CENTRE {
+            self.centre.click(id - CENTRE, b, self.t, cx);
+        } else {
+            self.click_calendar(id, b);
+        }
+    }
+
+    fn nav(&self, from: Option<i32>, dir: Dir) -> Option<i32> {
+        self.nav_calendar(from, dir)
+    }
+}
+
+impl CalPanel {
+    /// Lays the centre out and returns the column's box.
+    fn lay_out(&mut self, g: &mut Gfx, now: u64) -> (f32, f32) {
+        self.centre_h = self.centre.relayout(g, now);
+        (W, self.centre_h + COLUMN_GAP + H)
+    }
+
+    fn draw_calendar(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
         let accent = Rgba::colorref(pal().accent);
         let now = (self.now)();
         let today = now.date;
 
         // the clock and the date
-        let head = Rect::new(PAD + 8.0, PAD + 8.0, W - 2.0 * PAD - 16.0, 40.0);
-        c.text(&now.time, head, Font::new(40.0, 600).tracking(-0.03).tabular(), INK, Align::Start);
+        let head = Rect::new(PAD + 8.0, PAD + 8.0, W - 2.0 * PAD - 16.0, CLOCK_H);
+        c.text(&now.time, head, Font::new(34.0, 600).tracking(-0.03).tabular(), INK, Align::Start);
         let dt = match &self.day {
             Some((d, s)) if *d == today => s.clone(),
             _ => {
@@ -254,7 +376,7 @@ impl Content for CalPanel {
                 s
             }
         };
-        c.text(&dt, Rect::new(PAD + 8.0, PAD + 8.0 + 42.0, W - 2.0 * PAD - 16.0, 17.0), Font::new(14.0, 400), DIM, Align::Start);
+        c.text(&dt, Rect::new(PAD + 8.0, PAD + 8.0 + CLOCK_H + 2.0, W - 2.0 * PAD - 16.0, 17.0), Font::new(14.0, 400), DIM, Align::Start);
 
         // the month card
         let card = Rect::new(PAD, CARD_Y, W - 2.0 * PAD, CARD_H);
@@ -324,7 +446,7 @@ impl Content for CalPanel {
         );
     }
 
-    fn hit(&self, x: f32, y: f32) -> Option<i32> {
+    fn hit_calendar(&self, x: f32, y: f32) -> Option<i32> {
         if let Some(id) = [TODAY, PREV, NEXT].into_iter().find(|&id| self.button(id).contains(x, y)) {
             return Some(id);
         }
@@ -334,7 +456,7 @@ impl Content for CalPanel {
         })
     }
 
-    fn click(&mut self, id: i32, b: Button, _cx: &mut Cx) {
+    fn click_calendar(&mut self, id: i32, b: Button) {
         if b != Button::Left {
             return;
         }
@@ -349,7 +471,7 @@ impl Content for CalPanel {
         }
     }
 
-    fn nav(&self, from: Option<i32>, dir: Dir) -> Option<i32> {
+    fn nav_calendar(&self, from: Option<i32>, dir: Dir) -> Option<i32> {
         let start = (0..42).find(|&i| cell(self.view, i) == self.sel).unwrap_or(0);
         let i = match (from.filter(|&f| f < 42), dir) {
             (_, Dir::First) => 0,
@@ -377,6 +499,35 @@ mod tests {
         assert_eq!(cell((2026, 11), 35), (2026, 11, 30));
         assert_eq!(cell((2026, 11), 36), (2026, 12, 1));
         assert_eq!(cell((2026, 11), 41), (2026, 12, 6));
+    }
+
+    #[test]
+    fn the_column_is_the_centre_over_the_calendar_and_each_has_its_own_card() {
+        use super::super::panel::{Anchor, Popup};
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
+        fn now() -> Now {
+            Now { date: (2026, 11, 26), time: "03:57".into(), tick: 1_000_000 }
+        }
+        crate::notify::with(|s| *s = crate::notify::Store::new());
+        let mut g = Gfx::new(1.0).unwrap();
+        let anchor = Anchor { side: Side::Bottom, button: (1330, 850, 1430, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
+        let mut p = Popup::new(&mut g, Box::new(CalPanel::new(now, Side::Bottom, 822.0)), anchor, 0, &mut grab);
+        let (x, y, w, h) = p.rect();
+        // an empty centre is 52 + 128 high, 10 above the calendar's 467; the column's right edge is 12 from the screen's, its
+        // bottom 12 above the bar
+        assert_eq!((w, h), (380, 52 + 128 + 10 + 467));
+        assert_eq!((x + w, y + h), (1440 - 12, 846 - 12));
+        let shown = p.frame(&mut g, 2000);
+        assert!(shown.alpha > 0 && !p.surfaces().1.pixels().is_empty());
+        // the gap between the two cards lets the screen through: no pixel of the glass window is lit there
+        let (wx, wy, ww, _) = shown.win;
+        let at = |gx: i32, gy: i32| p.surfaces().0.pixels()[((gy - wy) * ww + (gx - wx)) as usize];
+        assert_eq!(at(x + 190, y + 52 + 128 + 5) >> 24, 0, "the gap is clear");
+        assert!(at(x + 190, y + 52 + 128 + 10 + 30) >> 24 > 200, "the calendar's card is there");
+        assert!(at(x + 190, y + 20) >> 24 > 200, "the centre's card is there");
     }
 
     #[test]

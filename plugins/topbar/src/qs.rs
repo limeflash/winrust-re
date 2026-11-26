@@ -592,10 +592,21 @@ pub(crate) unsafe fn wifi_toggle() {
     }
 }
 
+/// The calendar with the notification centre, if it is not open (a click on a pop-up opens it).
+pub(crate) unsafe fn cal_open() {
+    if !ui::panel::is_open(ui::panel::Id::Cal) {
+        cal_toggle();
+    }
+}
+
 /// A click on the clock: the calendar, or close it.
 pub(crate) unsafe fn cal_toggle() {
     ui::panel::toggle(ui::panel::Id::Cal, || {
         let a = anchor(CLOCK)?;
-        Some((Box::new(ui::cal_popup::CalPanel::new(ui::cal_popup::system_now, a.side)), a))
+        // the column's room: from 12 below the top of the screen to 12 above the bar (beside a side bar, to the screen's end)
+        let s = SCALE.get();
+        let (sh, bar_top) = (a.screen.1 as f32 / s, a.bar.1 as f32 / s);
+        let room = if a.side == Side::Bottom { bar_top - 12.0 - 12.0 } else { sh - 24.0 };
+        Some((Box::new(ui::cal_popup::CalPanel::new(ui::cal_popup::system_now, a.side, room)), a))
     });
 }

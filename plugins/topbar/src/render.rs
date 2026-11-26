@@ -123,6 +123,7 @@ pub(crate) unsafe fn render(args: &[String]) {
     let (mut style, mut side, mut size) = (Style::Classic, Side::Bottom, 1u8);
     let (mut hover, mut press, mut open, mut scale, mut op) = (NONE, NONE, "", 1.0f32, 0.85f32);
     let (mut battery, mut tray, mut n_apps) = (false, 0usize, 8usize);
+    let (mut unread, mut dnd) = (0usize, false);
     let Some(file) = args.first() else { return };
     for a in &args[1..] {
         match a.split_once('=') {
@@ -133,7 +134,9 @@ pub(crate) unsafe fn render(args: &[String]) {
             Some(("op", v)) => op = v.parse::<f32>().unwrap_or(85.0) / 100.0,
             Some(("tray", v)) => tray = v.parse().unwrap_or(0),
             Some(("apps", v)) => n_apps = v.parse().unwrap_or(8),
+            Some(("unread", v)) => unread = v.parse().unwrap_or(0),
             _ => match a.as_str() {
+                "dnd" => dnd = true,
                 "battery" => battery = true,
                 "0" | "1" | "2" => size = a.parse().unwrap_or(1),
                 "bottom" | "left" | "right" => side = Side::parse(a),
@@ -170,6 +173,8 @@ pub(crate) unsafe fn render(args: &[String]) {
         lang: "RUS".into(),
         time: "03:57".into(),
         date: "11/26/2026".into(),
+        unread,
+        dnd,
     };
     let still = barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() };
     let shown = barui::Live {
@@ -332,7 +337,7 @@ thread_local! {
 }
 
 fn demo_now() -> ui::cal_popup::Now {
-    ui::cal_popup::Now { date: DEMO_DATE.get(), time: "03:57".into() }
+    ui::cal_popup::Now { date: DEMO_DATE.get(), time: "03:57".into(), tick: NOTIFY_BASE }
 }
 
 /// `y-m-d` or `y-m` as numbers.
@@ -378,6 +383,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let mut dir_arg = "";
     let (mut click, mut after, mut busy, mut per_monitor) = (None::<i32>, 0u64, false, false);
+    // the notification centre (`calendar`) and the pop-ups (`popups`): what is in the store
+    let (mut notes_arg, mut expand, mut reply_text, mut pops_arg) = ("demo", "", None::<&str>, "msg,shot,cal");
+    let (mut dnd_flag, mut undo_flag) = (false, false);
     let (mut n_wins, mut recent, mut kind, mut n_desks) = (3usize, false, "ctx", 2usize);
     for a in args.iter().skip(2) {
         match a.split_once('=') {
@@ -408,7 +416,13 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("wins", v)) => n_wins = v.parse().unwrap_or(3),
             Some(("desks", v)) => n_desks = v.parse().unwrap_or(2),
             Some(("kind", v)) => kind = Box::leak(v.to_string().into_boxed_str()),
+            Some(("notes", v)) => notes_arg = Box::leak(v.to_string().into_boxed_str()),
+            Some(("expand", v)) => expand = Box::leak(v.to_string().into_boxed_str()),
+            Some(("reply", v)) => reply_text = Some(Box::leak(v.to_string().into_boxed_str())),
+            Some(("pops", v)) => pops_arg = Box::leak(v.to_string().into_boxed_str()),
             _ => match a.as_str() {
+                "dnd" => dnd_flag = true,
+                "undo" => undo_flag = true,
                 "real" => real = true,
                 "busy" => busy = true,
                 "permon" => per_monitor = true,
@@ -422,7 +436,17 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             },
         }
     }
-    let sandbox = what.starts_with("settings") || what == "toast";
+    let notifying = matches!(what.as_str(), "calendar" | "popups");
+    let base = if notifying { NOTIFY_BASE } else { 0 };
+    if notifying {
+        // the machine's own notifications are never read: the store holds the mockup's
+        ui::notice::set_icon_loader(|p| {
+            // SAFETY: the shell makes the icon; the handle lives as long as the process.
+            unsafe { item_icon(p, 32) as isize }
+        });
+        demo_notes(what == "popups", notes_arg, expand, reply_text, (dnd_flag, undo_flag), pops_arg, base);
+    }
+    let sandbox = what.starts_with("settings") || what == "toast" || notifying;
     if sandbox {
         // SAFETY: single-threaded at this point; the process only ever reads these settings from its own scratch folder.
         if !benchmarking { unsafe { std::env::set_var("ProgramData", std::env::temp_dir().join("topbar-render")) }; }
@@ -466,6 +490,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         lang: "RUS".into(),
         time: "03:57".into(),
         date: "11/26/2026".into(),
+        unread: 0,
+        dnd: false,
     };
     let lit = barui::Live {
         now: 100_000,
@@ -540,7 +566,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         ("menu", "winx") => 0,
         ("menu", _) => at,
         ("quick" | "wifi", _) => WIFI_I,
-        ("calendar", _) => CLOCK,
+        ("calendar" | "popups", _) => CLOCK,
         ("start", _) => 0,
         ("search", _) => SEARCH,
         ("settings" | "toast", _) => GEAR,
@@ -577,12 +603,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 (_, Some(ssid)) => panel.with_menu(ssid),
                 _ => panel,
             })
+        } else if what == "popups" {
+            Box::new(ui::tray_popup::TrayPanel::new(demo_cells, |_, _, _| {})) // not shown: `render_popups` takes over
         } else if what == "calendar" {
             let get = |k: &str| args.iter().find_map(|a| a.strip_prefix(k).and_then(|v| v.strip_prefix('=')));
             let today = get("today").and_then(parse_date).unwrap_or((2026, 11, 26));
             DEMO_DATE.set(today);
             let view = get("view").and_then(parse_date).map_or((today.0, today.1), |d| (d.0, d.1));
-            Box::new(ui::cal_popup::CalPanel::new(demo_now, side).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
+            // the whole column: the mockup's room is the screen less 12 at the top and the bar's 12 and height at the bottom
+            let room = if side == Side::Bottom { (p.rest.1 as f32 / scale) - 24.0 } else { screen_h - 24.0 };
+            Box::new(ui::cal_popup::CalPanel::new(demo_now, side, room).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
         } else if what == "start" || what == "search" {
             apps::load(); // the machine's apps, synchronously, with the icons of what is pinned
             let recent = apps::recent(if what == "start" { 4 } else { 3 });
@@ -669,7 +699,11 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         let mut grab = |x: i32, y: i32, w: i32, h: i32| {
             Some((0..h).flat_map(|row| snap[((y + row) * sw + x) as usize..((y + row) * sw + x + w) as usize].iter().copied()).collect::<Vec<u32>>())
         };
-        let mut popup = Popup::new(&mut gfx, content, anchor, 0, &mut grab);
+        if what == "popups" {
+            render_popups((&mut gfx, canvas.as_mut_slice()), (sw, sh), (file, scale, t), (anchor, hover), (&p, bar_surf));
+            return;
+        }
+        let mut popup = Popup::new(&mut gfx, content, anchor, base, &mut grab);
         popup.set_hover(hover);
         if benchmarking {
             let mut bench = Bench::new();
@@ -688,16 +722,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             bench.report(&what);
             return;
         }
-        let _ = popup.frame(&mut gfx, 0); // the first frame stamps what opens with the panel (the rising blocks of the first page)
+        let _ = popup.frame(&mut gfx, base); // the first frame stamps what opens with the panel (the rising blocks of the first page)
         if let Some(id) = click {
             // the panel at rest, a click on item `id`, then the frame `after` ms later (the ones in between run as the live timer does)
-            let _ = popup.frame(&mut gfx, t);
+            let _ = popup.frame(&mut gfx, base + t);
             let _ = popup.click_id(id); // what it asks of the bar (a repaint, a toast) is not done here
             for ms in (0..after).step_by(16) {
-                let _ = popup.frame(&mut gfx, t + ms);
+                let _ = popup.frame(&mut gfx, base + t + ms);
             }
         }
-        let shown = popup.frame(&mut gfx, t + after);
+        let shown = popup.frame(&mut gfx, base + t + after);
         for (i, h) in popup.holes().iter().enumerate() {
             fake_window(&mut canvas, (sw, sh), h.rect, i);
         }
@@ -718,6 +752,124 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         if whole { (0, 0, sw, sh) } else { around(popup.rect()) }
     };
     let (x0, y0, x1, y1) = crop;
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in y0..y1 {
+        out.extend_from_slice(&canvas[(y * sw + x0) as usize..(y * sw + x1) as usize]);
+    }
+    if gfx.save_png(file, w as u32, h as u32, &out).is_err() {
+        let _ = std::fs::write(format!("{file}.err.txt"), "could not write the png");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the notifications of the mockup, for `--render-panel calendar` and `popups`
+
+/// The clock of the notification renders: the frame at `t` ms stands at `NOTIFY_BASE + t`, so notes can be hours old.
+const NOTIFY_BASE: u64 = 36_000_000;
+
+fn demo_app(key: &str) -> notify::App {
+    use notify::{App, AppIcon};
+    let (name, icon) = match key {
+        "telegram" => ("Telegram", AppIcon::Plate("M20.5 4.5L3.5 11l5 2 2 6 3-4 5 3z", 0x37aee2, 0x1e96c8)),
+        "discord" => ("Discord", AppIcon::Plate("M6 8c3-2 9-2 12 0 1 3 1 7-1 10-2 1-3 1-5 0-2 1-3 1-5 0-2-3-2-7-1-10zM9.5 12.5h.01M14.5 12.5h.01", 0x7a84f7, 0x4752c4)),
+        "tm" => ("Task Manager", AppIcon::Plate("M4 18V9M9 18V5M14 18v-7M19 18V7", 0x3a3f4b, 0x22252d)),
+        "winrust" => ("WinRust", AppIcon::Winrust),
+        "cal" => ("Calendar", AppIcon::Plate("M5 8h14v11H5zM5 11h14M9 5v3M15 5v3", 0xe5484d, 0xc13a40)),
+        _ => ("Screenshot", AppIcon::Plate("M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M12 12h.01", 0x7b6cf0, 0x5b4bd8)),
+    };
+    App { key: key.into(), name: name.into(), icon }
+}
+
+/// Fills the store the way the mockup's states do: the seven notes of `NDEF` (`notes=demo`, the default) or none, the pop-ups
+/// of `popups` (`pops=msg,shot,cal,sus`), Do not disturb, an open stack, an answer being typed, "Clear all" just pressed.
+fn demo_notes(popups: bool, which: &str, expand: &str, reply: Option<&str>, (dnd, undo): (bool, bool), pops: &str, base: u64) {
+    use notify::{Act, Do, Note};
+    let min = 60_000u64;
+    let wall = r"C:\Windows\Web\Wallpaper\Windows\img19.jpg";
+    let acts = |l: &[(&str, Do)]| l.iter().map(|(t, d)| Act { label: (*t).into(), does: d.clone() }).collect::<Vec<_>>();
+    let chat = || acts(&[("Reply", Do::Reply), ("Mark as read", Do::Read)]);
+    let go = |s: &str| Do::Open(s.into());
+    let mk = |app: &str, title: &str, body: &str, a: Vec<Act>| Note::new(demo_app(app), title, body).acts(a);
+    let asel = || mk("telegram", "Asel", "Скинула новые макеты установщика, глянь когда будет минутка", chat()).avatar('A', 0xf472b6, 0xbe185d);
+    notify::with(|s| {
+        *s = notify::Store::new();
+        if popups {
+            for (k, name) in pops.split(',').enumerate() {
+                let n = match name {
+                    "shot" => mk("snip", "Screenshot saved", "Copied to clipboard \u{b7} Pictures \u{203a} Screenshots", acts(&[("Open", go("x")), ("Show in folder", Do::Show("x".into()))])).image(wall),
+                    "cal" => mk("cal", "Design sync in 10 minutes", "19:30 \u{2013} 20:00 \u{b7} Google Meet", acts(&[("Join", go("x")), ("Snooze", Do::Read)])),
+                    "long" => mk("telegram", "A very long title that does not fit on one line of a pop-up at all, truly", "The body of this one runs on and on and on, past the three lines a pop-up allows, so that its last line has to end in an ellipsis instead of spilling out of the card over the buttons.", chat()).avatar('A', 0xf472b6, 0xbe185d),
+                    "sus" => mk("tm", "winhelper.exe looks suspicious", "Unsigned, runs from %TEMP% and opens outbound connections.", acts(&[("End task", go("x")), ("Show", Do::Show("x".into()))])).danger(),
+                    _ => mk("telegram", "Asel", "Ты тут? Созвонимся в 19:30?", chat()).avatar('A', 0xf472b6, 0xbe185d),
+                };
+                s.push(n, base + [0, 500, 950][k.min(2)]);
+            }
+        } else {
+            s.open_centre(); // the centre is on show: nothing pops up
+            if which == "demo" || undo {
+                // oldest first, the list stands newest first; the first four are read
+                let list = [
+                    (180, mk("discord", "#design-review", "Kira: the new Alt+Tab looks great, ship it", vec![]).avatar('#', 0x818cf8, 0x4338ca), false),
+                    (120, mk("telegram", "WinRust chat", "Lemxy: new nightly is up, please test the topbar on 2 monitors", chat()).avatar('W', 0x34d399, 0x047857), false),
+                    (60, mk("snip", "Screenshot saved", "Pictures \u{203a} Screenshots \u{203a} desktop.png", acts(&[("Open", go("x")), ("Show in folder", Do::Show("x".into()))])).image(wall), false),
+                    (60, mk("winrust", "WinRust 0.5.2 is ready", "Faster search indexing and a new Terminal. Restart the bar to update.", acts(&[("Update now", go("x")), ("Later", Do::Read)])), false),
+                    (21, mk("tm", "winhelper.exe looks suspicious", "Unsigned, runs from %TEMP% and opens outbound connections.", acts(&[("End task", go("x")), ("Show", Do::Show("x".into()))])).danger(), true),
+                    (14, mk("telegram", "Dima", "PR с фото-вьюером посмотрел, пара комментов по анимации", chat()).avatar('D', 0x60a5fa, 0x1d4ed8), true),
+                    (2, asel(), true),
+                ];
+                for (ago, n, unread) in list {
+                    let id = s.push(n, base.saturating_sub(ago * min));
+                    if !unread {
+                        s.mark_read(id);
+                    }
+                }
+            }
+            if undo {
+                s.clear_all(base);
+                s.tick(base + 400);
+            }
+        }
+        s.set_dnd(dnd);
+        if !expand.is_empty() {
+            s.toggle_stack(expand);
+        }
+        if let (Some(text), Some(id)) = (reply, s.notes().iter().find(|n| n.acts.iter().any(|a| a.does == Do::Reply)).map(|n| n.id)) {
+            s.start_reply(id);
+            text.chars().for_each(|c| s.reply_char(c));
+        }
+    });
+}
+
+/// `popups`: the cards of the pop-up stack over the desktop, with the bar.
+fn render_popups(
+    (gfx, canvas): (&mut ui::gfx::Gfx, &mut [u32]),
+    (sw, sh): (i32, i32),
+    (file, scale, t): (&str, f32, u64),
+    (anchor, hover): (ui::panel::Anchor, Option<i32>),
+    (p, bar_surf): (&barui::Placement, &ui::gfx::Surface),
+) {
+    let mut stack = ui::notice_pop::Stack::new(scale, anchor);
+    let snap = canvas.to_vec();
+    let mut grab = |x: i32, y: i32, w: i32, h: i32| {
+        Some((0..h).flat_map(|row| snap[((y + row) * sw + x) as usize..((y + row) * sw + x + w) as usize].iter().copied()).collect::<Vec<u32>>())
+    };
+    // the first frame takes the backdrop, then the one asked for
+    let _ = stack.frame(gfx, NOTIFY_BASE, &mut grab);
+    let _ = stack.frame(gfx, NOTIFY_BASE + t, &mut grab);
+    // the pointer comes onto a card, and what it does to the card has time to run
+    let after = if hover.is_some() { 400 } else { 0 };
+    if let Some(k) = hover {
+        stack.point_at(usize::try_from(k).unwrap_or(0));
+        let _ = stack.frame(gfx, NOTIFY_BASE + t + 10, &mut grab);
+    }
+    let shown = stack.frame(gfx, NOTIFY_BASE + t + after, &mut grab);
+    let (surf, shade) = stack.surfaces();
+    blend(canvas, (sw, sh), shade.pixels(), shown.shade.2, (shown.shade.0, shown.shade.1), 255);
+    blend(canvas, (sw, sh), surf.pixels(), shown.win.2, (shown.win.0, shown.win.1), 255);
+    blend(canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha);
+    let m = (30.0 * scale) as i32;
+    let (x0, y0, x1, y1) = ((shown.win.0 - m).max(0), (shown.win.1 - m).max(0), sw, sh);
     let (w, h) = (x1 - x0, y1 - y0);
     let mut out = Vec::with_capacity((w * h) as usize);
     for y in y0..y1 {

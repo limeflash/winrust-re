@@ -39,6 +39,7 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
     let (op, flags, uid) = (u(4), u(20), u(16));
     let h = u(12) as i32 as isize as HWND;
     let guid: [u8; 16] = if flags & 0x20 != 0 { d[944..960].try_into().unwrap() } else { [0; 16] };
+    let mut balloon = None;
     TAPPS.with_borrow_mut(|t| {
         let pos = t.iter().position(|x| x.hwnd == h && x.uid == uid && x.guid == guid);
         match (op, pos) {
@@ -80,10 +81,46 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                 if flags & 8 != 0 && u(292) & 1 != 0 {
                     x.hidden = u(288) & 1 != 0; // NIS_HIDDEN
                 }
+                // a balloon: it becomes a notification of the app that owns the icon
+                balloon = notify::parse_balloon(d).map(|b| (b, x.hwnd, x.uid));
             }
             _ => {}
         }
     });
+    if let Some((b, hwnd, uid)) = balloon {
+        balloon_note(&b, hwnd, uid);
+    }
+}
+
+/// A tray balloon as a note: the app's own face and name; a click on it is a click on the balloon.
+unsafe fn balloon_note(b: &notify::Balloon, hwnd: HWND, uid: u32) {
+    use notify::{App, AppIcon, Note, Target};
+    let exe = exe_of(hwnd);
+    let name = if exe.is_empty() { b.title.clone() } else { notify::app_name(&exe) };
+    let key = if exe.is_empty() { format!("window:{:x}", hwnd as usize) } else { exe.to_lowercase() };
+    let icon = if exe.is_empty() { AppIcon::Winrust } else { AppIcon::Exe(exe) };
+    let (title, body) = if b.title.is_empty() { (name.clone(), b.text.clone()) } else { (b.title.clone(), b.text.clone()) };
+    notify::post(Note::new(App { key, name, icon }, title, body).target(Target::Balloon { hwnd: hwnd as isize, uid }));
+}
+
+/// A click on a balloon's note: the app is told what Explorer tells it, `NIN_BALLOONUSERCLICK`, the way a click on its icon is.
+pub(crate) unsafe fn balloon_click(hwnd: isize, uid: u32) {
+    let Some((cb, ver)) = TAPPS.with_borrow(|t| t.iter().find(|x| x.hwnd as isize == hwnd && x.uid == uid).map(|x| (x.cb, x.ver))) else { return };
+    if cb == 0 {
+        return;
+    }
+    let hwnd = hwnd as HWND;
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    AllowSetForegroundWindow(pid); // so the app can bring its window to the front
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    const NIN_BALLOONUSERCLICK: u32 = 0x405;
+    if ver >= 4 {
+        PostMessageW(hwnd, cb, ((pt.x as u32 & 0xffff) | (pt.y as u32) << 16) as usize, (NIN_BALLOONUSERCLICK | (uid & 0xffff) << 16) as isize);
+    } else {
+        PostMessageW(hwnd, cb, uid as usize, NIN_BALLOONUSERCLICK as isize);
+    }
 }
 
 /// A Shell_NotifyIconGetRect request (WM_COPYDATA, dwData 3): the icon asked about and which corner of its rectangle.

@@ -39,6 +39,7 @@ mod vdesk;
 mod wins;
 mod render;
 mod pacing;
+mod notify;
 use ui::bar::{self as barui, keys::*};
 use {tray::*, status::*, run::*, shot::*, lang::*, settings::*, qs::*, wins::*};
 use windows::{
@@ -300,17 +301,6 @@ fn vol_tip() -> String {
     }
 }
 
-/// Shows `s` over the bar, centred on screen position `cx` along it (a notice that belongs to no button).
-unsafe fn show_tip(s: String, cx: i32) {
-    let Some(a) = anchor(NONE) else { return };
-    let edge = match a.side {
-        Side::Bottom => a.bar.1 - dp(12.0),
-        Side::Left => a.bar.2 + dp(12.0),
-        Side::Right => a.bar.0 - dp(12.0),
-    };
-    ui::tip::show(&s, ui::tip::Place { side: a.side, along: cx, edge }, 0, None);
-}
-
 /// The hint of bar element `key` after `delay` ms (the mockup waits .25 s), `hold` ms at most.
 unsafe fn key_tip(key: i32, text: String, delay: u32, hold: Option<u32>) {
     let Some(a) = anchor(key) else { return };
@@ -336,6 +326,7 @@ unsafe fn anchor(key: i32) -> Option<ui::panel::Anchor> {
 
 /// A panel opened or closed: the bar redraws the button that is lit for it.
 fn panel_changed() {
+    ui::notice_pop::restack(); // the cards stand over a panel that opened in their corner
     // SAFETY: invalidating our own bar window.
     unsafe { InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0) };
 }
@@ -1381,6 +1372,7 @@ unsafe fn view_sig() -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
     (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), INET.get(), EXPLORER_UP.load(Relaxed), clock_texts(), lang_name()).hash(&mut h);
+    notify::with(|s| (s.badge(), s.dnd())).hash(&mut h);
     TAPPS.with_borrow(|t| t.iter().for_each(|x| (x.hwnd as usize, x.uid, x.icon as usize, x.hidden, &x.tip).hash(&mut h)));
     h.finish()
 }
@@ -1515,11 +1507,19 @@ unsafe fn build_view() -> barui::View {
         lang: lang_name(),
         time,
         date,
+        unread: notify::with(|s| s.badge()).unwrap_or(0),
+        dnd: notify::with(|s| s.dnd()),
     }
 }
 
 /// The pointer and the open panels.
 unsafe fn build_live() -> barui::Live {
+    // the centre is the calendar's: open, it has seen what arrived (and the pop-ups are gone); closed, it has been seen
+    let cal = ui::panel::is_open(ui::panel::Id::Cal);
+    if notify::with(|s| s.centre_open()) != cal {
+        notify::with(|s| if cal { s.open_centre() } else { s.close_centre() });
+        ui::notice_pop::changed(None);
+    }
     let now = now_ms();
     let (pk, pt) = PRESS.get();
     barui::Live {
@@ -1530,7 +1530,7 @@ unsafe fn build_live() -> barui::Live {
         start: ui::panel::is_open(ui::panel::Id::Start),
         search: ui::panel::is_open(ui::panel::Id::Search),
         qs: ui::panel::is_open(ui::panel::Id::Qs),
-        cal: ui::panel::is_open(ui::panel::Id::Cal),
+        cal,
         lang: ui::panel::is_open(ui::panel::Id::Lang),
         tray: ui::panel::is_open(ui::panel::Id::Tray),
         task: ui::panel::is_open(ui::panel::Id::Task),
@@ -1542,7 +1542,8 @@ unsafe fn build_live() -> barui::Live {
 /// Draws one frame of the bar (and of its shadow) and puts it on screen; asks for the next one while anything moves.
 /// Everything that wants the bar redrawn invalidates it, WM_PAINT lands here.
 unsafe fn redraw(hwnd: HWND) {
-    let (view, live) = (build_view(), build_live());
+    let live = build_live(); // first: it tells the notifications whether their centre is open, and the badge follows
+    let view = build_view();
     let Some(p) = UI.with_borrow_mut(|u| u.as_mut().map(|b| b.frame(&view, &live))) else { return };
     let shadow = SHADOW.get();
     if p.gone {
@@ -2554,6 +2555,13 @@ fn main() {
         ui::panel::init(hi, SCALE.get(), hwnd, panel_changed);
         ui::tip::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
         ui::toast::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
+        {
+            // the notification pop-ups, and the icons their cards draw (the shell's, at the size they are drawn)
+            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            ui::notice_pop::init(hi, SCALE.get(), ui::panel::Anchor { side: i18n::style::side(), button: (0, 0, 0, 0), bar: (0, sh - 54, sw, sh), screen: (sw, sh) });
+            ui::notice::set_icon_loader(|p| item_icon(p, sc(32)) as isize);
+            notify::with(|s| s.set_dnd(notify::load_dnd()));
+        }
         OLD_STATE.set(remember_taskbar_state());
         appbar_new(hwnd);
         // Without explorer nobody is the "taskman" window, so Windows treats minimized windows as loose icons and leaves

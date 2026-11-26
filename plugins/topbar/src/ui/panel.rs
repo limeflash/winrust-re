@@ -402,6 +402,13 @@ impl Cx {
         self.then = Some(Box::new(f));
     }
 
+    /// Runs what the click asked for, for a window that is not the panel host (the notification pop-ups).
+    pub fn finish(self) {
+        if let Some(f) = self.then {
+            f();
+        }
+    }
+
     /// What a test does in place of the frame: runs the callback the click asked for.
     #[cfg(test)]
     pub fn run_for_test(self) {
@@ -609,6 +616,11 @@ pub trait Content {
     fn reach(&self) -> f32 {
         0.0
     }
+    /// The box is several cards one above another (the notification centre over the calendar), in the box's own DIPs: each has
+    /// its own glass, rings and shadow and the gaps between them let the screen through. Empty: the box is one card.
+    fn cards(&self) -> Vec<Rect> {
+        Vec::new()
+    }
     /// Drawn after the box, outside its glass and its clip, still under the panel's own pose and fade: a submenu that stands
     /// beside the menu on a glass of its own. What it draws answers `hit` like the rest (a point beyond the box is negative or
     /// past the width).
@@ -692,6 +704,7 @@ pub struct Popup {
     surf: Surface,
     shade: Surface,
     shade_h: f32,
+    shade_cards: Vec<Rect>,
     shade_gen: u32,
     scrim: Surface,
     scrim_done: bool,
@@ -818,6 +831,7 @@ impl Popup {
             surf: Surface::new(),
             shade: Surface::new(),
             shade_h: -1.0,
+            shade_cards: Vec::new(),
             shade_gen: 0,
             scrim: Surface::new(),
             scrim_done: false,
@@ -1181,17 +1195,23 @@ impl Popup {
         let (win, hover, press) = (self.win, self.hover, self.press);
 
         // the shadow is painted once, at rest (again when the box changes its height); its opacity follows the panel's
-        if (self.shade_h - h).abs() > 0.01 {
+        let cards = self.content.cards();
+        if (self.shade_h - h).abs() > 0.01 || self.shade_cards != cards {
             self.shade_h = h;
+            self.shade_cards.clone_from(&cards);
             self.shade_gen += 1;
             let (sw, sh) = (self.sh.2, self.sh.3);
             if sw > 0 {
                 let pad = (self.at.0 - self.sh.0) as f32 / s;
-                let r = Rect::new(pad, pad, w, h);
+                let rs = if cards.is_empty() { vec![Rect::new(pad, pad, w, h)] } else { cards.iter().map(|k| k.shift(pad, pad)).collect() };
                 let _ = g.paint(&mut self.shade, sw, sh, |c| {
-                    c.shadow(r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
-                    c.ring(r.inset(-1.0), look.radius + 1.0, 1.0, look.ring_out);
-                    c.erase(r, look.radius);
+                    for r in &rs {
+                        c.shadow(*r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
+                        c.ring(r.inset(-1.0), look.radius + 1.0, 1.0, look.ring_out);
+                    }
+                    for r in &rs {
+                        c.erase(*r, look.radius);
+                    }
                 });
             }
         }
@@ -1230,6 +1250,7 @@ impl Popup {
             let radius = pose.clip.map_or(look.radius, |i| i.radius);
             let xf = Xf { cx: m + ox, cy: m + oy, k: pose.k, dx: pose.dx, dy: pose.dy };
             c.faded(1.0, |c| {
+                if cards.is_empty() {
                 c.masked(clip, radius, xf, |c| {
                     if let Some((p, gx, gy)) = glass.as_ref() {
                         c.picture(p, (*gx - win.0) as f32 / s, (*gy - win.1) as f32 / s);
@@ -1244,6 +1265,24 @@ impl Popup {
                         });
                     });
                 });
+                } else {
+                    // several cards: each is glass of its own, the content draws inside them
+                    for k in &cards {
+                        c.masked(Rect::new(m + k.x, m + k.y, k.w, k.h), look.radius, xf, |c| {
+                            if let Some((p, gx, gy)) = glass.as_ref() {
+                                c.picture(p, (*gx - win.0) as f32 / s, (*gy - win.1) as f32 / s);
+                            }
+                            c.transformed(0.0, 0.0, 1.0, m, m, |c| {
+                                c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| {
+                                    let tint = if glass.is_some() { look.tint } else { look.tint.alpha(look.tint.a.max(0.97)) };
+                                    c.fill(*k, look.radius, tint);
+                                    c.ring(*k, look.radius, 1.0, look.ring_in);
+                                });
+                            });
+                        });
+                    }
+                    c.transformed(0.0, 0.0, 1.0, m, m, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.draw(c, &mut f)));
+                }
                 c.transformed(0.0, 0.0, 1.0, m, m, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.overlay(c, &mut f)));
             });
         }); }
