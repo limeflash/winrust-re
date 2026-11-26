@@ -7,6 +7,7 @@ pub mod gfx;
 pub mod icons;
 pub mod lang_popup;
 pub mod panel;
+pub mod power_popup;
 pub mod quick_popup;
 pub mod svg;
 pub mod tip;

@@ -271,7 +271,7 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
     Some((p.next()??, p.next()??, p.next().flatten().unwrap_or(1)))
 }
 
-/// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar [classic|floating|dock] [bottom|left|right] [scale=1.25]
+/// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|power-restart|power-shutdown|power-busy [classic|floating|dock] [bottom|left|right] [scale=1.25]
 /// [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]`
 ///
 /// `quick` and `wifi` also take the state of the mockup's fake machine: `on=<tiles, 0..8>` `vol=<n>` `muted` `bright=<n>`
@@ -406,6 +406,10 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             DEMO_DATE.set(today);
             let view = get("view").and_then(parse_date).map_or((today.0, today.1), |d| (d.0, d.1));
             Box::new(ui::cal_popup::CalPanel::new(demo_now, side).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
+        } else if let Some(which) = what.strip_prefix("power-") {
+            let kind = if which == "shutdown" { ui::power_popup::Kind::Shutdown } else { ui::power_popup::Kind::Restart };
+            let panel = ui::power_popup::PowerPanel::new(kind, |_| {});
+            Box::new(if which == "busy" { panel.busy_since(0) } else { panel })
         } else if what == "lang" {
             let items = if real {
                 layout_rows()

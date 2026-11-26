@@ -104,6 +104,9 @@ pub enum Along {
     Start,
     /// Against the far edge of the screen, `gap` from it (the mockup's `right: 12px` of quick settings and the calendar).
     ScreenEnd,
+    /// The box is the whole screen (the mockup's `position: absolute; inset: 0` of the power dialog); the content learns the
+    /// screen's size from [`Content::fit`] and answers it in `size`.
+    Fill,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -321,6 +324,12 @@ impl Cx {
         self.close = true;
     }
 
+    /// The panel has been asked to close.
+    #[must_use]
+    pub const fn close_asked(&self) -> bool {
+        self.close
+    }
+
     /// Close the panel, then run `f` (an app's own menu must not open under a panel that still holds the focus).
     pub fn close_then(&mut self, f: impl FnOnce() + 'static) {
         self.close = true;
@@ -424,6 +433,15 @@ pub trait Content {
     }
     /// The box in DIPs; asked once, before the panel is shown.
     fn size(&mut self, g: &mut Gfx) -> (f32, f32);
+    /// The screen's size in DIPs, told before `size` to a content placed with [`Along::Fill`].
+    fn fit(&mut self, _screen: (f32, f32)) {}
+    /// A dialog: the bar stays under it instead of being raised over it, and losing the focus does not close it.
+    fn modal(&self) -> bool {
+        false
+    }
+    /// The host's timer ticked; `age` is the time since the panel opened in ms. A content that acts by itself (a countdown
+    /// that runs out) does it here.
+    fn tick(&mut self, _age: u64, _cx: &mut Cx) {}
     /// Draws the inside of the box (the glass, the tint and the rings are already there).
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>);
     /// The item under a point; its number is whatever the content chooses.
@@ -502,6 +520,7 @@ pub struct Popup {
     sh: (i32, i32, i32, i32),
     button: (i32, i32, i32, i32),
     side: Side,
+    modal: bool,
     t0: u64,
     /// When it started closing and how far in it was.
     closing: Option<(u64, f32)>,
@@ -556,6 +575,10 @@ impl Popup {
     ) -> Self {
         let s = g.scale();
         let (look, entry, exit, place) = (content.look(), content.entry(), content.exit(), content.place());
+        if place.along == Along::Fill {
+            content.fit((anchor.screen.0 as f32 / s, anchor.screen.1 as f32 / s));
+        }
+        let modal = content.modal();
         let (w, h) = content.size(g);
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
         let size = (bw as f32 / s, bh as f32 / s);
@@ -574,7 +597,8 @@ impl Popup {
         // the shadow window: the box and as far as the shadow reaches
         let sigma = look.shadow.blur / 2.0;
         let pad = ((sigma * 3.0 + look.shadow.dy.abs() + 2.0) * s).ceil() as i32;
-        let sh = (at.0 - pad, at.1 - pad, bw + 2 * pad, bh + 2 * pad);
+        // no shadow (a full-screen dialog draws its own card's): no window for it
+        let sh = if look.shadow.color.a > 0.0 { (at.0 - pad, at.1 - pad, bw + 2 * pad, bh + 2 * pad) } else { (0, 0, 0, 0) };
         // what the glass blurs: the panel window and the blur's reach beyond it
         let reach_px = (look.blur * 3.0 * s).ceil() as i32;
         let cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
@@ -594,6 +618,7 @@ impl Popup {
             sh,
             button: anchor.button,
             side: anchor.side,
+            modal,
             t0: now,
             closing: None,
             hover: None,
@@ -616,6 +641,20 @@ impl Popup {
     #[must_use]
     pub const fn is_closing(&self) -> bool {
         self.closing.is_some()
+    }
+
+    #[must_use]
+    pub const fn is_modal(&self) -> bool {
+        self.modal
+    }
+
+    /// The host's timer ticked.
+    pub fn tick(&mut self, now: u64) -> Cx {
+        let mut cx = Cx::default();
+        if self.closing.is_none() {
+            self.content.tick(now.saturating_sub(self.t0), &mut cx);
+        }
+        cx
     }
 
     /// The box on the screen (left, top, width, height), device pixels.
@@ -839,13 +878,15 @@ impl Popup {
         if !self.shade_done {
             self.shade_done = true;
             let (sw, sh) = (self.sh.2, self.sh.3);
-            let pad = (self.at.0 - self.sh.0) as f32 / s;
-            let r = Rect::new(pad, pad, w, h);
-            let _ = g.paint(&mut self.shade, sw, sh, |c| {
-                c.shadow(r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
-                c.ring(r.inset(-1.0), look.radius + 1.0, 1.0, look.ring_out);
-                c.erase(r, look.radius);
-            });
+            if sw > 0 {
+                let pad = (self.at.0 - self.sh.0) as f32 / s;
+                let r = Rect::new(pad, pad, w, h);
+                let _ = g.paint(&mut self.shade, sw, sh, |c| {
+                    c.shadow(r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
+                    c.ring(r.inset(-1.0), look.radius + 1.0, 1.0, look.ring_out);
+                    c.erase(r, look.radius);
+                });
+            }
         }
 
         let Self { content, mo, cap, glass, surf, .. } = self;
@@ -905,6 +946,9 @@ fn button_origin(a: &Anchor, at: (i32, i32), size: (f32, f32), s: f32) -> (f32, 
 
 /// The top left corner of a `size` px box next to its button.
 fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
+    if p.along == Along::Fill {
+        return (0, 0);
+    }
     let gap = (p.gap * s).round() as i32;
     let (l, t, r, b) = a.button;
     let edge = (8.0 * s).round() as i32;
@@ -913,6 +957,7 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
         Along::Start => lo,
         Along::End => hi - len,
         Along::ScreenEnd => screen - gap - len,
+        Along::Fill => 0,
     };
     match a.side {
         Side::Bottom => ((along(l, r, w, a.screen.0)).clamp(edge, (a.screen.0 - edge - w).max(edge)), a.bar.1 - gap - h),
@@ -1024,13 +1069,22 @@ pub fn open(content: Box<dyn Content>, anchor: Anchor) {
         h.popup = Some(p);
         h.shown = (0, 0, 0, 0, 0);
         h.frame(t);
-        // SAFETY: z-order and focus of our own windows: shadow under the panel, the bar above both.
+        let (shadowed, modal) = h.popup.as_ref().map_or((false, false), |p| (p.last().shadow.2 > 0, p.is_modal()));
+        // SAFETY: z-order and focus of our own windows: shadow under the panel, the bar above both (under a dialog).
         unsafe {
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            SetWindowPos(h.shadow, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+            if shadowed {
+                SetWindowPos(h.shadow, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+            } else {
+                ShowWindow(h.shadow, SW_HIDE);
+            }
             SetWindowPos(h.panel, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
-            SetWindowPos(h.shadow, h.panel, 0, 0, 0, 0, flags);
-            SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            if shadowed {
+                SetWindowPos(h.shadow, h.panel, 0, 0, 0, 0, flags);
+            }
+            if !modal {
+                SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
             winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
         }
         (h.notify)();
@@ -1091,7 +1145,7 @@ impl Host {
         let (win, sh) = (shown.win, shown.shadow);
         let s = whwnd(self.shadow);
         let key = (sh.0, sh.1, sh.2, sh.3, shown.shadow_alpha);
-        if key != self.shown {
+        if key != self.shown && sh.2 > 0 {
             self.shown = key;
             let _ = p.surfaces().1.present(s, sh.0, sh.1, shown.shadow_alpha);
         }
@@ -1230,14 +1284,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         // the focus went elsewhere: the panel goes (a click on its own button then must not bring it back)
         WM_ACTIVATE if wp & 0xffff == 0 => {
-            with(|h| {
-                if let Some(id) = h.popup.as_ref().filter(|p| !p.is_closing()).map(Popup::id) {
-                    h.deact = Some((id, now()));
-                }
-            });
-            close();
+            // a dialog stays: its countdown goes on and Esc works as soon as it is clicked again
+            if !with(|h| h.popup.as_ref().is_some_and(Popup::is_modal)).unwrap_or(false) {
+                with(|h| {
+                    if let Some(id) = h.popup.as_ref().filter(|p| !p.is_closing()).map(Popup::id) {
+                        h.deact = Some((id, now()));
+                    }
+                });
+                close();
+            }
         }
-        WM_TIMER => _ = with(|h| h.frame(now())),
+        WM_TIMER => {
+            with(|h| h.frame(now()));
+            if let Some(cx) = with(|h| h.popup.as_mut().map(|p| p.tick(now()))).flatten() {
+                apply(cx);
+            }
+        }
         _ => {
             // SAFETY: the default procedure of our own window.
             return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
