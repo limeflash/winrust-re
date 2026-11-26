@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, HWND_TOPMOST, KillTimer, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, KillTimer, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos,
     ShowWindow, WM_ACTIVATE, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER, WM_USER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -533,6 +533,12 @@ pub fn init(hi: HINSTANCE, scale: f32, anchor: Anchor) -> bool {
         (make(ex, &name), make(ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, &shade_name))
     };
     if wnd.is_null() || shade.is_null() {
+        // SAFETY: our own windows, whichever of the two was made.
+        unsafe {
+            for w in [wnd, shade].into_iter().filter(|w| !w.is_null()) {
+                DestroyWindow(w);
+            }
+        }
         return false;
     }
     HOST.set(Some(Host { stack: Stack::new(scale, anchor), gfx, wnd, shade, grab: Surface::new(), up: false, timer: false, last_win: (0, 0, 0, 0) }));

@@ -18,7 +18,7 @@ pub const CARD_H: f32 = 136.0;
 const GAP: f32 = 8.0;
 const PAD: f32 = 8.0;
 const TITLE: f32 = 34.0;
-const CLOSE_BASE: i32 = 100;
+const CLOSE_BASE: i32 = 1000; // far above any number of cards
 const CROSS: &str = "M7 7l10 10M17 7L7 17";
 
 /// One window of the app.

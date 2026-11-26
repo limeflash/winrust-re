@@ -71,10 +71,11 @@ fn mini(tile: Rect, (x, y, w, h): (f32, f32, f32, f32)) -> Rect {
     Rect::new((tile.x + x * tile.w).round(), (tile.y + y * tile.h).round(), (w * tile.w).max(6.0).round(), (h * tile.h).max(4.0).round())
 }
 
-const CLOSE_BASE: i32 = 100;
-const DESK_BASE: i32 = 200;
-const NEW_DESK: i32 = 300;
-const SCRIM: i32 = 400;
+// the ids of the controls by kind: a stride of 1000 per kind, so a thousand windows still never meet the next kind
+const CLOSE_BASE: i32 = 1000;
+const DESK_BASE: i32 = 2000;
+const NEW_DESK: i32 = 3000;
+const SCRIM: i32 = 4000;
 
 const CROSS: &str = "M7 7l10 10M17 7L7 17";
 const PLUS: &str = "M12 5v14M5 12h14";

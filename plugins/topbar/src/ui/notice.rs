@@ -822,7 +822,9 @@ impl Centre {
             let stack = Rect::new(PAD, stack_top, iw, content - stack_top);
             let pill_text = if g.open { t!("Свернуть", "Show less", ja: "折りたたむ", pt: "Mostrar menos", zh: "收起").to_string() } else { format!("+{}", g.ids.len() - 1) };
             let pill_w = if g.can_expand() { m.width(&pill_text, Font::new(11.5, 500)).ceil() + 8.0 + 3.0 + 12.0 + 4.0 } else { 0.0 };
-            let name_w = m.width(&g.app.name, Font::new(12.0, 600)).ceil();
+            // a long name gives way to the pill and the Clear button (it is drawn trimmed to what is left)
+            let room = (head.w - (6.0 + 16.0 + 8.0) - 8.0 - pill_w - 4.0 - (2.0 + 24.0)).max(0.0);
+            let name_w = m.width(&g.app.name, Font::new(12.0, 600)).ceil().min(room);
             let pill = Rect::new(head.x + 6.0 + 16.0 + 8.0 + name_w + 8.0, head.y + 1.0, pill_w, 22.0);
             groups.push(GroupL {
                 app: g.app.clone(),
@@ -1028,7 +1030,7 @@ impl Centre {
                 let group_hot = on_group == Some(gi);
                 // the group's line: its face, its name, the pill, the x
                 app_icon(c, &g.app.icon, Rect::new(g.head.x + 6.0, g.head.cy() - 8.0, 16.0, 16.0), 1.0);
-                c.text(&g.app.name, Rect::new(g.head.x + 6.0 + 16.0 + 8.0, g.head.y, 160.0, g.head.h), Font::new(12.0, 600), CHIP, Align::Start);
+                c.text_fit(&g.app.name, Rect::new(g.head.x + 6.0 + 16.0 + 8.0, g.head.y, g.pill.x - 8.0 - (g.head.x + 6.0 + 16.0 + 8.0), g.head.h), Font::new(12.0, 600), CHIP, Align::Start);
                 if g.can_expand {
                     let h = Hit::More(gi as u32);
                     let over = hot(tw, hov, h, 0, 250);
@@ -1270,6 +1272,22 @@ mod tests {
         let h = c.relayout(&mut Fake, 2000);
         assert!((h - (52.0 + 128.0)).abs() < 1e-3, "empty: the header and the picture: {h}");
         assert_eq!(c.scroll, 0.0);
+    }
+
+    #[test]
+    fn a_long_app_name_leaves_room_for_the_pill_and_the_clear_button() {
+        notify::with(|s| *s = notify::Store::new());
+        let long = App { key: "l".into(), name: "A very long application name that goes on and on".repeat(3), icon: AppIcon::Winrust };
+        notify::with(|s| {
+            for t in ["one", "two", "three"] {
+                s.push(Note::new(long.clone(), t, "b"), 0);
+            }
+        });
+        let mut c = Centre::new(800.0);
+        c.relayout(&mut Fake, 0);
+        let g = &c.lay.groups[0];
+        assert!(g.can_expand && g.pill.x + g.pill.w <= g.clear.x, "pill {:?}, clear {:?}", g.pill, g.clear);
+        notify::with(|s| *s = notify::Store::new());
     }
 
     #[test]

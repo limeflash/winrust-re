@@ -483,7 +483,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         });
         demo_notes(what == "popups", notes_arg, expand, reply_text, (dnd_flag, undo_flag), pops_arg, base);
     }
-    let sandbox = what.starts_with("settings") || what == "toast" || notifying;
+    let sandbox = what.starts_with("settings") || what == "toast" || notifying || lang_arg != "en"; // a language is the scratch folder's too
     if sandbox {
         // SAFETY: single-threaded at this point; the process only ever reads these settings from its own scratch folder.
         if !benchmarking { unsafe { std::env::set_var("ProgramData", std::env::temp_dir().join("topbar-render")) }; }

@@ -18,11 +18,12 @@ const W: f32 = 288.0;
 const WIN_ROW: f32 = 40.0;
 
 const WIN_BASE: i32 = 0;
-const CLOSE_BASE: i32 = 100;
-const RECENT_BASE: i32 = 200;
-const ACT_BASE: i32 = 300;
-const CLOSE_ALL: i32 = 400;
-const KILL: i32 = 401;
+// a stride of 1000 per kind of row, so a long list of windows never meets the next kind
+const CLOSE_BASE: i32 = 1000;
+const RECENT_BASE: i32 = 2000;
+const ACT_BASE: i32 = 3000;
+const CLOSE_ALL: i32 = 4000;
+const KILL: i32 = 4001;
 
 const CROSS: &str = "M7 7l10 10M17 7L7 17";
 const CLOSE_WINDOW: &str = "M4 5h16v14H4zM9.5 9.5l5 5M14.5 9.5l-5 5";
@@ -373,6 +374,19 @@ mod tests {
         // a pinned app that is not running has no window rows and no tail
         assert_eq!(a.hit(a.act_row(0).cx(), a.act_row(0).cy()), Some(ACT_BASE));
         assert_eq!(a.hit(W / 2.0, a.size.1 - 4.0), None);
+    }
+
+    #[test]
+    fn a_hundred_windows_do_not_run_into_the_next_kind_of_row() {
+        let got = Rc::new(std::cell::Cell::new(None));
+        let g = Rc::clone(&got);
+        let mut p = JumpPanel::new(data(130, 1), Side::Bottom, move |k| g.set(Some(k)));
+        let x = p.win_close(120);
+        assert_eq!(p.hit(x.cx(), x.cy()), Some(CLOSE_BASE + 120));
+        let mut cx = Cx::default();
+        p.click(CLOSE_BASE + 120, Button::Left, &mut cx);
+        cx.run_for_test();
+        assert_eq!(got.get(), Some(Pick::CloseWindow(130)), "the 121st window, not a recent file");
     }
 
     #[test]
