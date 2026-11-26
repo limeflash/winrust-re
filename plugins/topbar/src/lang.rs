@@ -22,18 +22,111 @@ pub(crate) unsafe fn layout_names(k: HKL) -> (String, String) {
     (get(2), if short == "ENU" { "ENG".into() } else { short }) // LOCALE_SLOCALIZEDDISPLAYNAME
 }
 
-/// The input language picker above the language button.
-pub(crate) unsafe fn lang_menu(bar: HWND) {
+/// The registry key of a layout under `HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layouts` (its KLID), from the layout
+/// handle: the low word is the language, the high word the layout (equal to the language for the default one). A high word
+/// with `F` as its top digit (a second layout of the same language) is looked up by its "Layout Id" value instead: `None`.
+fn klid(hkl: u32) -> Option<String> {
+    let (lo, hi) = (hkl & 0xffff, hkl >> 16);
+    match hi {
+        0xf000..=0xffff => None,
+        0 => Some(format!("0000{lo:04X}")),
+        h if h == lo => Some(format!("0000{lo:04X}")),
+        h => Some(format!("{h:04X}{lo:04X}")),
+    }
+}
+
+/// A string value under `HKLM\...\Keyboard Layouts\<klid>`.
+unsafe fn layout_value(klid: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
+    let path = wide(&format!("SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts\\{klid}"));
+    let mut key: HKEY = null_mut();
+    if RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+        return None;
+    }
+    let mut buf = [0u16; 256];
+    let mut len = size_of_val(&buf) as u32;
+    let r = RegQueryValueExW(key, wide(name).as_ptr(), null(), null_mut(), buf.as_mut_ptr().cast(), &mut len);
+    RegCloseKey(key);
+    let n = (len as usize / 2).min(buf.len());
+    (r == 0).then(|| String::from_utf16_lossy(&buf[..n]).trim_end_matches('\0').to_string()).filter(|s| !s.is_empty())
+}
+
+/// The layout's name in the user's language ("US", "Russian"), from the registry: its resource-string display name when that
+/// loads, else the plain "Layout Text".
+unsafe fn layout_text(k: HKL) -> String {
+    let hkl = k as usize as u32;
+    let id = klid(hkl).unwrap_or_else(|| {
+        // a second layout of a language: the key whose "Layout Id" is the high word's low 12 bits
+        let lid = format!("{:04X}", (hkl >> 16) & 0x0fff);
+        let lang = format!("{:04X}", hkl & 0xffff);
+        (0xa000u32..=0xa0ffu32)
+            .map(|n| format!("{n:04X}{lang}"))
+            .find(|c| layout_value(c, "Layout Id").is_some_and(|v| v.eq_ignore_ascii_case(&lid)))
+            .unwrap_or_default()
+    });
+    if id.is_empty() {
+        return String::new();
+    }
+    if let Some(res) = layout_value(&id, "Layout Display Name") {
+        let mut b = [0u16; 128];
+        if SHLoadIndirectString(wide(&res).as_ptr(), b.as_mut_ptr(), 128, null_mut()) >= 0 {
+            let n = b.iter().position(|&c| c == 0).unwrap_or(0);
+            if n > 0 {
+                return String::from_utf16_lossy(&b[..n]);
+            }
+        }
+    }
+    layout_value(&id, "Layout Text").unwrap_or_default()
+}
+
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// "Language · layout": just the layout when its name already says the language ("Turkish Q").
+fn sub_line(lang: &str, layout: &str) -> String {
+    let (l, k) = (lang.to_lowercase(), layout.to_lowercase());
+    match (layout.is_empty(), k.contains(&l) || l.contains(&k)) {
+        (true, _) => lang.to_string(),
+        (false, true) => layout.to_string(),
+        (false, false) => format!("{lang} \u{b7} {layout}"),
+    }
+}
+
+/// What the keyboard layout panel lists: every installed layout, the current one marked.
+pub(crate) unsafe fn layout_rows() -> Vec<ui::lang_popup::Layout> {
     let (list, cur) = layouts();
-    let mut items: Vec<fly::MItem> = list.iter().map(|&k| {
-        let (name, short) = layout_names(k);
-        fly::MItem::new(name).on(k == cur).hint(Box::leak(short.into_boxed_str())) // a handful of short strings, kept for the bar's lifetime
-    }).collect();
-    items.push(fly::MItem::new(t!("Языковые параметры", "Language settings", ja: "言語設定", pt: "Configurações de idioma", zh: "语言设置")).sep());
-    let head = (null_mut(), "\u{E775}", t!("Язык ввода", "Input language", ja: "入力言語", pt: "Idioma de entrada", zh: "输入语言").to_string(), t!("Win+Пробел — следующий", "Win+Space — next one", ja: "Win+Space — 次の言語", pt: "Win+Espaço — o próximo", zh: "Win+Space — 下一个").to_string());
-    fly::menu(tip_cx(LANG), Some(head), items, move |i| match list.get(i) {
-        Some(&k) => set_lang(bar, k),
-        None => open(&wide("ms-settings:regionlanguage")),
+    list.iter()
+        .map(|&k| {
+            let id = k as usize as u32 & 0xffff;
+            let get = |what: u32| {
+                let mut b = [0u16; 96];
+                let n = GetLocaleInfoW(id, what, b.as_mut_ptr(), 96).max(1) as usize - 1;
+                String::from_utf16_lossy(&b[..n])
+            };
+            // LOCALE_SNATIVELANGUAGENAME: the language in its own tongue; LOCALE_SLOCALIZEDLANGUAGENAME: in the user's
+            let (name, local) = (capital(&get(0x04)), capital(&get(0x6f)));
+            ui::lang_popup::Layout { id: k as isize, code: layout_names(k).1, name, sub: sub_line(&local, &layout_text(k)), on: k == cur }
+        })
+        .collect()
+}
+
+fn pick_layout(id: isize) {
+    // SAFETY: asks the app in front to switch to one of the installed layouts.
+    unsafe { set_lang(BAR.load(Relaxed) as HWND, id as HKL) }
+}
+
+fn language_settings() {
+    // SAFETY: opens a settings URI.
+    unsafe { open(&wide("ms-settings:regionlanguage")) }
+}
+
+/// The language button was clicked: open the keyboard layout panel above it, or close it.
+pub(crate) unsafe fn lang_toggle() {
+    ui::panel::toggle(ui::panel::Id::Lang, || {
+        let a = anchor(LANG)?;
+        Some((Box::new(ui::lang_popup::LangPanel::new(layout_rows(), pick_layout, language_settings)), a))
     });
 }
 
@@ -86,4 +179,26 @@ pub(crate) unsafe fn lang_name() -> String {
 
 thread_local! {
     pub(crate) static SIG: Cell<(u64, u32)> = const { Cell::new((0, 0)) }; // (hash of the last painted state, ticks since the last repaint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn klid_of_a_layout_handle() {
+        assert_eq!(klid(0x0419_0419).as_deref(), Some("00000419")); // the default layout of Russian
+        assert_eq!(klid(0x0409_0409).as_deref(), Some("00000409"));
+        assert_eq!(klid(0x0002_0409).as_deref(), Some("00020409")); // United States-International
+        assert_eq!(klid(0xf0a8_0419), None); // looked up by its Layout Id
+    }
+
+    #[test]
+    fn the_sub_line_does_not_say_the_language_twice() {
+        assert_eq!(sub_line("Turkish", "Turkish Q"), "Turkish Q");
+        assert_eq!(sub_line("English", "US"), "English \u{b7} US");
+        assert_eq!(sub_line("Russian", "Russian"), "Russian");
+        assert_eq!(sub_line("Russian", ""), "Russian");
+        assert_eq!(capital("русский"), "Русский");
+    }
 }

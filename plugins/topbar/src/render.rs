@@ -170,3 +170,177 @@ pub(crate) unsafe fn render(args: &[String]) {
         let _ = std::fs::write(format!("{file}.err.txt"), "could not write the png");
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+thread_local! {
+    static DEMO: std::cell::RefCell<Vec<ui::tray_popup::Cell>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn demo_cells() -> Vec<ui::tray_popup::Cell> {
+    DEMO.with_borrow(|d| d.iter().map(|c| ui::tray_popup::Cell { icon: c.icon, tip: c.tip.clone(), token: c.token }).collect())
+}
+
+/// `topbar --render-panel <file.png> tray|lang|tip [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>]
+/// [n=<icons>] [real] [at=<n>]`
+///
+/// Draws a popup panel through the same frame as the live one, next to the bar, on a backdrop with something to blur, and
+/// writes the area around it to a PNG. `t` is the time since the panel opened (default: at rest), `hover` the hovered item,
+/// `n` the number of tray icons, `real` the machine's own keyboard layouts instead of the three of the mockup, and for `tip`
+/// the element it hints at is `at` (an app button number, default 3).
+pub(crate) unsafe fn render_panel(args: &[String]) {
+    use ui::panel::{Anchor, Popup};
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let Some(file) = args.first() else { return };
+    let what = args.get(1).map_or("tray", String::as_str).to_string();
+    let (mut style, mut side, mut scale, mut t, mut hover, mut n_icons, mut real, mut at) = (Style::Classic, Side::Bottom, 1.0f32, 5000u64, None, 6usize, false, 3i32);
+    for a in args.iter().skip(2) {
+        match a.split_once('=') {
+            Some(("scale", v)) => scale = v.parse().unwrap_or(1.0),
+            Some(("t", v)) => t = v.parse().unwrap_or(5000),
+            Some(("hover", v)) => hover = v.parse().ok(),
+            Some(("n", v)) => n_icons = v.parse().unwrap_or(6),
+            Some(("at", v)) => at = v.parse().unwrap_or(3),
+            _ => match a.as_str() {
+                "real" => real = true,
+                "bottom" | "left" | "right" => side = Side::parse(a),
+                s => style = Style::parse(s),
+            },
+        }
+    }
+    SCALE.set(scale);
+    let Ok(mut bar) = barui::Bar::new(scale) else { return };
+    let icon = |path: &str| {
+        let ic = if std::path::Path::new(path).exists() { item_icon(path, bar_icon_px()) } else { null_mut() };
+        wicon(ic)
+    };
+    let apps: Vec<barui::AppView> = (0..8)
+        .map(|i| {
+            let (_, color, wins, exe) = APPS[i % APPS.len()];
+            barui::AppView { icon: icon(exe), wins, active: i == 1, flash: false, color: ui::gfx::Rgba::hex(color) }
+        })
+        .collect();
+    let (sw, sh) = ((1440.0 * scale).round() as i32, (900.0 * scale).round() as i32);
+    let view = barui::View {
+        style,
+        side,
+        size: 1,
+        align_left: false,
+        screen: (1440.0, 900.0),
+        op: 0.85,
+        apps,
+        tray: Vec::new(),
+        battery: None,
+        vol: (72, false),
+        net: Net::Wifi(85),
+        lang: "RUS".into(),
+        time: "03:57".into(),
+        date: "11/26/2026".into(),
+    };
+    let lit = barui::Live { now: 100_000, hot: if what == "tip" { at } else { NONE }, tray: what == "tray", lang: what == "lang", ..Default::default() };
+    bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
+    bar.frame(&view, &lit);
+    let p = bar.frame(&view, &barui::Live { now: 110_000, ..lit });
+
+    // a backdrop with something to blur: a dark desktop with a few lit windows
+    let mut canvas: Vec<u32> = (0..sw * sh)
+        .map(|i| {
+            let (x, y) = ((i % sw) as f32 / scale, (i / sw) as f32 / scale);
+            let mut c = [5.0, 7.0, 12.0];
+            let mut lit = |x0: f32, y0: f32, w: f32, h: f32, col: [f32; 3]| {
+                if x >= x0 && x < x0 + w && y >= y0 && y < y0 + h {
+                    c = col;
+                }
+            };
+            lit(300.0, 120.0, 520.0, 300.0, [34.0, 38.0, 52.0]);
+            lit(820.0, 560.0, 420.0, 230.0, [96.0, 120.0, 190.0]);
+            lit(900.0, 600.0, 120.0, 40.0, [240.0, 240.0, 245.0]);
+            lit(1060.0, 640.0, 140.0, 120.0, [232.0, 112.0, 90.0]);
+            lit(700.0, 500.0, 160.0, 160.0, [60.0, 190.0, 120.0]);
+            0xff00_0000 | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32
+        })
+        .collect();
+    let (bar_surf, shadow_surf) = bar.surfaces();
+    if let Some((x, y, w, _)) = p.shadow {
+        blend(&mut canvas, (sw, sh), shadow_surf.pixels(), w, (x, y), p.shadow_alpha);
+    }
+    blend(&mut canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha);
+
+    let mut gfx = ui::gfx::Gfx::new(scale).expect("the renderer");
+    let key = match what.as_str() {
+        "lang" => LANG,
+        "tip" => at,
+        _ => TAPP,
+    };
+    let r = bar.screen_rect(key).unwrap_or((0, 0, 0, 0));
+    let anchor = Anchor { side, button: r, bar: (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3), screen: (sw, sh) };
+    let around = |b: (i32, i32, i32, i32)| {
+        let m = (110.0 * scale) as i32;
+        let (x0, y0, x1, y1) = (b.0 - m, b.1 - m, b.0 + b.2 + m, b.1 + b.3 + m);
+        (x0.min(anchor.bar.0).max(0), y0.min(anchor.bar.1).max(0), x1.max(anchor.bar.2).min(sw), y1.max(anchor.bar.3).min(sh))
+    };
+    let crop = if what == "tip" {
+        let mut tip = ui::tip::Tip::new(scale, (sw, sh));
+        let text = ["Claude", "File manager", "Microsoft Edge", "Spotify", "Task Manager", "Outlook", "Discord", "Telegram"][(at.max(1) as usize - 1) % 8];
+        let along = if side == Side::Bottom { (r.0 + r.2) / 2 } else { (r.1 + r.3) / 2 };
+        tip.show(&mut gfx, text, ui::tip::Place::button(side, r, along, scale), 0, 250, None);
+        let (win, _) = tip.frame(&mut gfx, t);
+        blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
+        around(win)
+    } else {
+        let content: Box<dyn ui::panel::Content> = if what == "lang" {
+            let items = if real {
+                layout_rows()
+            } else {
+                [("RUS", "Русский", "Russian · ЙЦУКЕН", true), ("ENG", "English", "United States · QWERTY", false), ("TUR", "Türkçe", "Turkish Q", false)]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(code, name, sub, on))| ui::lang_popup::Layout { id: i as isize, code: code.into(), name: name.into(), sub: sub.into(), on })
+                    .collect()
+            };
+            Box::new(ui::lang_popup::LangPanel::new(items, |_| {}, || {}))
+        } else {
+            let exes = [
+                r"C:\Windows\System32\notepad.exe",
+                r"C:\Windows\System32\mspaint.exe",
+                r"C:\Windows\explorer.exe",
+                r"C:\Windows\System32\calc.exe",
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\Windows\System32\control.exe",
+                r"C:\Windows\System32\Taskmgr.exe",
+                r"C:\Windows\System32\charmap.exe",
+            ];
+            DEMO.with_borrow_mut(|d| {
+                *d = (0..n_icons).map(|i| ui::tray_popup::Cell { icon: icon(exes[i % exes.len()]), tip: format!("Icon {}", i + 1), token: i }).collect();
+            });
+            Box::new(ui::tray_popup::TrayPanel::new(demo_cells, |_, _| {}))
+        };
+        let snap = canvas.clone();
+        let mut grab = |x: i32, y: i32, w: i32, h: i32| {
+            Some((0..h).flat_map(|row| snap[((y + row) * sw + x) as usize..((y + row) * sw + x + w) as usize].iter().copied()).collect::<Vec<u32>>())
+        };
+        let mut popup = Popup::new(&mut gfx, content, anchor, 0, &mut grab);
+        popup.set_hover(hover);
+        let shown = popup.frame(&mut gfx, t);
+        let (panel, shade) = popup.surfaces();
+        blend(&mut canvas, (sw, sh), shade.pixels(), shown.shadow.2, (shown.shadow.0, shown.shadow.1), shown.shadow_alpha);
+        blend(&mut canvas, (sw, sh), panel.pixels(), shown.win.2, (shown.win.0, shown.win.1), 255);
+        if let Some((text, along, top)) = popup.tip() {
+            let mut tip = ui::tip::Tip::new(scale, (sw, sh));
+            let place = ui::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * scale).round() as i32 };
+            tip.show(&mut gfx, &text, place, 0, 0, None);
+            let (win, _) = tip.frame(&mut gfx, 5000);
+            blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
+        }
+        around(popup.rect())
+    };
+    let (x0, y0, x1, y1) = crop;
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in y0..y1 {
+        out.extend_from_slice(&canvas[(y * sw + x0) as usize..(y * sw + x1) as usize]);
+    }
+    if gfx.save_png(file, w as u32, h as u32, &out).is_err() {
+        let _ = std::fs::write(format!("{file}.err.txt"), "could not write the png");
+    }
+}

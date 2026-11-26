@@ -8,12 +8,14 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP,
     D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1Shadow, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_CAP_STYLE_ROUND,
+    CLSID_D2D1ColorMatrix, CLSID_D2D1GaussianBlur, CLSID_D2D1Shadow, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_PROPERTIES,
+    D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
@@ -32,8 +34,8 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC, HGDIOBJ, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CAPTUREBLT, CreateCompatibleDC,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapDitherTypeNone,
@@ -275,6 +277,24 @@ impl Surface {
         unsafe { std::slice::from_raw_parts(self.bits, (self.w * self.h) as usize) }
     }
 
+    /// Copies a rectangle of the screen (device pixels, entirely on the screen, layered windows included) into this surface
+    /// and makes every pixel opaque. This is what a panel's glass blurs.
+    pub fn grab(&mut self, x: i32, y: i32, w: i32, h: i32) -> bool {
+        if w <= 0 || h <= 0 || !self.ensure(w, h) {
+            return false;
+        }
+        // SAFETY: the screen DC is released at once; the DIB belongs to `self` and holds `w * h` pixels.
+        unsafe {
+            let screen = GetDC(None);
+            let ok = BitBlt(self.dc, 0, 0, w, h, Some(screen), x, y, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0)).is_ok();
+            ReleaseDC(None, screen);
+            if ok {
+                std::slice::from_raw_parts_mut(self.bits, (w * h) as usize).iter_mut().for_each(|p| *p |= 0xff00_0000);
+            }
+            ok
+        }
+    }
+
     fn free(&mut self) {
         if self.dc.is_invalid() {
             return;
@@ -324,6 +344,33 @@ impl Default for Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         self.free();
+    }
+}
+
+/// A baked picture that stays in the render target's memory: the blurred desktop behind a panel. It belongs to the device
+/// it was made on, so a panel makes a new one each time it opens.
+pub struct Picture {
+    bmp: ID2D1Bitmap,
+    /// Size in DIPs.
+    pub w: f32,
+    pub h: f32,
+}
+
+/// CSS `transform: translate(dx, dy) scale(k)` around `(cx, cy)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Xf {
+    pub cx: f32,
+    pub cy: f32,
+    pub k: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+impl Xf {
+    pub const NONE: Xf = Xf { cx: 0.0, cy: 0.0, k: 1.0, dx: 0.0, dy: 0.0 };
+
+    fn matrix(self) -> Matrix3x2 {
+        Matrix3x2::translation(-self.cx, -self.cy) * Matrix3x2::scale(self.k, self.k) * Matrix3x2::translation(self.cx + self.dx, self.cy + self.dy)
     }
 }
 
@@ -381,6 +428,13 @@ impl Gfx {
     #[must_use]
     pub const fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Drops every cached icon bitmap (a panel that drew icons it does not own, whose handles may be reused).
+    pub fn forget_icons(&mut self) {
+        if let Some(d) = self.dev.as_mut() {
+            d.icons.clear();
+        }
     }
 
     /// DIPs to whole device pixels.
@@ -726,11 +780,12 @@ impl Canvas<'_> {
             * Matrix3x2::scale(k, k)
             * Matrix3x2::translation(cx, cy);
         let (rt, b, round) = (self.rt(), self.brush(c), self.g.round.clone());
+        let cur = self.world();
         // SAFETY: drawing inside BeginDraw/EndDraw; the transform is restored.
         unsafe {
-            rt.SetTransform(&m);
+            rt.SetTransform(&(m * cur));
             rt.DrawGeometry(&geo, &b, stroke, &round);
-            rt.SetTransform(&Matrix3x2::identity());
+            rt.SetTransform(&cur);
         }
     }
 
@@ -740,11 +795,12 @@ impl Canvas<'_> {
         let k = size / 24.0;
         let m = Matrix3x2::translation(-12.0, -12.0) * Matrix3x2::scale(k, k) * Matrix3x2::translation(cx, cy);
         let (rt, b) = (self.rt(), self.brush(c));
+        let cur = self.world();
         // SAFETY: drawing inside BeginDraw/EndDraw; the transform is restored.
         unsafe {
-            rt.SetTransform(&m);
+            rt.SetTransform(&(m * cur));
             rt.FillGeometry(&geo, &b, None);
-            rt.SetTransform(&Matrix3x2::identity());
+            rt.SetTransform(&cur);
         }
     }
 
@@ -963,14 +1019,111 @@ impl Canvas<'_> {
         unsafe { ctx.PopLayer() };
     }
 
-    /// Draws `f` scaled by `k` around `(cx, cy)` and moved by `(dx, dy)` — CSS `transform: translate() scale()`.
-    pub fn transformed(&mut self, cx: f32, cy: f32, k: f32, dx: f32, dy: f32, f: impl FnOnce(&mut Self)) {
-        let m = Matrix3x2::translation(-cx, -cy) * Matrix3x2::scale(k, k) * Matrix3x2::translation(cx + dx, cy + dy);
+    /// The transform in force (what enclosing [`Canvas::transformed`] calls built up).
+    fn world(&mut self) -> Matrix3x2 {
         let rt = self.rt();
-        // SAFETY: the transform is restored after `f`; nested calls are not used.
-        unsafe { rt.SetTransform(&m) };
+        let mut m = Matrix3x2::identity();
+        // SAFETY: reading the target's transform into a local.
+        unsafe { rt.GetTransform(&mut m) };
+        m
+    }
+
+    /// Draws `f` scaled by `k` around `(cx, cy)` and moved by `(dx, dy)` — CSS `transform: translate() scale()`. It composes
+    /// with an enclosing call, so a panel's pose and an item's own motion add up.
+    pub fn transformed(&mut self, cx: f32, cy: f32, k: f32, dx: f32, dy: f32, f: impl FnOnce(&mut Self)) {
+        let m = Xf { cx, cy, k, dx, dy }.matrix();
+        let (rt, cur) = (self.rt(), self.world());
+        // SAFETY: the enclosing transform is restored after `f`.
+        unsafe { rt.SetTransform(&(m * cur)) };
         f(self);
-        // SAFETY: restoring the identity transform.
-        unsafe { rt.SetTransform(&Matrix3x2::identity()) };
+        // SAFETY: restoring the enclosing transform.
+        unsafe { rt.SetTransform(&cur) };
+    }
+
+    /// Bakes what is on the screen behind a panel: `px` (`w`×`h` device pixels, opaque) blurred with a Gaussian of
+    /// `sigma` DIPs (CSS `blur(r)`: `r` is the standard deviation) and saturated by `saturate` (CSS `saturate(k)`).
+    pub fn glass(&mut self, px: &[u32], w: i32, h: i32, sigma: f32, saturate: f32) -> Option<Picture> {
+        if w <= 0 || h <= 0 || px.len() < (w * h) as usize {
+            return None;
+        }
+        let (rt, ctx, s) = (self.rt(), self.dev().ctx.clone(), self.g.scale);
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0 * s,
+            dpiY: 96.0 * s,
+        };
+        let size = D2D_SIZE_F { width: w as f32 / s, height: h as f32 / s };
+        // SAFETY: the pixels are read once by CreateBitmap; the effects and the baked target live within this call.
+        unsafe {
+            let src = rt.CreateBitmap(D2D_SIZE_U { width: w as u32, height: h as u32 }, Some(px.as_ptr().cast()), (w * 4) as u32, &props).ok()?;
+            let blur = ctx.CreateEffect(&CLSID_D2D1GaussianBlur).ok()?;
+            blur.SetInput(0, &src, true);
+            blur.SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32, D2D1_PROPERTY_TYPE_FLOAT, &sigma.to_le_bytes()).ok()?;
+            let mut out: ID2D1Image = blur.GetOutput().ok()?;
+            if (saturate - 1.0).abs() > 1e-3 {
+                // CSS saturate(s); the rows are the input channels (D2D multiplies a row vector)
+                let (a, b, c) = (0.213, 0.715, 0.072);
+                let m = [
+                    a + (1.0 - a) * saturate, a - a * saturate, a - a * saturate, 0.0,
+                    b - b * saturate, b + (1.0 - b) * saturate, b - b * saturate, 0.0,
+                    c - c * saturate, c - c * saturate, c + (1.0 - c) * saturate, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0,
+                ];
+                let bytes: Vec<u8> = m.iter().flat_map(|v: &f32| v.to_le_bytes()).collect();
+                let cm = ctx.CreateEffect(&CLSID_D2D1ColorMatrix).ok()?;
+                cm.SetInput(0, &out, true);
+                cm.SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32, D2D1_PROPERTY_TYPE_MATRIX_5X4, &bytes).ok()?;
+                out = cm.GetOutput().ok()?;
+            }
+            let baked = rt.CreateCompatibleRenderTarget(Some(&size), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE).ok()?;
+            let bctx = baked.cast::<ID2D1DeviceContext>().ok()?;
+            bctx.BeginDraw();
+            bctx.Clear(Some(&Rgba::TRANSPARENT.d2d()));
+            bctx.DrawImage(&out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            bctx.EndDraw(None, None).ok()?;
+            Some(Picture { bmp: baked.GetBitmap().ok()?, w: size.width, h: size.height })
+        }
+    }
+
+    /// Draws a baked picture with its top left corner at `(x, y)`, pixel for pixel.
+    pub fn picture(&mut self, p: &Picture, x: f32, y: f32) {
+        let ctx = self.dev().ctx.clone();
+        let dst = Rect::new(x, y, p.w, p.h);
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe { ctx.DrawBitmap(&p.bmp, Some(&dst.d2d()), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None) };
+    }
+
+    /// Runs `f` with everything it draws clipped to the rounded rectangle `r` as `xf` moves it (CSS `clip-path: inset(..
+    /// round ..)` on an element with a transform). Call it with no transform in force: the shape is in window coordinates.
+    pub fn masked(&mut self, r: Rect, radius: f32, xf: Xf, f: impl FnOnce(&mut Self)) {
+        let ctx = self.dev().ctx.clone();
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius.max(0.0), radiusY: radius.max(0.0) };
+        // SAFETY: plain geometry creation on the factory.
+        let mask = unsafe {
+            self.g
+                .factory
+                .CreateRoundedRectangleGeometry(&rr)
+                .and_then(|geo| self.g.factory.CreateTransformedGeometry(&geo, &xf.matrix()))
+                .and_then(|t| t.cast::<ID2D1Geometry>())
+                .ok()
+        };
+        let Some(mask) = mask else { return f(self) };
+        let mut params = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
+            geometricMask: std::mem::ManuallyDrop::new(Some(mask)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2::identity(),
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // SAFETY: the layer is popped right after `f`; the mask reference we hold is released once it is gone.
+        unsafe { ctx.PushLayer(&params, None) };
+        f(self);
+        // SAFETY: matches the PushLayer above; the geometry reference is dropped exactly once.
+        unsafe {
+            ctx.PopLayer();
+            std::mem::ManuallyDrop::drop(&mut params.geometricMask);
+        }
     }
 }

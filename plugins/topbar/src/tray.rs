@@ -214,4 +214,38 @@ mod tests {
     }
 }
 
-// ---------- tray overflow flyout (the chevron): every icon, click / right click work as in the real tray ----------
+
+// ---------- the hidden icons panel (the chevron): every icon, clicks work as in the real tray ----------
+
+/// The icons the panel shows, read afresh while it is open (programs add and drop their icons any time).
+fn panel_cells() -> Vec<ui::tray_popup::Cell> {
+    let over = over_idx();
+    TAPPS.with_borrow(|t| {
+        over.iter()
+            .map(|&i| ui::tray_popup::Cell { icon: wicon(t[i].icon), tip: t[i].tip.clone(), token: i })
+            .collect()
+    })
+}
+
+/// A click on an icon of the panel: left and right go to its program, middle moves it onto the bar.
+fn panel_click(token: usize, b: ui::panel::Button) {
+    use ui::panel::Button;
+    let icon = TAPPS.with_borrow(|t| t.get(token).map(|x| ((x.hwnd, x.uid, x.cb, x.ver), x.key.clone())));
+    let Some((t, key)) = icon else { return };
+    // SAFETY: posts the click to the program's own window.
+    unsafe {
+        match b {
+            Button::Middle => toggle_shown(&key),
+            Button::Left => tray_click(t, true),
+            Button::Right => tray_click(t, false),
+        }
+    }
+}
+
+/// The arrow on the bar was clicked: open the panel of hidden icons, or close it.
+pub(crate) unsafe fn tray_toggle() {
+    ui::panel::toggle(ui::panel::Id::Tray, || {
+        let a = anchor(TAPP)?;
+        Some((Box::new(ui::tray_popup::TrayPanel::new(panel_cells, panel_click)), a))
+    });
+}

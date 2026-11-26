@@ -1,0 +1,315 @@
+//! The hint over a bar button: the mockup's `.app::after`. A dark rounded label (`rgba(27,28,34,.96)`, a white ring at .1,
+//! `0 8px 24px` shadow, radius 8, padding 5×10, Inter 500 12 px) that fades in over .2 s and rises 6 px into place over .35 s
+//! (`SPRING`) once the pointer has rested .25 s, and fades out again when it leaves.
+//!
+//! [`Tip`] is the windowless core; [`show`] and [`hide`] drive the one real window (layered, click-through, never active).
+
+use std::cell::RefCell;
+
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, HWND_TOPMOST, KillTimer, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer,
+    SetWindowPos, ShowWindow, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+};
+use winrust_common::style::{self, Side};
+
+use super::anim::{self, EASE, SPRING, Transition};
+use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba, Surface};
+
+const FONT: Font = Font::new(12.0, 500);
+const BG: Rgba = Rgba::css(27, 28, 34, 0.96);
+const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
+/// Line height of 12 px Inter (`line-height: normal` in the browser).
+const LINE: f32 = 15.0;
+/// Room around the label for the shadow and the slide, DIPs.
+const PAD: f32 = 44.0;
+/// How far the label slides in, DIPs.
+const SLIDE: f32 = 6.0;
+
+/// Where the label stands: `edge` is the line it keeps to (device pixels) and `along` the point it is centred on along the
+/// bar. For a bottom bar the label stands above `edge`; for a left bar it starts right of it; for a right bar it ends left of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub side: Side,
+    pub along: i32,
+    pub edge: i32,
+}
+
+impl Place {
+    /// The label of a bar button: `bottom:58px` above a bottom bar's button, 12 px beside a side bar's.
+    #[must_use]
+    pub fn button(side: Side, rect: (i32, i32, i32, i32), along: i32, scale: f32) -> Self {
+        let dp = |v: f32| (v * scale).round() as i32;
+        let edge = match side {
+            Side::Bottom => rect.3 - dp(58.0),
+            Side::Left => rect.2 + dp(12.0),
+            Side::Right => rect.0 - dp(12.0),
+        };
+        Self { side, along, edge }
+    }
+}
+
+/// The label's state and painting, without a window.
+pub struct Tip {
+    lines: Vec<String>,
+    size: (f32, f32),
+    place: Place,
+    screen: (i32, i32),
+    scale: f32,
+    /// Opacity and the slide (6 → 0 DIPs).
+    op: Transition,
+    mv: Transition,
+    /// What to switch to once the label that is showing has faded out.
+    pending: Option<(String, Place, u64, Option<u32>)>,
+    hide_at: Option<u64>,
+    surf: Surface,
+    painted: Option<(i32, i32, u32, u32)>,
+    at: (i32, i32),
+}
+
+impl Tip {
+    #[must_use]
+    pub fn new(scale: f32, screen: (i32, i32)) -> Self {
+        Self {
+            lines: Vec::new(),
+            size: (0.0, 0.0),
+            place: Place { side: Side::Bottom, along: 0, edge: 0 },
+            screen,
+            scale,
+            op: Transition::new(0.0),
+            mv: Transition::new(SLIDE),
+            pending: None,
+            hide_at: None,
+            surf: Surface::new(),
+            painted: None,
+            at: (0, 0),
+        }
+    }
+
+    /// Shows `text` at `place` after `delay` ms (the mockup's `transition-delay: .25s`); `hold` hides it again after that many
+    /// ms (the volume readout). A label that is already up fades out first.
+    pub fn show(&mut self, g: &mut Gfx, text: &str, place: Place, now: u64, delay: u32, hold: Option<u32>) {
+        if text.is_empty() {
+            return self.hide(now);
+        }
+        if self.op.target() > 0.0 && self.lines.join("\n") == text && self.place == place {
+            self.hide_at = hold.map(|h| now + u64::from(h));
+            return; // the same label again (the wheel keeps turning)
+        }
+        if self.op.value(now) > 0.02 && delay > 0 {
+            // another label is still on its way out: this one waits for it, counting its delay from now
+            self.pending = Some((text.to_string(), place, now + u64::from(delay), hold));
+            return self.hide(now);
+        }
+        self.pending = None;
+        self.lines = text.split('\n').map(str::to_string).collect();
+        let w = self.lines.iter().map(|l| g.measure(l, FONT)).fold(0.0, f32::max).ceil();
+        self.size = (w + 20.0, LINE * self.lines.len() as f32 + 10.0);
+        self.place = place;
+        let (od, odel) = anim::timing(style::anim(), 200, delay);
+        let (md, mdel) = anim::timing(style::anim(), 350, delay);
+        self.op.snap(0.0);
+        self.mv.snap(SLIDE);
+        self.op.set(1.0, now, od, odel, EASE);
+        self.mv.set(0.0, now, md, mdel, SPRING);
+        self.hide_at = hold.map(|h| now + u64::from(h) + u64::from(delay));
+        self.painted = None;
+    }
+
+    /// Fades the label out (`opacity .2s ease`; it also slides back down).
+    pub fn hide(&mut self, now: u64) {
+        self.hide_at = None;
+        if self.op.target() <= 0.0 {
+            return;
+        }
+        let (od, _) = anim::timing(style::anim(), 200, 0);
+        let (md, _) = anim::timing(style::anim(), 350, 0);
+        self.op.set(0.0, now, od, 0, EASE);
+        self.mv.set(SLIDE, now, md, 0, SPRING);
+    }
+
+    #[must_use]
+    pub fn busy(&self, now: u64) -> bool {
+        self.op.running(now) || self.mv.running(now) || self.hide_at.is_some() || self.pending.is_some()
+    }
+
+    /// Where the label's box rests, in DIPs on the screen.
+    fn rest(&self) -> (f32, f32) {
+        let s = self.scale;
+        let (w, h) = self.size;
+        let (sw, sh) = (self.screen.0 as f32 / s, self.screen.1 as f32 / s);
+        let (along, edge) = (self.place.along as f32 / s, self.place.edge as f32 / s);
+        match self.place.side {
+            Side::Bottom => ((along - w / 2.0).clamp(4.0, (sw - w - 4.0).max(4.0)), edge - h),
+            Side::Left => (edge, (along - h / 2.0).clamp(4.0, (sh - h - 4.0).max(4.0))),
+            Side::Right => (edge - w, (along - h / 2.0).clamp(4.0, (sh - h - 4.0).max(4.0))),
+        }
+    }
+
+    /// Paints the label at `now`. Returns the window rectangle in device pixels and whether the window should be shown.
+    pub fn frame(&mut self, g: &mut Gfx, now: u64) -> ((i32, i32, i32, i32), bool) {
+        if self.hide_at.is_some_and(|t| now >= t) {
+            self.hide(now);
+        }
+        let o = self.op.value(now);
+        if o <= 0.001 && self.op.target() <= 0.0 {
+            if let Some((t, p, due, h)) = self.pending.take() {
+                self.show(g, &t, p, now, due.saturating_sub(now) as u32, h);
+            }
+            if self.op.target() <= 0.0 && self.pending.is_none() {
+                self.lines.clear();
+                return ((0, 0, 0, 0), false);
+            }
+        }
+        let s = self.scale;
+        let (o, m) = (self.op.value(now), self.mv.value(now));
+        let (bx, by) = self.rest();
+        let (wx, wy) = (((bx - PAD) * s).round() as i32, ((by - PAD) * s).round() as i32);
+        let (ww, wh) = (((self.size.0 + 2.0 * PAD) * s).round() as i32, ((self.size.1 + 2.0 * PAD) * s).round() as i32);
+        let (dx, dy) = match self.place.side {
+            Side::Bottom => (0.0, m),
+            Side::Left => (-m, 0.0),
+            Side::Right => (m, 0.0),
+        };
+        let key = (wx, wy, o.to_bits(), m.to_bits());
+        if self.painted != Some(key) {
+            self.painted = Some(key);
+            let (w, h) = self.size;
+            let r = Rect::new(PAD + dx, PAD + dy, w, h);
+            let lines = &self.lines;
+            let _ = g.paint(&mut self.surf, ww, wh, |c: &mut Canvas<'_>| {
+                c.faded(o, |c| {
+                    c.shadow(r, 8.0, 8.0, 24.0, Rgba::css(0, 0, 0, 0.5));
+                    c.ring(r.inset(-1.0), 9.0, 1.0, Rgba::white(0.1));
+                    c.erase(r, 8.0);
+                    c.fill(r, 8.0, BG);
+                    for (i, l) in lines.iter().enumerate() {
+                        c.text(l, Rect::new(r.x + 10.0, r.y + 5.0 + LINE * i as f32, w - 20.0, LINE), FONT, INK, Align::Start);
+                    }
+                });
+            });
+        }
+        self.at = (wx, wy);
+        ((wx, wy, ww, wh), true)
+    }
+
+    #[must_use]
+    pub const fn surface(&self) -> &Surface {
+        &self.surf
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the window
+
+struct Host {
+    tip: Tip,
+    gfx: Gfx,
+    wnd: HWND,
+    shown: bool,
+    timer: bool,
+}
+
+thread_local! {
+    static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
+}
+
+fn with<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    HOST.with(|h| h.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
+}
+
+fn now() -> u64 {
+    // SAFETY: plain query.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+/// Creates the label's window; `screen` is the primary monitor in device pixels.
+pub fn init(hi: HINSTANCE, scale: f32, screen: (i32, i32)) -> bool {
+    let Ok(gfx) = Gfx::new(scale) else { return false };
+    let name: Vec<u16> = "topbar_tip\0".encode_utf16().collect();
+    super::panel::register_class(hi, &name, Some(proc), false);
+    // SAFETY: window creation with a live, NUL-terminated class name.
+    let wnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            name.as_ptr(),
+            std::ptr::null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hi,
+            std::ptr::null(),
+        )
+    };
+    if wnd.is_null() {
+        return false;
+    }
+    HOST.set(Some(Host { tip: Tip::new(scale, screen), gfx, wnd, shown: false, timer: false }));
+    true
+}
+
+/// Shows `text` over a bar button after `delay` ms; `hold` takes it away again after that many ms.
+pub fn show(text: &str, place: Place, delay: u32, hold: Option<u32>) {
+    with(|h| {
+        let t = now();
+        h.tip.show(&mut h.gfx, text, place, t, delay, hold);
+        h.frame(t);
+    });
+}
+
+pub fn hide() {
+    with(|h| {
+        let t = now();
+        h.tip.hide(t);
+        h.frame(t);
+    });
+}
+
+/// A label is on screen or about to be.
+#[must_use]
+pub fn is_up() -> bool {
+    with(|h| h.shown || h.tip.busy(now())).unwrap_or(false)
+}
+
+impl Host {
+    fn frame(&mut self, t: u64) {
+        let (rect, up) = self.tip.frame(&mut self.gfx, t);
+        if up {
+            let _ = self.tip.surface().present(super::panel::whwnd(self.wnd), rect.0, rect.1, 255);
+            if !self.shown {
+                self.shown = true;
+                // SAFETY: showing our own window without activating it.
+                unsafe { SetWindowPos(self.wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW) };
+            }
+        } else if self.shown {
+            self.shown = false;
+            // SAFETY: hiding our own window.
+            unsafe { ShowWindow(self.wnd, SW_HIDE) };
+        }
+        let busy = self.tip.busy(t);
+        if busy != self.timer {
+            self.timer = busy;
+            // SAFETY: a timer on our own window.
+            unsafe {
+                if busy {
+                    SetTimer(self.wnd, 1, 16, None);
+                } else {
+                    KillTimer(self.wnd, 1);
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_TIMER {
+        with(|h| h.frame(now()));
+        return 0;
+    }
+    // SAFETY: the default procedure of our own window.
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}

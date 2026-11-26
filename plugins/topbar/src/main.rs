@@ -18,7 +18,7 @@ use std::{
 #[macro_use]
 extern crate winrust_common;
 use winrust_common as i18n;
-use winrust_common::style::{Style, card, on_accent, pal, rgb, style, ui_face};
+use winrust_common::style::{Side, Style, card, on_accent, pal, rgb, style, ui_face};
 mod clip;
 mod hist;
 mod fly;
@@ -206,17 +206,12 @@ fn lnk_uses(lnk: &std::path::Path) -> u32 {
 thread_local! {
     static HOST: Cell<HWND> = const { Cell::new(null_mut()) };
     static SKIP: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // windows their app took off the taskbar (ITaskbarList::DeleteTab)
-    static TIPWND: Cell<HWND> = const { Cell::new(null_mut()) };
     static SWWND: Cell<HWND> = const { Cell::new(null_mut()) }; // the Alt+Tab switcher
     static SW: RefCell<(Vec<HWND>, usize)> = const { RefCell::new((Vec::new(), 0)) }; // its windows (z-order) and selection
-    static TIP: RefCell<String> = const { RefCell::new(String::new()) };
     static PINS: RefCell<Vec<Pin>> = const { RefCell::new(Vec::new()) };
     static BTNS: RefCell<Vec<Btn>> = const { RefCell::new(Vec::new()) }; // [0] is always Start (pin None, no wins)
     static TAPPS: RefCell<Vec<TIcon>> = const { RefCell::new(Vec::new()) };
     static SHOWN: RefCell<Option<Vec<String>>> = const { RefCell::new(None) }; // tray icons kept on the bar (by exe); None = none: every tray icon lives in the chevron flyout
-    static TRAYFLY: Cell<HWND> = const { Cell::new(null_mut()) };
-    static TF_ANIM: Cell<(u64, i32, i32)> = const { Cell::new((0, 0, 0)) }; // tray flyout: when it opened, its final x, y
-    static FHOT: Cell<i32> = const { Cell::new(-1) };
     static HOT: Cell<i32> = const { Cell::new(NONE) };
     static ORDER: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // unpinned windows in the order their buttons were added
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
@@ -247,172 +242,6 @@ fn sc(v: i32) -> i32 {
     (v as f32 * SCALE.get()) as i32
 }
 // ---------- taskbar / appbar ----------
-
-const FCELL: i32 = 38;
-
-/// (columns, window width, window height) for the current number of icons.
-fn fly_size() -> (usize, i32, i32) {
-    let n = over_idx().len().max(1);
-    let cols = n.min(6);
-    (cols, sc(FCELL) * cols as i32 + sc(16), sc(FCELL) * n.div_ceil(cols) as i32 + sc(16) + sc(26))
-}
-
-unsafe fn fly_toggle() {
-    let w = TRAYFLY.get();
-    if IsWindowVisible(w) != 0 {
-        ShowWindow(w, SW_HIDE);
-        InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
-        return;
-    }
-    let (_, fw, fh) = fly_size();
-    FHOT.set(-1);
-    let scr = GetSystemMetrics(SM_CXSCREEN);
-    let cx = tip_cx(TAPP); // above the chevron
-    SetWindowRgn(w, CreateRoundRectRgn(0, 0, fw + 1, fh + 1, rr(12), rr(12)), 1);
-    let (x, y) = if vert() { (side_x(fw), (cx - fh / 2).clamp(sc(8), GetSystemMetrics(SM_CYSCREEN) - fh - sc(8))) } else { ((cx - fw / 2).clamp(sc(8), scr - fw - sc(8)), pop_y(fh)) };
-    TF_ANIM.set((now_ms(), x, y));
-    SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA); // tf_step fades it in
-    SetWindowPos(w, HWND_TOPMOST, x, y + tf_slide(0.0), fw, fh, SWP_SHOWWINDOW);
-    InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
-    SetTimer(w, 1, 15, None);
-    SetForegroundWindow(w); // so that WM_ACTIVATE tells us when the user clicks elsewhere
-}
-
-/// How far the tray flyout still is from its place at opening progress `e` (0..1): it rises toward the bar's far side.
-unsafe fn tf_slide(e: f32) -> i32 {
-    ((1.0 - e) * sc(14) as f32) as i32
-}
-
-/// Opening progress 0..1 of the tray flyout, eased, and of its icon `n` (each one starts 25 ms after the previous).
-unsafe fn tf_progress(n: i32) -> f32 {
-    let age = now_ms().saturating_sub(TF_ANIM.get().0) as f32;
-    ease(((age - 25.0 * n as f32) / 200.0).clamp(0.0, 1.0))
-}
-
-unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let cell_at = |lp: LPARAM| -> i32 {
-        let (x, y) = ((lp & 0xffff) as i16 as i32 - sc(8), ((lp >> 16) & 0xffff) as i16 as i32 - sc(8));
-        let (cols, _, _) = fly_size();
-        let n = over_idx().len() as i32;
-        if x < 0 || y < 0 || x >= sc(FCELL) * cols as i32 {
-            return -1;
-        }
-        let i = (y / sc(FCELL)) * cols as i32 + x / sc(FCELL);
-        if i < n { i } else { -1 }
-    };
-    match msg {
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = zeroed();
-            let dc = BeginPaint(hwnd, &mut ps);
-            let mut r: RECT = zeroed();
-            GetClientRect(hwnd, &mut r);
-            fill(dc, r, pal().line, sc(12));
-            fill(dc, RECT { left: 1, top: 1, right: r.right - 1, bottom: r.bottom - 1 }, pal().bg, sc(12));
-            let (cols, _, _) = fly_size();
-            let f = tip_font();
-            let of = SelectObject(dc, f);
-            SetBkMode(dc, TRANSPARENT as i32);
-            SetTextColor(dc, pal().dim);
-            let mut tip = String::new();
-            let over = over_idx();
-            TAPPS.with_borrow(|t| {
-                for (n, ti) in over.iter().map(|&i| &t[i]).enumerate() {
-                    let (x, y) = (sc(8) + (n % cols) as i32 * sc(FCELL), sc(8) + (n / cols) as i32 * sc(FCELL));
-                    if FHOT.get() == n as i32 {
-                        fill(dc, RECT { left: x, top: y, right: x + sc(FCELL), bottom: y + sc(FCELL) }, pal().hover, sc(6));
-                        tip = ti.tip.clone();
-                    }
-                    if !ti.icon.is_null() {
-                        let sz = (sc(20) as f32 * (0.4 + 0.6 * tf_progress(n as i32))) as i32; // pops in
-                        DrawIconEx(dc, x + sc(19) - sz / 2, y + sc(18) - sz / 2, ti.icon, sz, sz, 0, null_mut(), DI_NORMAL);
-                    }
-                }
-            });
-            if tip.is_empty() {
-                tip = if over.is_empty() { "No more icons".into() } else { "Middle click: move to the bar".into() };
-            }
-            let mut tr = RECT { left: sc(10), top: r.bottom - sc(26), right: r.right - sc(10), bottom: r.bottom - sc(4) };
-            DrawTextW(dc, wide(&tip).as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
-            SelectObject(dc, of);
-            DeleteObject(f);
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_MOUSEMOVE => {
-            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-            TrackMouseEvent(&mut tme);
-            if FHOT.replace(cell_at(lp)) != cell_at(lp) {
-                InvalidateRect(hwnd, null(), 0);
-            }
-            0
-        }
-        WM_MOUSELEAVE => {
-            FHOT.set(-1);
-            InvalidateRect(hwnd, null(), 0);
-            0
-        }
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-            let i = cell_at(lp);
-            let ti = over_idx().get(i.max(0) as usize).and_then(|&k| TAPPS.with_borrow(|t| t.get(k).map(|x| ((x.hwnd, x.uid, x.cb, x.ver), x.key.clone()))));
-            if let (true, Some((t, key))) = (i >= 0, ti) {
-                if msg == WM_MBUTTONDOWN {
-                    toggle_shown(&key);
-                    InvalidateRect(hwnd, null(), 0);
-                } else {
-                    ShowWindow(hwnd, SW_HIDE);
-                    InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
-                    tray_click(t, msg == WM_LBUTTONDOWN);
-                }
-            }
-            0
-        }
-        WM_ACTIVATE if wp & 0xffff == 0 => {
-            ShowWindow(hwnd, SW_HIDE);
-            InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
-            0
-        }
-        WM_TIMER => {
-            let (_, x, y) = TF_ANIM.get();
-            let e = tf_progress(0);
-            SetLayeredWindowAttributes(hwnd, 0, (255.0 * e) as u8, LWA_ALPHA);
-            SetWindowPos(hwnd, null_mut(), x, y + tf_slide(e), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            InvalidateRect(hwnd, null(), 0);
-            if tf_progress(over_idx().len() as i32) >= 1.0 {
-                KillTimer(hwnd, 1);
-            }
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
-}
-
-// ---------- tray tooltip: a small popup under the icon after the mouse rests on it ----------
-
-unsafe fn tip_font() -> HFONT {
-    CreateFontW(-sc(12), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, wide(ui_face()).as_ptr())
-}
-
-unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg != WM_PAINT {
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    let mut ps: PAINTSTRUCT = zeroed();
-    let dc = BeginPaint(hwnd, &mut ps);
-    let mut r: RECT = zeroed();
-    GetClientRect(hwnd, &mut r);
-    fill(dc, r, pal().line, sc(8));
-    fill(dc, RECT { left: 1, top: 1, right: r.right - 1, bottom: r.bottom - 1 }, pal().bg, sc(8));
-    let f = tip_font();
-    let of = SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(dc, pal().text);
-    let mut tr = RECT { left: sc(8), top: sc(5), right: r.right - sc(8), bottom: r.bottom - sc(5) };
-    TIP.with_borrow(|s| DrawTextW(dc, wide(s).as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK));
-    SelectObject(dc, of);
-    DeleteObject(f);
-    EndPaint(hwnd, &ps);
-    0
-}
 
 /// Tooltip text of a bar element ("" = none).
 unsafe fn tip_text(h: i32) -> String {
@@ -471,31 +300,49 @@ fn vol_tip() -> String {
     }
 }
 
-/// Shows `s` in a small rounded popup above the bar, centered on screen x `cx`.
+/// Shows `s` over the bar, centred on screen position `cx` along it (a notice that belongs to no button).
 unsafe fn show_tip(s: String, cx: i32) {
-    let tw = TIPWND.get();
-    if s.is_empty() || tw.is_null() {
-        return;
-    }
-    let (dc, f) = (GetDC(tw), tip_font());
-    let of = SelectObject(dc, f);
-    let mut r = RECT { left: 0, top: 0, right: sc(280), bottom: 0 };
-    DrawTextW(dc, wide(&s).as_ptr(), -1, &mut r, DT_CALCRECT | DT_NOPREFIX | DT_WORDBREAK);
-    SelectObject(dc, of);
-    DeleteObject(f);
-    ReleaseDC(tw, dc);
-    let (w, h) = (r.right + sc(16), r.bottom + sc(10));
-    TIP.set(s);
-    SetWindowRgn(tw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(8), rr(8)), 1);
-    if vert() {
-        let y = (cx - h / 2).clamp(sc(4), GetSystemMetrics(SM_CYSCREEN) - h - sc(4));
-        SetWindowPos(tw, HWND_TOPMOST, side_x(w), y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(tw, null(), 1);
-        return;
-    }
-    let x = (cx - w / 2).clamp(sc(4), GetSystemMetrics(SM_CXSCREEN) - w - sc(4));
-    SetWindowPos(tw, HWND_TOPMOST, x, bar_top() + bar_off() - h - sc(6), w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(tw, null(), 1);
+    let Some(a) = anchor(NONE) else { return };
+    let edge = match a.side {
+        Side::Bottom => a.bar.1 - dp(12.0),
+        Side::Left => a.bar.2 + dp(12.0),
+        Side::Right => a.bar.0 - dp(12.0),
+    };
+    ui::tip::show(&s, ui::tip::Place { side: a.side, along: cx, edge }, 0, None);
+}
+
+/// The hint of bar element `key` after `delay` ms (the mockup waits .25 s), `hold` ms at most.
+unsafe fn key_tip(key: i32, text: String, delay: u32, hold: Option<u32>) {
+    let Some(a) = anchor(key) else { return };
+    let along = tip_cx(key);
+    ui::tip::show(&text, ui::tip::Place::button(a.side, a.button, along, SCALE.get()), delay, hold);
+}
+
+/// Where a bar element is, for the panel that belongs to it (`NONE`: the bar as a whole), in device pixels with the bar at rest.
+unsafe fn anchor(key: i32) -> Option<ui::panel::Anchor> {
+    UI.with_borrow(|u| {
+        let b = u.as_ref()?;
+        let p = b.placement();
+        let (dx, dy) = (p.rest.0 - p.bar.0, p.rest.1 - p.bar.1);
+        let button = b.screen_rect(key).map_or((0, 0, 0, 0), |r| (r.0 + dx, r.1 + dy, r.2 + dx, r.3 + dy));
+        Some(ui::panel::Anchor {
+            side: i18n::style::side(),
+            button,
+            bar: (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3),
+            screen: (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
+        })
+    })
+}
+
+/// A panel opened or closed: the bar redraws the button that is lit for it.
+fn panel_changed() {
+    // SAFETY: invalidating our own bar window.
+    unsafe { InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0) };
+}
+
+/// A popup (a panel of the new frame, or an old flyout) is open: hints stay away and the bar stays put.
+fn popup_open() -> bool {
+    fly::any_open() || ui::panel::any_open()
 }
 
 // ---------- Alt+Tab switcher: a grid of the open windows with live previews, most recently used first (#92) ----------
@@ -642,7 +489,7 @@ unsafe extern "system" fn sw_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 unsafe fn hide_tip(bar: HWND) {
     KillTimer(bar, 2);
-    ShowWindow(TIPWND.get(), SW_HIDE);
+    ui::tip::hide();
 }
 
 unsafe fn set_state(hwnd: HWND, state: usize) {
@@ -1458,7 +1305,7 @@ unsafe fn fs_update(hwnd: HWND) {
     } else {
         pt.y >= sh - edge || (pt.y >= sh - outer && shown)
     };
-    if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || fly::any_open() || over {
+    if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || popup_open() || over {
         DESK_T.set(now);
     }
     let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
@@ -1468,6 +1315,7 @@ unsafe fn fs_update(hwnd: HWND) {
     if FULLSCREEN.swap(fs, Relaxed) != fs {
         if fs {
             fly::close_now();
+            ui::panel::close_now();
             hide_tip(hwnd);
             thumbs::hide_preview();
         }
@@ -1497,7 +1345,7 @@ unsafe fn dock_covered() -> bool {
     }
     let fg = GetForegroundWindow();
     // a maximized window never hides the dock (it could stay gone until the window was restored)
-    if fg.is_null() || IsIconic(fg) != 0 || IsZoomed(fg) != 0 || fg == BAR.load(Relaxed) as HWND || fly::any_open() {
+    if fg.is_null() || IsIconic(fg) != 0 || IsZoomed(fg) != 0 || fg == BAR.load(Relaxed) as HWND || popup_open() {
         return false;
     }
     let mut r: RECT = zeroed();
@@ -1781,8 +1629,8 @@ unsafe fn build_live() -> barui::Live {
         start: fly::is_open(fly::Kind::Start),
         qs: fly::is_open(fly::Kind::Quick) || fly::is_open(fly::Kind::Wifi),
         cal: fly::is_open(fly::Kind::Cal),
-        lang: menu_at(LANG),
-        tray: IsWindowVisible(TRAYFLY.get()) != 0,
+        lang: ui::panel::is_open(ui::panel::Id::Lang),
+        tray: ui::panel::is_open(ui::panel::Id::Tray),
         hidden: FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)),
     }
 }
@@ -2451,7 +2299,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
             }
         }
         // left: the language picker; right: straight to the next one (Win+Space is explorer's, gone under rs-shell)
-        LANG if left => lang_menu(BAR.load(Relaxed) as HWND),
+        LANG if left => lang_toggle(),
         LANG => next_lang(BAR.load(Relaxed) as HWND, false),
         WIFI_I => fly::toggle_click(if left { fly::Kind::Quick } else { fly::Kind::Wifi }), // right click: the network list
         VOL_I | BAT_I => fly::toggle_click(fly::Kind::Quick),
@@ -2478,7 +2326,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
             let slot = (h - TAPP) as usize;
             if slot == 0 {
                 if left {
-                    fly_toggle();
+                    tray_toggle();
                 }
             } else if mid {
                 if let Some(k) = bar_idx().get(slot - 1).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|x| x.key.clone()))) {
@@ -2583,12 +2431,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == 2 => {
             KillTimer(hwnd, 2);
             let h = HOT.get();
-            if h != NONE && !fly::any_open() {
+            if h != NONE && !popup_open() {
                 let cx = tip_cx(h);
                 // an app button with windows shows their live previews (#92), anything else its tip
                 if !thumbs::show_preview(h, cx) {
                     thumbs::hide_preview();
-                    show_tip(tip_text(h), cx);
+                    key_tip(h, tip_text(h), 0, None);
                 }
             }
         }
@@ -2629,7 +2477,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         VOLKEY => {
             if wp == 2 { toggle_mute() } else { add_volume(if wp == 0 { 4 } else { -4 }) }
             KillTimer(hwnd, 2);
-            show_tip(vol_tip(), tip_cx(VOL_I));
+            key_tip(VOL_I, vol_tip(), 0, None);
             SetTimer(hwnd, 6, 1200, None);
             InvalidateRect(hwnd, null(), 0);
         }
@@ -2659,6 +2507,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 hide_tip(hwnd);
                 if h != NONE {
                     SetTimer(hwnd, 2, 450, None);
+                    // the hint comes by itself after the mockup's .25 s; an app with windows shows previews instead
+                    if !popup_open() && !(h >= 1 && BTNS.with_borrow(|b| b.get(h as usize).is_some_and(|b| !b.wins.is_empty()))) {
+                        key_tip(h, tip_text(h), 250, None);
+                    }
                 }
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -2672,8 +2524,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             add_volume(if (wp >> 16) as i16 > 0 { 2 } else { -2 }); // wheel anywhere on the bar = volume
             press(VOL_I); // the speaker flashes so it is clear what the wheel changed
             KillTimer(hwnd, 2);
-            if !fly::any_open() {
-                show_tip(vol_tip(), tip_cx(VOL_I)); // and the level shows above it for a moment
+            if !popup_open() {
+                key_tip(VOL_I, vol_tip(), 0, None); // and the level shows above it for a moment
                 SetTimer(hwnd, 6, 1200, None);
             }
             InvalidateRect(hwnd, null(), 0);
@@ -2735,6 +2587,11 @@ fn main() {
         // `topbar --render <file.png> [classic|floating|dock] [bottom|left|right] [0|1|2] ...`: one frame of the bar into a PNG, no windows
         if let Some(i) = std::env::args().position(|a| a == "--render") {
             render::render(&std::env::args().skip(i + 1).collect::<Vec<_>>());
+            return;
+        }
+        // `topbar --render-panel <file.png> tray|lang|tip ...`: one popup panel (or the hint over a button) next to the bar, into a PNG
+        if let Some(i) = std::env::args().position(|a| a == "--render-panel") {
+            render::render_panel(&std::env::args().skip(i + 1).collect::<Vec<_>>());
             return;
         }
         if std::env::args().any(|a| a == "--shot") {
@@ -2816,12 +2673,8 @@ fn main() {
         for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, WM_COPYDATA] {
             ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, null_mut());
         }
-        let fc = wide("topbar_trayfly");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(fly_proc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: fc.as_ptr(), ..zeroed() });
-        TRAYFLY.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, fc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
-        let tipc = wide("topbar_tip");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(tip_proc), hInstance: hi, lpszClassName: tipc.as_ptr(), ..zeroed() });
-        TIPWND.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, tipc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
+        ui::panel::init(hi, SCALE.get(), hwnd, panel_changed);
+        ui::tip::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
         let swc = wide("topbar_alttab");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(sw_proc), hInstance: hi, lpszClassName: swc.as_ptr(), ..zeroed() });
         SWWND.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, swc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
