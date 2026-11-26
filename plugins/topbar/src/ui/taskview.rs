@@ -107,6 +107,42 @@ fn fit(src: (f32, f32), cell: Rect, cap: f32) -> Rect {
     Rect::new((cell.cx() - w / 2.0).round(), (cell.cy() - h / 2.0).round(), w, h)
 }
 
+/// Pack windows in centred rows of equal-height pictures, leaving room for each row's labels.
+fn task_grid(sizes: &[(f32, f32)], area: Rect) -> Vec<Rect> {
+    if sizes.is_empty() { return Vec::new(); }
+    let gap = 40.0;
+    let label = 34.0;
+    let aspects: Vec<f32> = sizes.iter().map(|&(w, h)| w.max(1.0) / h.max(1.0)).collect();
+    let mut best = (0.0f32, 1usize);
+    for rows in 1..=sizes.len() {
+        let cols = sizes.len().div_ceil(rows);
+        let actual_rows = sizes.len().div_ceil(cols);
+        let height = ((area.h - gap * (actual_rows - 1) as f32) / actual_rows as f32 - label).min(area.h * 0.45);
+        let mut height = height;
+        for chunk in aspects.chunks(cols) {
+            let available = area.w - gap * (chunk.len() - 1) as f32;
+            height = height.min(available / chunk.iter().sum::<f32>());
+        }
+        if height > best.0 { best = (height, cols); }
+    }
+    let (height, cols) = (best.0.max(1.0), best.1);
+    let rows = sizes.len().div_ceil(cols);
+    let total_h = rows as f32 * (height + label) + (rows - 1) as f32 * gap;
+    let y0 = area.y + (area.h - total_h) / 2.0;
+    let mut out = Vec::with_capacity(sizes.len());
+    for (row, chunk) in aspects.chunks(cols).enumerate() {
+        let width = chunk.iter().sum::<f32>() * height + (chunk.len() - 1) as f32 * gap;
+        let mut x = area.x + (area.w - width) / 2.0;
+        let y = y0 + row as f32 * (height + label + gap);
+        for aspect in chunk {
+            let w = aspect * height;
+            out.push(Rect::new(x, y, w, height));
+            x += w + gap;
+        }
+    }
+    out
+}
+
 fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
     let l = |x: f32, y: f32| x + (y - x) * t;
     Rect::new(l(a.x, b.x), l(a.y, b.y), l(a.w, b.w), l(a.h, b.h))
@@ -171,13 +207,8 @@ impl TaskView {
     pub fn new(scale: f32, screen: (i32, i32), desks: Vec<Desk>, can_add: bool, cards: Vec<WinCard>, calm: bool, pick: impl Fn(Pick) + 'static) -> Self {
         let screen = (screen.0 as f32 / scale, screen.1 as f32 / scale);
         let (aw, top, bottom) = (screen.0 - 160.0, 190.0, screen.1 - 150.0);
-        let label = 34.0;
         let sizes: Vec<(f32, f32)> = cards.iter().map(|c| { let s = c.size(); (s.0 / scale, s.1 / scale) }).collect();
-        // one cell for every window, as big as the room allows: the picture is half the window's size at most
-        let (cw, ch) = (aw * 0.5, (bottom - top - label) * 0.62);
-        let (cells, tw, th) = grid(cards.len(), aw, bottom - top - label, cw, ch + label, 40.0);
-        let (x0, y0) = ((screen.0 - tw) / 2.0, top + ((bottom - top - th) / 2.0).max(0.0));
-        let target = cells.iter().zip(&sizes).map(|(cell, &sz)| fit(sz, Rect::new(cell.x + x0, cell.y + y0, cell.w, cell.h - label), 0.5)).collect();
+        let target = task_grid(&sizes, Rect::new(80.0, top, aw.max(1.0), (bottom - top).max(1.0)));
         let from = cards
             .iter()
             .map(|c| Rect::new(c.frame.0 as f32 / scale, c.frame.1 as f32 / scale, (c.frame.2 - c.frame.0) as f32 / scale, (c.frame.3 - c.frame.1) as f32 / scale))
@@ -199,7 +230,7 @@ impl TaskView {
 
     fn close_at(&self, i: usize) -> Rect {
         let t = self.target[i];
-        Rect::new(t.x + t.w - 28.0, t.y - 36.0, 28.0, 28.0)
+        Rect::new(t.x + t.w - 20.0, t.y - 8.0, 28.0, 28.0)
     }
 
     fn draw_tile(&self, c: &mut Canvas<'_>, f: &mut Frame<'_>, i: usize, r: Rect, accent: Rgba) {
@@ -330,7 +361,7 @@ impl Content for TaskView {
             c.faded(label, |c| {
                 c.transformed(to.cx(), to.y + to.h, 1.0, 0.0, strip.dy, |c| draw_label(c, card, to.cx(), to.y + to.h + 14.0, to.w.max(160.0), Font::new(13.0, 500)));
             });
-            draw_cross(c, self.close_at(i), f.hover(CLOSE_BASE + i as i32, 160, EASE), cross * (0.9 + 0.1 * f.hover(CLOSE_BASE + i as i32, 160, EASE)));
+            draw_cross(c, Rect::new(r.x + r.w - 20.0, r.y - 8.0, 28.0, 28.0), f.hover(CLOSE_BASE + i as i32, 160, EASE), cross * (0.9 + 0.1 * f.hover(CLOSE_BASE + i as i32, 160, EASE)));
         }
     }
 
@@ -550,6 +581,18 @@ mod tests {
 #[cfg(test)]
 mod fit_tests {
     use super::*;
+
+    #[test]
+    fn task_rows_have_equal_heights_gaps_and_a_shared_label_baseline() {
+        let area = Rect::new(80.0, 190.0, 3200.0, 1100.0);
+        let cards = task_grid(&[(850.0, 560.0), (760.0, 300.0), (640.0, 420.0)], area);
+        assert_eq!(cards.len(), 3);
+        assert!((cards[0].h - cards[1].h).abs() < 0.01);
+        assert!((cards[0].y - cards[2].y).abs() < 0.01);
+        assert!((cards[1].x - cards[0].x - cards[0].w - 40.0).abs() < 0.01);
+        assert!((cards[2].x - cards[1].x - cards[1].w - 40.0).abs() < 0.01);
+        assert!(((cards[0].x + cards[2].x + cards[2].w) / 2.0 - area.cx()).abs() < 0.01);
+    }
 
     #[test]
     fn a_picture_keeps_its_shape_in_the_middle_of_its_cell() {

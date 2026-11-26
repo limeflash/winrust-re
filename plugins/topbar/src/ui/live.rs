@@ -27,6 +27,19 @@ pub fn source_size(w: isize) -> (i32, i32) {
     ((r.2 - r.0).max(1), (r.3 - r.1).max(1))
 }
 
+/// Check that DWM can supply a non-empty thumbnail before exposing a hole.
+pub fn drawable(host: HWND, source: HWND) -> bool {
+    // SAFETY: both handles are windows; the temporary registration is always released.
+    unsafe {
+        let mut id = 0isize;
+        if DwmRegisterThumbnail(host, source, &mut id) != 0 { return false; }
+        let mut size = SIZE { cx: 0, cy: 0 };
+        let ok = DwmQueryThumbnailSourceSize(id, &mut size) == 0 && size.cx > 0 && size.cy > 0;
+        DwmUnregisterThumbnail(id);
+        ok
+    }
+}
+
 /// The visible frame of a window on the screen (left, top, right, bottom).
 #[must_use]
 pub fn frame_of(w: isize) -> (i32, i32, i32, i32) {

@@ -302,12 +302,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let what = args.get(1).map_or("tray", String::as_str).to_string();
     let (mut style, mut side, mut scale, mut t, mut hover, mut n_icons, mut real, mut at) = (Style::Classic, Side::Bottom, 1.0f32, 5000u64, None, 6usize, false, 3i32);
     let (mut query, mut page, mut pins) = (String::new(), 0usize, 24usize);
+    let (mut screen_w, mut screen_h) = (1440.0f32, 900.0f32);
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let mut dir_arg = "";
     let (mut n_wins, mut recent, mut kind, mut n_desks) = (3usize, false, "ctx", 2usize);
     for a in args.iter().skip(2) {
         match a.split_once('=') {
+            Some(("width", v)) => screen_w = v.parse().unwrap_or(1440.0),
+            Some(("height", v)) => screen_h = v.parse().unwrap_or(900.0),
             Some(("q", v)) => query = v.to_string(),
             Some(("page", v)) => page = v.parse().unwrap_or(0),
             Some(("pins", v)) => pins = v.parse().unwrap_or(24),
@@ -371,13 +374,13 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             barui::AppView { icon: icon(exe), wins, active: i == 1, flash: false, color: ui::gfx::Rgba::hex(color) }
         })
         .collect();
-    let (sw, sh) = ((1440.0 * scale).round() as i32, (900.0 * scale).round() as i32);
+    let (sw, sh) = ((screen_w * scale).round() as i32, (screen_h * scale).round() as i32);
     let view = barui::View {
         style,
         side,
         size: 1,
         align_left: false,
-        screen: (1440.0, 900.0),
+        screen: (screen_w, screen_h),
         op: 0.85,
         apps,
         tray: Vec::new(),
@@ -662,7 +665,7 @@ fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, 
     let frames = [fr(300.0, 120.0, 850.0, 560.0), fr(520.0, 200.0, 760.0, 300.0), fr(80.0, 90.0, 640.0, 420.0), fr(700.0, 60.0, 600.0, 400.0)];
     let titles = ["File manager", "Task Manager", "Lemxy/WinRust \u{b7} GitHub", "Notepad"];
     let cards: Vec<WinCard> = (0..n_wins.min(4))
-        .map(|i| WinCard { hwnd: i as isize + 1, title: titles[i].into(), icon: Rc::new(OwnedIcon(demo_icon(icon, i + 1))), frame: frames[i], minimized: false })
+        .map(|i| WinCard { hwnd: i as isize + 1, title: titles[i].into(), icon: Rc::new(OwnedIcon(demo_icon(icon, i + 1))), frame: frames[i], minimized: i == 2 })
         .collect();
     let on_first = [(0.2, 0.13, 0.59, 0.62), (0.36, 0.22, 0.52, 0.33)];
     let desks: Vec<Desk> = (0..n_desks)
