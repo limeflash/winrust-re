@@ -510,6 +510,9 @@ pub struct QuickPanel {
     toggle: bool,
     /// The time of the frame being drawn, for the geometry that moves.
     now: u64,
+    /// The Wi-Fi page: how many of the other networks the wheel has scrolled past, and the most it can (set by `layout`).
+    scroll: Cell<usize>,
+    max_scroll: Cell<usize>,
 }
 
 impl QuickPanel {
@@ -539,6 +542,8 @@ impl QuickPanel {
             slide: Slide::new(),
             toggle: false,
             now: 0,
+            scroll: Cell::new(0),
+            max_scroll: Cell::new(0),
         };
         panel.size.1 = panel.geo().height;
         panel
@@ -568,6 +573,7 @@ impl QuickPanel {
         self.flip = Some((0, dir));
         self.pass = None;
         self.ctx = None;
+        self.scroll.set(0);
         ON_WIFI.set(to == Page::Wifi);
     }
 
@@ -599,8 +605,11 @@ impl QuickPanel {
         if !others.is_empty() {
             y = label_y + 15.0 + 6.0;
         }
-        let room = (self.footer().y - GAP - y + 1.0) / 45.0;
-        let rows = others.iter().take(room.max(0.0) as usize).enumerate().map(|(k, &i)| (i, Rect::new(PAD, y + k as f32 * 45.0, INNER, 44.0))).collect();
+        let room = ((self.footer().y - GAP - y + 1.0) / 45.0).max(0.0) as usize;
+        // more networks than rows: the wheel moves the window over them (the rest could not be joined otherwise)
+        self.max_scroll.set(others.len().saturating_sub(room));
+        let skip = self.scroll.get().min(self.max_scroll.get());
+        let rows = others.iter().skip(skip).take(room).enumerate().map(|(k, &i)| (i, Rect::new(PAD, y + k as f32 * 45.0, INNER, 44.0))).collect();
         (card, label_y, rows)
     }
 
@@ -1270,6 +1279,15 @@ impl Content for QuickPanel {
     }
 
     fn wheel(&mut self, _x: f32, _y: f32, up: bool) {
+        if self.page == Page::Wifi {
+            let at = self.scroll.get().min(self.max_scroll.get());
+            let to = if up { at.saturating_sub(1) } else { (at + 1).min(self.max_scroll.get()) };
+            if to != at {
+                self.scroll.set(to);
+                self.ctx = None;
+            }
+            return;
+        }
         if self.page == Page::Main
             && let Some((v, _)) = self.st.vol
         {

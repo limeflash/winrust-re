@@ -397,8 +397,8 @@ impl StartPanel {
         let back = Rect::new(16.0, 76.0, 100.0, 32.0);
         c.fill(back, 9.0, Rgba::white(0.07 * f.hover(3000, 140, EASE)));
         c.icon("M15 6l-6 6 6 6", (28.0, 92.0), 16.0, 2.2, INK, 0.0);
-        c.text(t!("????????", "Recent", ja: "??", pt: "Recentes", zh: "??"), Rect::new(40.0, 76.0, 76.0, 32.0), Font::new(13.0, 600), INK, Align::Start);
-        let labels = [t!("???", "All", ja: "???", pt: "Todos", zh: "??"), t!("?????????", "Documents", ja: "??", pt: "Documentos", zh: "??"), t!("???????????", "Images", ja: "??", pt: "Imagens", zh: "??"), t!("?????", "Folders", ja: "?????", pt: "Pastas", zh: "???")];
+        c.text(t!("Недавние", "Recent", ja: "最近", pt: "Recentes", zh: "最近"), Rect::new(40.0, 76.0, 76.0, 32.0), Font::new(13.0, 600), INK, Align::Start);
+        let labels = [t!("Все", "All", ja: "すべて", pt: "Todos", zh: "全部"), t!("Документы", "Documents", ja: "文書", pt: "Documentos", zh: "文档"), t!("Изображения", "Images", ja: "画像", pt: "Imagens", zh: "图片"), t!("Папки", "Folders", ja: "フォルダー", pt: "Pastas", zh: "文件夹")];
         let mut x = 624.0;
         for k in (0..4).rev() {
             let count = self.recent.iter().filter(|r| k == 0 || Self::recent_kind(r) == k).count();
@@ -423,7 +423,7 @@ impl StartPanel {
             for (row, &i) in indices.iter().skip(self.recent_scroll).take(6).enumerate() {
                 let it = &self.recent[i];
                 if last_day != Some(it.day) {
-                    let title = match it.day { 0 => t!("???????", "Today", ja: "??", pt: "Hoje", zh: "??"), 1 => t!("?????", "Yesterday", ja: "??", pt: "Ontem", zh: "??"), _ => t!("?????", "Earlier", ja: "??", pt: "Anteriormente", zh: "??") };
+                    let title = match it.day { 0 => t!("Сегодня", "Today", ja: "今日", pt: "Hoje", zh: "今天"), 1 => t!("Вчера", "Yesterday", ja: "昨日", pt: "Ontem", zh: "昨天"), _ => t!("Ранее", "Earlier", ja: "以前", pt: "Anteriormente", zh: "更早") };
                     c.text(title, Rect::new(26.0, y, 300.0, 28.0), Font::new(11.5, 600), DIM, Align::Start);
                     y += 28.0;
                     last_day = Some(it.day);
@@ -457,7 +457,7 @@ impl StartPanel {
                 } else { c.text_fit(it.when.rsplit_once(", ").map_or(it.when.as_str(), |(_, time)| time), Rect::new(475.0, r.y, 140.0, 52.0), Font::new(12.0, 400), DIM, Align::End); }
                 }));
             }
-            if indices.is_empty() { c.text(t!("??? ???????? ??????", "Nothing here yet", ja: "???????????????", pt: "Nada por aqui ainda", zh: "??????"), Rect::new(16.0, 200.0, 616.0, 100.0), Font::new(13.0, 500), DIM, Align::Center); }
+            if indices.is_empty() { c.text(t!("Здесь пока ничего нет", "Nothing here yet", ja: "ここにはまだ何もありません", pt: "Nada por aqui ainda", zh: "这里还没有内容"), Rect::new(16.0, 200.0, 616.0, 100.0), Font::new(13.0, 500), DIM, Align::Center); }
         });
         if indices.len() > 6 {
             let h = (area.h * 6.0 / indices.len() as f32).max(20.0);

@@ -824,7 +824,8 @@ impl Snip {
         let (w, h) = (m.rect.w() as f32 / m.scale, m.rect.h() as f32 / m.scale);
         let mut lay = Layout { size: (w, h), ..Layout::default() };
         if i == self.active {
-            let tool = Rect::new(((w - TOOL_W) / 2.0).round(), TOOL_TOP, TOOL_W, TOOL_H);
+            // centred; on a monitor narrower than the toolbar (high scale) it keeps its right end, so Close stays on the screen
+            let tool = Rect::new(((w - TOOL_W) / 2.0).round().min(w - TOOL_W), TOOL_TOP, TOOL_W, TOOL_H);
             let (kx, mx, gx) = (tool.x + 6.0, tool.x + 109.0, tool.x + 468.0);
             for (n, k) in KINDS.into_iter().enumerate() {
                 lay.items.push((Ctl::Kind(k), Rect::new(kx + 3.0 + 40.0 * n as f32, tool.y + 7.0, 40.0, 34.0)));
@@ -1286,9 +1287,14 @@ fn stop_label() -> &'static str {
     t!("Стоп", "Stop", ja: "停止", pt: "Parar", zh: "停止")
 }
 
-/// The width of the control box (it is 44 high), whatever the language and whether the meter is there.
-pub fn pill_width(measure: &mut dyn FnMut(&str, Font) -> f32, mic: bool) -> f32 {
-    let (tw, sw) = (measure("0:00", F_TIME), 10.0 + 10.0 + 7.0 + measure(stop_label(), F_GO) + 12.0);
+/// The widest the clock of the control can be while it reads `time` ("0:00" on the first minutes, "10:00" and "1:00:00" later): its digits, as zeros.
+fn time_shape(time: &str) -> String {
+    if time.len() < 4 { "0:00".into() } else { time.chars().map(|c| if c.is_ascii_digit() { '0' } else { c }).collect() }
+}
+
+/// The width of the control box (it is 44 high), whatever the language and whether the meter is there; `time` is the clock it shows.
+pub fn pill_width(measure: &mut dyn FnMut(&str, Font) -> f32, mic: bool, time: &str) -> f32 {
+    let (tw, sw) = (measure(&time_shape(time), F_TIME), 10.0 + 10.0 + 7.0 + measure(stop_label(), F_GO) + 12.0);
     pill_layout(tw, sw, mic).0
 }
 
@@ -1298,14 +1304,14 @@ pub fn paint_pill(c: &mut Canvas<'_>, origin: (f32, f32), v: &RecView, now: u64)
 }
 
 /// The Stop button of a control whose top left corner is the origin.
-pub fn stop_rect(measure: &mut dyn FnMut(&str, Font) -> f32, mic: bool) -> Rect {
-    let (tw, sw) = (measure("0:00", F_TIME), 10.0 + 10.0 + 7.0 + measure(stop_label(), F_GO) + 12.0);
+pub fn stop_rect(measure: &mut dyn FnMut(&str, Font) -> f32, mic: bool, time: &str) -> Rect {
+    let (tw, sw) = (measure(&time_shape(time), F_TIME), 10.0 + 10.0 + 7.0 + measure(stop_label(), F_GO) + 12.0);
     pill_layout(tw, sw, mic).3
 }
 
 fn pill(c: &mut Canvas<'_>, v: &RecView, now: u64) {
     let (p, out) = (SNAP.ease(prog(v.since, now, 320)), v.leaving.map_or(0.0, |at| EASE.ease(prog(at, now, 160))));
-    let (tw, sw) = (c.measure("0:00", F_TIME), 10.0 + 10.0 + 7.0 + c.measure(stop_label(), F_GO) + 12.0);
+    let (tw, sw) = (c.measure(&time_shape(&v.time), F_TIME), 10.0 + 10.0 + 7.0 + c.measure(stop_label(), F_GO) + 12.0);
     let (width, time, meter, stop) = pill_layout(tw, sw, v.meter.is_some());
     let r = Rect::new(0.0, 0.0, width, 44.0);
     let k = (0.96 + 0.04 * p) * (1.0 - 0.04 * out);
@@ -1554,6 +1560,24 @@ mod tests {
         let lay = s.layout(0, &mut |t, f| text_w(t, f));
         let pop = lay.pop.expect("the popover");
         assert_eq!((pop.x + pop.w, pop.y, pop.h), (1555.0, 72.0, 251.0));
+    }
+
+    #[test]
+    fn the_control_makes_room_for_the_hours() {
+        let mut w = |t: &str| pill_width(&mut |s, f| text_w(s, f), true, t);
+        assert_eq!((w("0:07"), w("9:59")), (w("0:00"), w("0:00")));
+        assert_eq!(w("12:34"), w("0:00"), "the box has a minimum that holds minutes");
+        assert!(w("1:02:03") > w("0:00"), "hours do not fit it");
+        assert_eq!(w("1:02:03"), w("9:59:59"));
+    }
+
+    #[test]
+    fn the_toolbar_on_a_narrow_monitor_keeps_its_close_button_on_screen() {
+        let mons = vec![Mon { rect: IRect::new(0, 0, 1000, 800), scale: 2.0 }]; // 500 DIPs wide: narrower than the 550 toolbar
+        let s = Snip::new(mons, vec![], Opts::default(), 0, 0);
+        let lay = s.layout(0, &mut |t, f| text_w(t, f));
+        let close = lay.rect_of(Ctl::Close).expect("close");
+        assert!(close.x >= 0.0 && close.x + close.w <= 500.0, "{close:?}");
     }
 
     #[test]

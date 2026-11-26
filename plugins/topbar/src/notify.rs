@@ -610,10 +610,12 @@ pub fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Do not disturb is remembered between runs: %ProgramData%\WinRust\dnd.txt holds `1` or `0`
+// Do not disturb is remembered between runs: %APPDATA%\WinRust\dnd.txt holds `1` or `0`. It is the user's own choice, so it lives in the
+// user's profile (a standard user cannot write to %ProgramData%\WinRust, and it would be one setting for everyone); the old
+// machine-wide file is still read when there is no personal one.
 
-fn dnd_file() -> Option<std::path::PathBuf> {
-    std::env::var_os("ProgramData").map(|p| std::path::PathBuf::from(p).join("WinRust").join("dnd.txt"))
+fn dnd_file(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(var).map(|p| std::path::PathBuf::from(p).join("WinRust").join("dnd.txt"))
 }
 
 /// What the file says: only a `1` turns it on.
@@ -624,11 +626,11 @@ pub fn parse_dnd(text: &str) -> bool {
 
 #[must_use]
 pub fn load_dnd() -> bool {
-    dnd_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_dnd(&s))
+    ["APPDATA", "ProgramData"].into_iter().find_map(|v| std::fs::read_to_string(dnd_file(v)?).ok()).is_some_and(|s| parse_dnd(&s))
 }
 
 pub fn save_dnd(on: bool) {
-    if let Some(f) = dnd_file() {
+    if let Some(f) = dnd_file("APPDATA") {
         let _ = std::fs::create_dir_all(f.parent().unwrap_or(&f));
         let _ = std::fs::write(f, if on { "1" } else { "0" });
     }
@@ -779,9 +781,26 @@ pub fn screenshot_failed() {
     post(Note::new(shot_app(), t!("Не удалось сделать скриншот", "Could not take a screenshot", ja: "スクリーンショットを撮影できませんでした", pt: "Não foi possível capturar a tela", zh: "无法截图"), ""));
 }
 
-/// The name an app goes by: its file's description (what Task Manager shows), else the file's name.
+/// The name an app goes by: its file's description (what Task Manager shows), else the file's name. Read from the file once per
+/// program (balloons come in on the bar's thread, inside the sender's `WM_COPYDATA`: a chatty tray icon must not read the file
+/// again for every balloon).
 #[must_use]
 pub fn app_name(exe: &str) -> String {
+    thread_local! { static NAMES: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
+    if let Some(n) = NAMES.with_borrow(|m| m.get(exe).cloned()) {
+        return n;
+    }
+    let name = read_app_name(exe);
+    NAMES.with_borrow_mut(|m| {
+        if m.len() >= 256 {
+            m.clear();
+        }
+        m.insert(exe.to_string(), name.clone());
+    });
+    name
+}
+
+fn read_app_name(exe: &str) -> String {
     use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
     let stem = || {
         let f = exe.rsplit('\\').next().unwrap_or(exe);
@@ -801,17 +820,21 @@ pub fn app_name(exe: &str) -> String {
         if GetFileVersionInfoW(path.as_ptr(), 0, size, block.as_mut_ptr().cast()) == 0 {
             return stem();
         }
-        let query = |sub: &str| -> Option<(*const u8, u32)> {
+        // `unit`: bytes per length unit (the translation table counts bytes, a string counts characters); a value that does not lie
+        // inside the block (a damaged resource) is refused rather than read past its end
+        let query = |sub: &str, unit: usize| -> Option<(*const u8, u32)> {
             let (mut p, mut n) = (std::ptr::null_mut(), 0u32);
-            (VerQueryValueW(block.as_ptr().cast(), wide(sub).as_ptr(), &mut p, &mut n) != 0 && !p.is_null() && n > 0).then_some((p as *const u8, n))
+            let found = VerQueryValueW(block.as_ptr().cast(), wide(sub).as_ptr(), &mut p, &mut n) != 0 && !p.is_null() && n > 0;
+            let (at, start, end) = (p as usize, block.as_ptr() as usize, block.as_ptr() as usize + block.len());
+            (found && at >= start && at.checked_add(n as usize * unit).is_some_and(|e| e <= end)).then_some((p as *const u8, n))
         };
         // the first language and code page the file lists, `\StringFileInfo\<lang><page>\FileDescription`
-        query("\\VarFileInfo\\Translation").and_then(|(p, n)| {
+        query("\\VarFileInfo\\Translation", 1).and_then(|(p, n)| {
             if n < 4 {
                 return None;
             }
             let (lang, page) = (u16::from_le_bytes([*p, *p.add(1)]), u16::from_le_bytes([*p.add(2), *p.add(3)]));
-            let (p, n) = query(&format!("\\StringFileInfo\\{lang:04x}{page:04x}\\FileDescription"))?;
+            let (p, n) = query(&format!("\\StringFileInfo\\{lang:04x}{page:04x}\\FileDescription"), 2)?;
             let w = std::slice::from_raw_parts(p.cast::<u16>(), n as usize);
             Some(String::from_utf16_lossy(w).trim_end_matches('\0').trim().to_string())
         })

@@ -1,13 +1,18 @@
 //! One monitor's picture, cropped to the recording area on the GPU and read back as top-down BGRA. Windows.Graphics.Capture
 //! first; where Windows refuses it ("Could not capture the given monitor": a machine whose shell is not Explorer, like
 //! WinRust's own), DXGI Desktop Duplication of the output that holds the area, with the pointer drawn in.
-use std::cell::RefCell;
+use std::{cell::{Cell, RefCell}, time::{Duration, Instant}};
 use windows::{core::{factory, Interface}, Graphics::{Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession}, DirectX::{DirectXPixelFormat, Direct3D11::IDirect3DDevice}}, Win32::{Foundation::{HMODULE, RECT}, Graphics::{Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN}, Direct3D11::*, Dxgi::{CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, Common::*}, Gdi::*}, System::WinRT::{Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess}, Graphics::Capture::IGraphicsCaptureItemInterop}, UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, ICONINFO}}};
+
+/// How long a duplication that cannot be made again (a secure desktop, a mode switch that does not end) is waited for.
+const LOST_FOR: Duration = Duration::from_secs(15);
 
 enum Source {
     Wgc { pool: Direct3D11CaptureFramePool, session: GraphicsCaptureSession },
     /// The duplication goes away when the display mode changes or a full-screen app takes the output; made again then.
-    Dup { output: IDXGIOutput1, dup: RefCell<Option<IDXGIOutputDuplication>> },
+    /// `lost`: since when the duplication could not be made again (the recording ends with an error after `LOST_FOR`: the rest of
+    /// the file would be one still picture reported as a recording).
+    Dup { output: IDXGIOutput1, dup: RefCell<Option<IDXGIOutputDuplication>>, lost: Cell<Option<Instant>> },
 }
 
 pub struct Capture {
@@ -111,7 +116,7 @@ impl Capture {
             let output: IDXGIOutput1 = output.cast().map_err(err("Output 1.1"))?;
             let dup = output.DuplicateOutput(&device).map_err(err("Duplicate output"))?;
             let (left, top) = ((rect.left - d.left) as u32, (rect.top - d.top) as u32);
-            Ok(Self { device, source: Source::Dup { output, dup: RefCell::new(Some(dup)) }, context, staging, area: area_box(left, top, width, height), origin: (rect.left, rect.top), width: width as usize, height: height as usize })
+            Ok(Self { device, source: Source::Dup { output, dup: RefCell::new(Some(dup)), lost: Cell::new(None) }, context, staging, area: area_box(left, top, width, height), origin: (rect.left, rect.top), width: width as usize, height: height as usize })
         }
     }
 
@@ -129,10 +134,19 @@ impl Capture {
                 let _ = frame.Close();
                 result
             },
-            Source::Dup { output, dup } => unsafe {
+            Source::Dup { output, dup, lost } => unsafe {
                 let mut slot = dup.borrow_mut();
                 if slot.is_none() {
                     *slot = output.DuplicateOutput(&self.device).ok(); // still switching modes: the next tick tries again
+                    if slot.is_some() {
+                        lost.set(None);
+                    } else {
+                        let since = lost.get().unwrap_or_else(Instant::now);
+                        lost.set(Some(since));
+                        if since.elapsed() > LOST_FOR {
+                            return Err("The screen can no longer be captured".into());
+                        }
+                    }
                 }
                 let Some(d) = slot.as_ref() else { return Ok(false) };
                 let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
