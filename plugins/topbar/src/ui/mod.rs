@@ -10,6 +10,7 @@ pub mod lang_popup;
 pub mod live;
 pub mod menu;
 pub mod panel;
+pub mod power_popup;
 pub mod preview;
 pub mod quick_popup;
 pub mod search_panel;

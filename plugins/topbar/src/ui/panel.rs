@@ -128,6 +128,9 @@ pub enum Along {
     Corner,
     /// The box's top left corner at these device pixels (a full-screen panel, a centred switcher).
     Abs(i32, i32),
+    /// The box is the whole screen (the mockup's `position: absolute; inset: 0` of the power dialog); the content learns the
+    /// screen's size from [`Content::fit`] and answers it in `size`.
+    Fill,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +375,12 @@ impl Cx {
         self.close = true;
     }
 
+    /// The panel has been asked to close.
+    #[must_use]
+    pub const fn close_asked(&self) -> bool {
+        self.close
+    }
+
     /// Close the panel, then run `f` (an app's own menu must not open under a panel that still holds the focus).
     pub fn close_then(&mut self, f: impl FnOnce() + 'static) {
         self.close = true;
@@ -532,6 +541,15 @@ pub trait Content {
     fn resized(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
         None
     }
+    /// The screen's size in DIPs, told before `size` to a content placed with [`Along::Fill`].
+    fn fit(&mut self, _screen: (f32, f32)) {}
+    /// A dialog: the bar stays under it instead of being raised over it, and losing the focus does not close it.
+    fn modal(&self) -> bool {
+        false
+    }
+    /// The host's timer ticked; `age` is the time since the panel opened in ms. A content that acts by itself (a countdown
+    /// that runs out) does it here.
+    fn tick(&mut self, _age: u64, _cx: &mut Cx) {}
     /// Draws the inside of the box (the glass, the tint and the rings are already there).
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>);
     /// The item under a point; its number is whatever the content chooses.
@@ -641,6 +659,7 @@ pub struct Popup {
     place: Place,
     /// The last pointer position (client device pixels), to find what is under it again when the content changes.
     ptr: Option<(i32, i32)>,
+    modal: bool,
     t0: u64,
     /// When it started closing and how far in it was.
     closing: Option<(u64, f32)>,
@@ -703,6 +722,10 @@ impl Popup {
         let s = g.scale();
         let (look, place) = (content.look(), content.place());
         let act = content.activates();
+        if place.along == Along::Fill {
+            content.fit((anchor.screen.0 as f32 / s, anchor.screen.1 as f32 / s));
+        }
+        let modal = content.modal();
         let (w, h) = content.size(g);
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
         let size = (bw as f32 / s, bh as f32 / s);
@@ -724,7 +747,8 @@ impl Popup {
         // the shadow window: the box and as far as the shadow reaches
         let sigma = look.shadow.blur / 2.0;
         let pad = ((sigma * 3.0 + look.shadow.dy.abs() + 2.0) * s).ceil() as i32;
-        let sh = (at.0 - pad, at.1 - pad, bw + 2 * pad, bh + 2 * pad);
+        // no shadow (a full-screen dialog draws its own card's): no window for it
+        let sh = if look.shadow.color.a > 0.0 { (at.0 - pad, at.1 - pad, bw + 2 * pad, bh + 2 * pad) } else { (0, 0, 0, 0) };
         // what the glass blurs: the panel window and the blur's reach beyond it
         let reach_px = (look.blur * 3.0 * s).ceil() as i32;
         let mut cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
@@ -760,6 +784,7 @@ impl Popup {
             anchor,
             place,
             ptr: None,
+            modal,
             t0: now,
             closing: None,
             hover: None,
@@ -815,6 +840,20 @@ impl Popup {
                 }
             })
             .collect()
+    }
+
+    #[must_use]
+    pub const fn is_modal(&self) -> bool {
+        self.modal
+    }
+
+    /// The host's timer ticked.
+    pub fn tick(&mut self, now: u64) -> Cx {
+        let mut cx = Cx::default();
+        if self.closing.is_none() {
+            self.content.tick(now.saturating_sub(self.t0), &mut cx);
+        }
+        cx
     }
 
     /// The box on the screen (left, top, width, height), device pixels.
@@ -1114,13 +1153,15 @@ impl Popup {
             self.shade_h = h;
             self.shade_gen += 1;
             let (sw, sh) = (self.sh.2, self.sh.3);
-            let pad = (self.at.0 - self.sh.0) as f32 / s;
-            let r = Rect::new(pad, pad, w, h);
-            let _ = g.paint(&mut self.shade, sw, sh, |c| {
-                c.shadow(r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
-                c.ring(r.inset(-1.0), look.radius + 1.0, 1.0, look.ring_out);
-                c.erase(r, look.radius);
-            });
+            if sw > 0 {
+                let pad = (self.at.0 - self.sh.0) as f32 / s;
+                let r = Rect::new(pad, pad, w, h);
+                let _ = g.paint(&mut self.shade, sw, sh, |c| {
+                    c.shadow(r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
+                    c.ring(r.inset(-1.0), look.radius + 1.0, 1.0, look.ring_out);
+                    c.erase(r, look.radius);
+                });
+            }
         }
 
         // the sheet that dims the screen: painted once, its opacity comes and goes with the panel
@@ -1205,6 +1246,9 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
     if let Along::Abs(x, y) = p.along {
         return (x, y);
     }
+    if p.along == Along::Fill {
+        return (0, 0);
+    }
     let gap = (p.gap * s).round() as i32;
     let (l, t, r, b) = a.button;
     let edge = (8.0 * s).round() as i32;
@@ -1215,6 +1259,7 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
         Along::ScreenEnd => screen - gap - len,
         Along::Corner => lo,
         Along::Abs(..) => lo,
+        Along::Fill => 0,
     };
     let middle = (a.screen.0 - w) / 2;
     match p.along {
@@ -1423,17 +1468,23 @@ pub fn open(content: Box<dyn Content>, anchor: Anchor) {
         h.shown = (0, 0, 0, 0, 0, 0);
         h.scrim_shown = 0;
         h.frame_with(t, false);
+        let shadowed = h.popup.as_ref().is_some_and(|p| p.last().shadow.2 > 0);
         // SAFETY: show our own windows without activating them; the panel takes the focus only when it wants the keyboard.
         unsafe {
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
             if dims {
                 SetWindowPos(h.scrim, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
             }
-            SetWindowPos(h.shadow, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+            if shadowed {
+                SetWindowPos(h.shadow, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+            } else {
+                ShowWindow(h.shadow, SW_HIDE);
+            }
             SetWindowPos(h.panel, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
         }
         h.stack();
-        if act {            winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
+        if act {
+            winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
         }
         h.live();
         (h.notify)();
@@ -1526,10 +1577,14 @@ impl Host {
         let f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         let live = self.thumbs.visible().then_some(self.thumbs.host());
         let dims = self.popup.as_ref().is_some_and(Popup::has_scrim);
+        // a dialog keeps the bar under it, a dimming panel under its scrim
+        let bar_low = dims || self.popup.as_ref().is_some_and(Popup::is_modal);
         // SAFETY: z-order of our own windows.
         unsafe {
-            if dims {
+            if bar_low {
                 SetWindowPos(self.bar, HWND_TOPMOST, 0, 0, 0, 0, f);
+            }
+            if dims {
                 SetWindowPos(self.scrim, HWND_TOPMOST, 0, 0, 0, 0, f);
             }
             SetWindowPos(self.shadow, HWND_TOPMOST, 0, 0, 0, 0, f);
@@ -1541,7 +1596,7 @@ impl Host {
                 SetWindowPos(l, self.panel, 0, 0, 0, 0, f);
             }
             SetWindowPos(self.shadow, live.unwrap_or(self.panel), 0, 0, 0, 0, f);
-            if !dims {
+            if !bar_low {
                 SetWindowPos(self.bar, HWND_TOPMOST, 0, 0, 0, 0, f);
             }
         }
@@ -1561,7 +1616,7 @@ impl Host {
         let (win, sh) = (shown.win, shown.shadow);
         let s = whwnd(self.shadow);
         let key = (sh.0, sh.1, sh.2, sh.3, shown.shadow_alpha, shown.shadow_gen);
-        if key != self.shown {
+        if key != self.shown && sh.2 > 0 {
             self.shown = key;
             let _ = p.surfaces().1.present(s, sh.0, sh.1, shown.shadow_alpha);
         }
@@ -1759,6 +1814,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         // began in another window deactivates the panel with the button still down: the Start menu waits for the drop.
         WM_ACTIVATE if wp & 0xffff == 0 => {
             let wait = with(|h| h.popup.as_ref().is_some_and(|p| !p.is_closing() && p.keeps_open_on_drag())).unwrap_or(false);
+            // a dialog stays: its countdown goes on and Esc works as soon as it is clicked again
+            if with(|h| h.popup.as_ref().is_some_and(Popup::is_modal)).unwrap_or(false) {
+                return 0;
+            }
             // SAFETY: reading the button state; a timer on our own window.
             if wait && unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0 {
                 unsafe { SetTimer(hwnd, 6, 150, None) };
@@ -1776,7 +1835,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
         }
         WM_USER => _ = with(|h| h.frame(now())),
-        WM_TIMER => _ = with(|h| h.frame(now())),
+        WM_TIMER => {
+            with(|h| h.frame(now()));
+            if let Some(cx) = with(|h| h.popup.as_mut().map(|p| p.tick(now()))).flatten() {
+                apply(cx);
+            }
+        }
         _ => {
             // SAFETY: the default procedure of our own window.
             return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };

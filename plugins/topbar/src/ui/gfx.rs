@@ -772,6 +772,33 @@ impl Canvas<'_> {
         }
     }
 
+    /// An arc of a circle, stroked `w` wide with round caps (SVG `stroke-linecap: round`): from `start` degrees (0 is three
+    /// o'clock, clockwise is positive) over `sweep` degrees, at most one turn. The power dialog's countdown ring and spinner.
+    pub fn arc(&mut self, (cx, cy): (f32, f32), r: f32, start: f32, sweep: f32, w: f32, c: Rgba) {
+        if c.a <= 0.0 || sweep <= 0.0 {
+            return;
+        }
+        // cubic pieces of at most a quarter turn: the control arms are 4/3 tan(a/4) of the radius long
+        let sweep = sweep.min(360.0);
+        let n = (sweep / 90.0).ceil() as usize;
+        let step = (sweep / n as f32).to_radians();
+        let arm = 4.0 / 3.0 * (step / 4.0).tan() * r;
+        let at = |a: f32| svg::Pt { x: cx + r * a.cos(), y: cy + r * a.sin() };
+        let a0 = start.to_radians();
+        let mut segs = vec![Seg::Move(at(a0))];
+        for i in 0..n {
+            let (p, q) = (a0 + step * i as f32, a0 + step * (i + 1) as f32);
+            let (from, to) = (at(p), at(q));
+            let c1 = svg::Pt { x: from.x - arm * p.sin(), y: from.y + arm * p.cos() };
+            let c2 = svg::Pt { x: to.x + arm * q.sin(), y: to.y - arm * q.cos() };
+            segs.push(Seg::Cubic(c1, c2, to));
+        }
+        let Ok(geo) = build_path(&self.g.factory, &segs) else { return };
+        let (rt, b, round) = (self.rt(), self.brush(c), self.g.round.clone());
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe { rt.DrawGeometry(&geo, &b, w, &round) };
+    }
+
     /// A 1-px separator that fades out at both ends, like the design's
     /// `linear-gradient(transparent, c 30%, c 70%, transparent)`; `vertical` runs top to bottom.
     pub fn fade_line(&mut self, r: Rect, vertical: bool, edge: f32, c: Rgba) {

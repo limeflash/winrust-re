@@ -1030,16 +1030,20 @@ fn refresh_status() {
 
 // ---------- Restart and Shut down on the bar (#173): one pill between the system group and the clock ----------
 
-/// Restart or shut down after a confirmation, so a stray click does not end the session.
+/// Restart or shut down after the dialog of the mockup (a minute's countdown; Esc or Cancel refuse), so a stray click does not
+/// end the session.
 unsafe fn power_click(key: i32) {
-    let (q, arg) = if key == POW_R {
-        (t!("Перезагрузить компьютер?", "Restart the computer?", ja: "コンピューターを再起動しますか?", pt: "Reiniciar o computador?", zh: "要重启计算机吗？"), "/r")
-    } else {
-        (t!("Выключить компьютер?", "Shut down the computer?", ja: "コンピューターをシャットダウンしますか?", pt: "Desligar o computador?", zh: "要关闭计算机吗？"), "/s")
-    };
-    if MessageBoxW(BAR.load(Relaxed) as HWND, wide(q).as_ptr(), wide("WinRust").as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES {
-        let _ = Command::new("shutdown.exe").args([arg, "/t", "0"]).creation_flags(NO_WINDOW).spawn();
-    }
+    let kind = if key == POW_R { ui::power_popup::Kind::Restart } else { ui::power_popup::Kind::Shutdown };
+    ui::panel::toggle(ui::panel::Id::Power, || {
+        let a = anchor(key)?;
+        Some((Box::new(ui::power_popup::PowerPanel::new(kind, power_run)), a))
+    });
+}
+
+/// What the dialog's action does: the same command whether the user confirmed or the countdown ran out.
+fn power_run(kind: ui::power_popup::Kind) {
+    let arg = if kind == ui::power_popup::Kind::Restart { "/r" } else { "/s" };
+    let _ = Command::new("shutdown.exe").args([arg, "/t", "0"]).creation_flags(NO_WINDOW).spawn();
 }
 
 /// The bar element under a client point of the bar window (device pixels), straight from the frame's layout table.
@@ -1114,7 +1118,7 @@ unsafe fn fullscreen_now(bar: HWND) -> bool {
     }
     let mut cls = [0u16; 64];
     let n = GetClassNameW(fg, cls.as_mut_ptr(), 64).max(0) as usize;
-    if matches!(String::from_utf16_lossy(&cls[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "RustExplorer") {
+    if matches!(String::from_utf16_lossy(&cls[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "RustExplorer" | "topbar_panel") {
         return false; // the desktop itself is full size (rs-shell's desktop is a rust-explorer window; a file manager is never "fullscreen")
     }
     let mut r: RECT = zeroed();

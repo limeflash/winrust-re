@@ -275,7 +275,7 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
 }
 
 /// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|start|search|settings[:<page>]|toast|jumplist|preview|taskview|
-/// switcher|menu [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]
+/// switcher|menu|power-restart|power-shutdown|power-busy [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]
 /// [q=<text>] [page=<n>] [pins=<n>] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
 ///
 /// `quick` and `wifi` also take the state of the mockup's fake machine: `on=<tiles, 0..8>` `vol=<n>` `muted` `bright=<n>`
@@ -532,6 +532,10 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             demo_switcher(scale, (sw, sh), n_wins, &icon)
         } else if what == "menu" {
             demo_menu(kind, side, (sh as f32 / scale) - 130.0)
+        } else if let Some(which) = what.strip_prefix("power-") {
+            let kind = if which == "shutdown" { ui::power_popup::Kind::Shutdown } else { ui::power_popup::Kind::Restart };
+            let panel = ui::power_popup::PowerPanel::new(kind, |_| {});
+            Box::new(if which == "busy" { panel.busy_since(0) } else { panel })
         } else if what == "lang" {
             let items = if real {
                 layout_rows()

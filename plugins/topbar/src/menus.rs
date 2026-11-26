@@ -100,8 +100,8 @@ unsafe fn pick(kind: &str, i: usize) {
                 "!taskview" => wins::taskview_toggle(),
                 "!lock" => quiet(Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"])),
                 "!sleep" => apps::sleep(),
-                "!restart" => quiet(Command::new("shutdown").args(["/r", "/t", "0"])),
-                "!shutdown" => quiet(Command::new("shutdown").args(["/s", "/t", "0"])),
+                "!restart" => power_click(POW_R), // asks first, like the bar's own button
+                "!shutdown" => power_click(POW_S),
                 _ => open(&wide(to)),
             }
         }
