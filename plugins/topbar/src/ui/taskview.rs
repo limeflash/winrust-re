@@ -107,38 +107,64 @@ fn fit(src: (f32, f32), cell: Rect, cap: f32) -> Rect {
     Rect::new((cell.cx() - w / 2.0).round(), (cell.cy() - h / 2.0).round(), w, h)
 }
 
-/// Pack windows in centred rows of equal-height pictures, leaving room for each row's labels.
+/// Pack windows at one scale into centred rows; bottom-align pictures so each row's labels share a baseline.
 fn task_grid(sizes: &[(f32, f32)], area: Rect) -> Vec<Rect> {
     if sizes.is_empty() { return Vec::new(); }
     let gap = 40.0;
     let label = 34.0;
-    let aspects: Vec<f32> = sizes.iter().map(|&(w, h)| w.max(1.0) / h.max(1.0)).collect();
-    let mut best = (0.0f32, 1usize);
-    for rows in 1..=sizes.len() {
-        let cols = sizes.len().div_ceil(rows);
-        let actual_rows = sizes.len().div_ceil(cols);
-        let height = ((area.h - gap * (actual_rows - 1) as f32) / actual_rows as f32 - label).min(area.h * 0.45);
-        let mut height = height;
-        for chunk in aspects.chunks(cols) {
-            let available = area.w - gap * (chunk.len() - 1) as f32;
-            height = height.min(available / chunk.iter().sum::<f32>());
+    let rows_at = |scale: f32| {
+        let mut rows: Vec<(usize, usize, f32, f32)> = Vec::new();
+        let (mut start, mut width, mut height) = (0, 0.0f32, 0.0f32);
+        for (i, &(w, h)) in sizes.iter().enumerate() {
+            let (w, h) = (w.max(1.0) * scale, h.max(1.0) * scale);
+            if i > start && width + gap + w > area.w {
+                rows.push((start, i, width, height));
+                (start, width, height) = (i, 0.0, 0.0);
+            }
+            width += if i > start { gap + w } else { w };
+            height = height.max(h);
         }
-        if height > best.0 { best = (height, cols); }
+        rows.push((start, sizes.len(), width, height));
+        rows
+    };
+    // Greedy wrapping changes at the width thresholds of contiguous runs. Examine each threshold so that a change in
+    // row composition cannot fool a binary search over the total block height.
+    let mut candidates = vec![0.5f32];
+    for start in 0..sizes.len() {
+        let mut width = 0.0;
+        for (count, &(w, _)) in sizes[start..].iter().enumerate() {
+            width += w.max(1.0);
+            let s = (area.w - gap * count as f32) / width;
+            if s > 0.0 && s < 0.5 {
+                candidates.push(s);
+                // Allow for rounding at a wrap boundary: the row just below it can be the largest feasible layout.
+                candidates.push(s * (1.0 - 1e-6));
+            }
+        }
     }
-    let (height, cols) = (best.0.max(1.0), best.1);
-    let rows = sizes.len().div_ceil(cols);
-    let total_h = rows as f32 * (height + label) + (rows - 1) as f32 * gap;
-    let y0 = area.y + (area.h - total_h) / 2.0;
+    let mut best = 0.0f32;
+    for upper in candidates {
+        let rows = rows_at(upper);
+        let overhead = rows.len() as f32 * label + (rows.len() - 1) as f32 * gap;
+        let heights: f32 = rows.iter().map(|r| r.3 / upper).sum();
+        let s = upper.min(((area.h - overhead) / heights).max(0.0));
+        if s <= best { continue; }
+        let actual = rows_at(s);
+        let total = actual.iter().map(|r| r.3 + label).sum::<f32>() + (actual.len() - 1) as f32 * gap;
+        if total <= area.h + 0.01 && actual.iter().all(|r| r.2 <= area.w + 0.01) { best = s; }
+    }
+    let rows = rows_at(best);
+    let total_h = rows.iter().map(|r| r.3 + label).sum::<f32>() + (rows.len() - 1) as f32 * gap;
+    let mut y = area.y + (area.h - total_h) / 2.0;
     let mut out = Vec::with_capacity(sizes.len());
-    for (row, chunk) in aspects.chunks(cols).enumerate() {
-        let width = chunk.iter().sum::<f32>() * height + (chunk.len() - 1) as f32 * gap;
+    for (start, end, width, height) in rows {
         let mut x = area.x + (area.w - width) / 2.0;
-        let y = y0 + row as f32 * (height + label + gap);
-        for aspect in chunk {
-            let w = aspect * height;
-            out.push(Rect::new(x, y, w, height));
+        for &(w, h) in &sizes[start..end] {
+            let (w, h) = (w.max(1.0) * best, h.max(1.0) * best);
+            out.push(Rect::new(x, y + height - h, w, h));
             x += w + gap;
         }
+        y += height + label + gap;
     }
     out
 }
@@ -583,15 +609,39 @@ mod fit_tests {
     use super::*;
 
     #[test]
-    fn task_rows_have_equal_heights_gaps_and_a_shared_label_baseline() {
-        let area = Rect::new(80.0, 190.0, 3200.0, 1100.0);
+    fn task_rows_share_a_scale_gaps_and_a_label_baseline() {
+        let area = Rect::new(80.0, 190.0, 2400.0, 1100.0);
         let cards = task_grid(&[(850.0, 560.0), (760.0, 300.0), (640.0, 420.0)], area);
         assert_eq!(cards.len(), 3);
-        assert!((cards[0].h - cards[1].h).abs() < 0.01);
-        assert!((cards[0].y - cards[2].y).abs() < 0.01);
+        assert!((cards[0].w / 850.0 - 0.5).abs() < 0.001);
+        assert!((cards[1].w / 760.0 - cards[0].w / 850.0).abs() < 0.001);
+        assert!((cards[2].h / 420.0 - cards[0].h / 560.0).abs() < 0.001);
+        assert!((cards[0].y + cards[0].h - cards[2].y - cards[2].h).abs() < 0.01);
         assert!((cards[1].x - cards[0].x - cards[0].w - 40.0).abs() < 0.01);
         assert!((cards[2].x - cards[1].x - cards[1].w - 40.0).abs() < 0.01);
         assert!(((cards[0].x + cards[2].x + cards[2].w) / 2.0 - area.cx()).abs() < 0.01);
+    }
+
+    #[test]
+    fn task_rows_wrap_and_shrink_to_fit() {
+        let area = Rect::new(0.0, 0.0, 400.0, 260.0);
+        let sizes = [(600.0, 300.0), (800.0, 500.0), (700.0, 400.0)];
+        let cards = task_grid(&sizes, area);
+        let scale = cards[0].w / sizes[0].0;
+        assert!(scale > 0.0 && scale < 0.5);
+        for (card, size) in cards.iter().zip(sizes) {
+            assert!((card.w / size.0 - scale).abs() < 0.001);
+            assert!(card.x >= area.x - 0.01 && card.x + card.w <= area.x + area.w + 0.01);
+            assert!(card.y >= area.y - 0.01 && card.y + card.h + 34.0 <= area.y + area.h + 0.01);
+        }
+    }
+
+    #[test]
+    fn task_grid_considers_the_layout_just_below_a_wrap() {
+        let sizes = [(480.0, 772.0), (211.0, 1036.0), (1716.0, 328.0), (925.0, 1130.0), (1574.0, 914.0), (218.0, 632.0), (1250.0, 906.0), (1573.0, 1239.0)];
+        let cards = task_grid(&sizes, Rect::new(0.0, 0.0, 1603.0, 463.0));
+        assert!(cards[0].w / sizes[0].0 > 0.16);
+        assert!((cards[0].y + cards[0].h - cards[7].y - cards[7].h).abs() < 0.01);
     }
 
     #[test]

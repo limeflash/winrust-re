@@ -51,12 +51,24 @@ unsafe fn card_icon(w: HWND) -> HICON {
 
 unsafe fn win_cards(wins: &[HWND]) -> Vec<WinCard> {
     wins.iter()
-        .map(|&w| WinCard {
-            hwnd: w as isize,
-            title: window_title(w),
-            icon: Rc::new(OwnedIcon(wicon(card_icon(w)))),
-            frame: ui::live::frame_of(w as isize),
-            minimized: IsIconic(w) != 0 || !ui::live::drawable(BAR.load(Relaxed) as HWND, w),
+        .map(|&w| {
+            let iconic = IsIconic(w) != 0;
+            let mut frame = ui::live::frame_of(w as isize);
+            if iconic {
+                let mut placement: WINDOWPLACEMENT = zeroed();
+                placement.length = size_of::<WINDOWPLACEMENT>() as u32;
+                if GetWindowPlacement(w, &mut placement) != 0 {
+                    let r = placement.rcNormalPosition;
+                    if r.right > r.left && r.bottom > r.top { frame = (r.left, r.top, r.right, r.bottom); }
+                }
+            }
+            WinCard {
+                hwnd: w as isize,
+                title: window_title(w),
+                icon: Rc::new(OwnedIcon(wicon(card_icon(w)))),
+                frame,
+                minimized: iconic || !ui::live::drawable(BAR.load(Relaxed) as HWND, w),
+            }
         })
         .collect()
 }
