@@ -10,6 +10,8 @@ static BRIGHT: AtomicI32 = AtomicI32::new(-1); // -1 = no controllable display (
 
 struct NetInfo {
     ssid: String,
+    /// The SSID's bytes as the adapter reported them (not always UTF-8: `ssid` is what is shown, this is what a profile needs).
+    raw: Vec<u8>,
     q: i32,
     secure: bool,
     profile: Option<String>,
@@ -152,12 +154,13 @@ unsafe fn read_one(h: HANDLE, g: &windows_sys::core::GUID) -> (Vec<NetInfo>, Opt
         let l = &*list;
         for i in 0..l.dwNumberOfItems as usize {
             let n = &*l.Network.as_ptr().add(i);
-            let ssid = String::from_utf8_lossy(&n.dot11Ssid.ucSSID[..n.dot11Ssid.uSSIDLength as usize]).to_string();
+            let raw = n.dot11Ssid.ucSSID[..(n.dot11Ssid.uSSIDLength as usize).min(32)].to_vec();
+            let ssid = String::from_utf8_lossy(&raw).to_string();
             if ssid.is_empty() {
                 continue;
             }
             let pn = String::from_utf16_lossy(&n.strProfileName[..n.strProfileName.iter().position(|&c| c == 0).unwrap_or(0)]);
-            let net = NetInfo { ssid, q: n.wlanSignalQuality as i32, secure: n.bSecurityEnabled != 0, profile: (n.dwFlags & 2 != 0 && !pn.is_empty()).then_some(pn), connected: n.dwFlags & 1 != 0, auth: n.dot11DefaultAuthAlgorithm as i32, g: *g };
+            let net = NetInfo { ssid, raw, q: n.wlanSignalQuality as i32, secure: n.bSecurityEnabled != 0, profile: (n.dwFlags & 2 != 0 && !pn.is_empty()).then_some(pn), connected: n.dwFlags & 1 != 0, auth: n.dot11DefaultAuthAlgorithm as i32, g: *g };
             match out.iter_mut().find(|o| o.ssid == net.ssid) {
                 Some(o) if o.q < net.q => *o = net,
                 Some(_) => {}
@@ -183,7 +186,7 @@ unsafe fn read_one(h: HANDLE, g: &windows_sys::core::GUID) -> (Vec<NetInfo>, Opt
                 out[i].connected = true;
                 out.swap(0, i);
             }
-            None => out.insert(0, NetInfo { ssid: c.ssid.clone(), q: c.q, secure: c.auth != 1, profile: Some(c.ssid.clone()), connected: true, auth: c.auth, g: *g }),
+            None => out.insert(0, NetInfo { ssid: c.ssid.clone(), raw: c.ssid.as_bytes().to_vec(), q: c.q, secure: c.auth != 1, profile: Some(c.ssid.clone()), connected: true, auth: c.auth, g: *g }),
         }
     }
     (out, conn)
@@ -246,6 +249,10 @@ unsafe fn wifi_connect(profile: &str, g: &windows_sys::core::GUID) {
     });
 }
 
+fn ssid_hex(raw: &[u8]) -> String {
+    raw.iter().map(|b| format!("{b:02X}")).collect()
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -264,7 +271,8 @@ unsafe fn wifi_join(n: &NetInfo, pass: &str) {
         format!("<authEncryption><authentication>{auth}</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption><sharedKey><keyType>passphrase</keyType><protected>false</protected><keyMaterial>{}</keyMaterial></sharedKey>", esc(&key))
     };
     let name = esc(&n.ssid);
-    let xml = format!("<?xml version=\"1.0\"?><WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\"><name>{name}</name><SSIDConfig><SSID><name>{name}</name></SSID></SSIDConfig><connectionType>ESS</connectionType><connectionMode>auto</connectionMode><MSM><security>{sec}</security></MSM></WLANProfile>");
+    let hex = ssid_hex(&n.raw); // the SSID by its bytes: a name that is not UTF-8 would not match its network as text
+    let xml = format!("<?xml version=\"1.0\"?><WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\"><name>{name}</name><SSIDConfig><SSID><hex>{hex}</hex><name>{name}</name></SSID></SSIDConfig><connectionType>ESS</connectionType><connectionMode>auto</connectionMode><MSM><security>{sec}</security></MSM></WLANProfile>");
     let x = wide(&xml);
     let mut reason = 0u32;
     let ok = with_iface(&n.g, |h, g| WlanSetProfile(h, g, 0, x.as_ptr(), null(), 1, null_mut(), &mut reason) == 0).unwrap_or(false);
@@ -609,4 +617,13 @@ pub(crate) unsafe fn cal_toggle() {
         let room = if a.side == Side::Bottom { bar_top - 12.0 - 12.0 } else { sh - 24.0 };
         Some((Box::new(ui::cal_popup::CalPanel::new(ui::cal_popup::system_now, a.side, room)), a))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_profile_names_the_ssid_by_its_bytes() {
+        assert_eq!(super::ssid_hex(b"Home"), "486F6D65");
+        assert_eq!(super::ssid_hex(&[0xC4, 0xE3, 0xBA, 0xC3]), "C4E3BAC3"); // a GBK name: not UTF-8, lossy text would not match it
+    }
 }

@@ -16,10 +16,11 @@ pub fn toggle() {
         let mut v: Vec<isize> = vec![];
         EnumWindows(Some(collect), &mut v as *mut _ as LPARAM);
         if !v.is_empty() {
-            v.iter().for_each(|&h| { ShowWindow(h as HWND, SW_MINIMIZE); });
+            // ShowWindowAsync: ShowWindow on another process's window waits for its message loop, and one hung app would freeze the caller
+            v.iter().for_each(|&h| { ShowWindowAsync(h as HWND, SW_MINIMIZE); });
             *hid = v;
         } else {
-            hid.iter().for_each(|&h| { if IsWindow(h as HWND) != 0 { ShowWindow(h as HWND, SW_RESTORE); } });
+            hid.iter().for_each(|&h| { if IsWindow(h as HWND) != 0 { ShowWindowAsync(h as HWND, SW_RESTORE); } });
             hid.clear();
         }
     }

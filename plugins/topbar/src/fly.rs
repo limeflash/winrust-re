@@ -122,18 +122,37 @@ pub fn menu(cx: i32, head: Option<(HICON, &'static str, String, String)>, items:
 
 /// (top, bottom) of each menu item in logical px, and the panel height.
 fn menu_rows() -> (Vec<(i32, i32)>, i32) {
-    let mut y = if MHEAD.with_borrow(|h| h.is_some()) { MHEAD_H + 9 } else { 6 };
-    let rows = MITEMS.with_borrow(|m| {
-        m.iter()
-            .map(|it| {
-                if it.sep {
-                    y += 9;
-                }
-                y += MROW;
-                (y - MROW, y)
-            })
-            .collect()
-    });
+    // SAFETY: plain system metrics.
+    let room = unsafe { menu_room() };
+    let seps: Vec<bool> = MITEMS.with_borrow(|m| m.iter().map(|it| it.sep).collect());
+    menu_rows_in(&seps, MHEAD.with_borrow(|h| h.is_some()), room)
+}
+
+/// The height, in logical px, the menu may take: from the screen's edge (beside a side bar) or from the bar to 8 below the top.
+unsafe fn menu_room() -> i32 {
+    let dev = if vert() { GetSystemMetrics(SM_CYSCREEN) - 2 * sc(8) } else { bar_top() - dp(12.0) - sc(8) };
+    (dev as f32 / SCALE.get()) as i32
+}
+
+const MIN_ROW: i32 = 24;
+
+/// The rows of a menu whose items have a separator above them where `seps` says so. A menu taller than `room` (a long list: the
+/// clipboard's history on a short screen) first squeezes its rows, down to `MIN_ROW`, then leaves off the last ones: it never
+/// outgrows the screen. (ponytail: no scrolling; a list that long wants it.)
+fn menu_rows_in(seps: &[bool], head: bool, room: i32) -> (Vec<(i32, i32)>, i32) {
+    let top = if head { MHEAD_H + 9 } else { 6 };
+    let n = seps.len() as i32;
+    let fixed = top + 9 * seps.iter().filter(|s| **s).count() as i32 + 6;
+    let row = if n == 0 || fixed + n * MROW <= room { MROW } else { ((room - fixed) / n).clamp(MIN_ROW, MROW) };
+    let (mut y, mut rows) = (top, Vec::new());
+    for &sep in seps {
+        let extra = if sep { 9 } else { 0 };
+        if !rows.is_empty() && y + extra + row + 6 > room {
+            break;
+        }
+        y += extra + row;
+        rows.push((y - row, y));
+    }
     (rows, y + 6)
 }
 
@@ -212,7 +231,7 @@ pub fn toggle(k: Kind) {
             Kind::Menu => MENU_X.get().min(sw - w - sc(8)).max(sc(8)),
         } };
         let class = wide("topbar_fly");
-        let fy = if vert() && k == Kind::Menu { (MENU_X.get() - h / 2).clamp(sc(8), GetSystemMetrics(SM_CYSCREEN) - h - sc(8)) } else { pop_y(h) }; // above the bar (below it at the top of the screen)
+        let fy = if vert() && k == Kind::Menu { (MENU_X.get() - h / 2).min(GetSystemMetrics(SM_CYSCREEN) - h - sc(8)).max(sc(8)) } else { pop_y(h) }; // above the bar (below it at the top of the screen)
         let hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, class.as_ptr(), null(), WS_POPUP, x, fy + sc(14), w, h, null_mut(), null_mut(), GetModuleHandleW(null()), null());
         SetLayeredWindowAttributes(hw, 0, 0, LWA_ALPHA); // starts invisible, anim_step fades it in
         FIN.set((x, fy));
@@ -410,5 +429,16 @@ mod tests {
             assert!(is_open(Kind::Menu) && IsWindow(FH.get()) != 0, "the press opens a real window");
             close_now();
         }
+    }
+
+    #[test]
+    fn a_long_menu_never_outgrows_its_room() {
+        let (rows, h) = super::menu_rows_in(&[false; 5], false, 700);
+        assert_eq!((rows.len(), rows[1], h), (5, (44, 82), 6 + 5 * 38 + 6)); // fits: the natural rows
+        let (rows, h) = super::menu_rows_in(&[false; 25], true, 700);
+        assert!(rows.len() == 25 && h <= 700 && rows[0].1 - rows[0].0 < 38, "squeezed to fit: {h}");
+        let (rows, h) = super::menu_rows_in(&[true; 100], false, 500);
+        assert!(!rows.is_empty() && rows.len() < 100 && h <= 500, "the last ones left off: {} rows, {h}", rows.len());
+        assert!(super::menu_rows_in(&[false; 3], false, 10).0.len() == 1, "always at least one row");
     }
 }

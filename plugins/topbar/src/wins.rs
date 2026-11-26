@@ -199,9 +199,7 @@ unsafe fn taskview_content(calm: bool, skip: isize) -> Option<(Box<dyn panel::Co
         current.clear();
         for &w in v.iter().rev().filter(|&&w| IsIconic(w) == 0) {
             let (l, t, r, b) = ui::live::frame_of(w as isize);
-            let norm = |v: i32, span: i32| (v as f32 / span.max(1) as f32).clamp(0.0, 1.0);
-            let (x0, y0, x1, y1) = (norm(l, a.screen.0), norm(t, a.screen.1), norm(r, a.screen.0), norm(b, a.screen.1));
-            if x1 > x0 && y1 > y0 { current.push((w as isize, (x0, y0, x1 - x0, y1 - y0))); }
+            if let Some(m) = vdesk::on_screen((l, t, r, b), a.screen.0.max(1) as f32, a.screen.1.max(1) as f32) { current.push((w as isize, m)); }
         }
     }
     let can_add = EXPLORER_UP.load(Relaxed) && desks.len() < 8;

@@ -44,7 +44,7 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
         let pos = t.iter().position(|x| x.hwnd == h && x.uid == uid && x.guid == guid);
         match (op, pos) {
             (2, Some(i)) => {
-                DestroyIcon(t.remove(i).icon);
+                destroy_icon(t.remove(i).icon);
             }
             (4, Some(i)) => t[i].ver = u(808),
             (0 | 1, _) => {
@@ -69,7 +69,7 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                     let ic = CopyIcon(u(28) as i32 as isize as HICON);
                     if !ic.is_null() {
                         if !x.icon.is_null() {
-                            DestroyIcon(x.icon);
+                            destroy_icon(x.icon);
                         }
                         x.icon = ic;
                     }

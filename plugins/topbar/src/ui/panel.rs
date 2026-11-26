@@ -28,7 +28,7 @@ use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_SHIFT,
+    GetAsyncKeyState, GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -704,6 +704,9 @@ pub struct Popup {
     mo: Motion,
     /// What was on the screen under the window, until the first frame bakes it: pixels and their screen rectangle.
     cap: Option<Capture>,
+    /// The same pixels after the bake, kept for as long as the panel is open: a lost device takes the baked glass with it, and
+    /// it is baked again from these.
+    cap_kept: Option<Capture>,
     glass: Option<(Picture, i32, i32)>,
     surf: Surface,
     shade: Surface,
@@ -827,6 +830,7 @@ impl Popup {
             press: None,
             mo: Motion::default(),
             cap,
+            cap_kept: None,
             glass: None,
             surf: Surface::composed(),
             shade: Surface::composed(),
@@ -956,9 +960,12 @@ impl Popup {
         std::mem::replace(&mut self.hover, h) != h
     }
 
-    /// The pointer left the window.
-    pub fn leave(&mut self) -> bool {
-        self.press = None;
+    /// The pointer left the window; with the pointer captured (a slider held and dragged out) the button is still down and
+    /// the item keeps it, until the button goes up.
+    pub fn leave(&mut self, captured: bool) -> bool {
+        if !captured {
+            self.press = None;
+        }
         self.ptr = None;
         self.hover.take().is_some()
     }
@@ -1251,10 +1258,15 @@ impl Popup {
             tc.saturating_sub(self.t0) >= u64::from(self.entry.dur.max(self.content.settle())));
         let paint = !fade_only || !self.fade_cached;
         self.fade_cached = fade_only;
-        let Self { content, mo, cap, glass, surf, .. } = self;
+        let Self { content, mo, cap, cap_kept, glass, surf, .. } = self;
         if paint { let _ = g.paint(surf, win.2, win.3, |c| {
             if let Some((px, (cx, cy, cw, ch))) = cap.take() {
                 *glass = c.glass(&px, cw, ch, look.blur, look.saturate).map(|p| (p, cx, cy));
+                *cap_kept = Some((px, (cx, cy, cw, ch)));
+            } else if let Some((px, (cx, cy, cw, ch))) = cap_kept.as_ref()
+                && glass.as_ref().is_some_and(|(p, ..)| c.picture_stale(p))
+            {
+                *glass = c.glass(px, *cw, *ch, look.blur, look.saturate).map(|p| (p, *cx, *cy));
             }
             let mut f = Frame { now, age, leaving, hover, press, size: (w, h), opacity: pose.opacity, mo };
             let clip = pose.clip.map_or(Rect::new(mx, my, w, h), |i| Rect::new(mx + i.left, my + i.top, w - i.left - i.right, h - i.top - i.bottom));
@@ -1783,7 +1795,11 @@ impl Host {
     }
 
     fn hide(&mut self) {
+        let tipped = self.popup.as_ref().is_some_and(|p| p.hovered().is_some()); // its tooltip must not outlive it (Esc while one shows)
         let had = self.popup.take().is_some(); // its surfaces go off the windows' visuals with it
+        if tipped {
+            super::tip::hide();
+        }
         self.timer(false);
         self.pulse(0);
         self.thumbs.clear();
@@ -1846,7 +1862,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             hovered(|p| p.pointer(x, y));
         }
-        WM_MOUSELEAVE => hovered(Popup::leave),
+        // SAFETY: a plain query.
+        WM_MOUSELEAVE => hovered(|p| p.leave(unsafe { GetCapture() } == hwnd)),
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             let (x, y) = xy(lp);
             let b = match msg {
@@ -1887,7 +1904,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
         }
         WM_CHAR => {
-            let cx = char::from_u32(wp as u32).and_then(|ch| with(|h| h.popup.as_mut().map(|p| p.text(ch))).flatten());
+            let cx = wm_char(wp).and_then(|ch| with(|h| h.popup.as_mut().map(|p| p.text(ch))).flatten());
             if let Some(cx) = cx {
                 with(|h| h.frame(now()));
                 apply(cx);
@@ -1975,6 +1992,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 }
 
 /// Runs a pointer change on the open panel and, if it changed what is hovered, repaints and moves the tooltip.
+/// The character of a WM_CHAR message: the system sends a character beyond the BMP (an emoji) as two messages, the high
+/// surrogate first; it is held until the low one comes. None for the first half and for a stray half.
+pub(crate) fn wm_char(unit: usize) -> Option<char> {
+    thread_local! { static HIGH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    let u = unit as u32 & 0xFFFF;
+    match u {
+        0xD800..=0xDBFF => {
+            HIGH.set(u);
+            None
+        }
+        0xDC00..=0xDFFF => match HIGH.replace(0) {
+            0 => None,
+            hi => char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (u - 0xDC00)),
+        },
+        _ => {
+            HIGH.set(0);
+            char::from_u32(u)
+        }
+    }
+}
+
 fn hovered(f: impl FnOnce(&mut Popup) -> bool) {
     with(|h| {
         if h.popup.as_mut().is_some_and(f) {
@@ -1997,6 +2035,16 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wm_char_joins_surrogate_pairs() {
+        assert_eq!(wm_char(0x41), Some('A'));
+        assert_eq!(wm_char(0xD83D), None); // the high half of U+1F600 waits for the low one
+        assert_eq!(wm_char(0xDE00), Some('\u{1F600}'));
+        assert_eq!(wm_char(0xDE00), None); // a stray low half is dropped
+        assert_eq!(wm_char(0xD83D), None);
+        assert_eq!(wm_char(0x42), Some('B')); // a high half the low one never followed is dropped
+    }
     use crate::ui::tray_popup::{Cell, TrayPanel};
     use windows::Win32::UI::WindowsAndMessaging::HICON;
 

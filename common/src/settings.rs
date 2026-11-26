@@ -179,25 +179,35 @@ pub fn explorer_lent() -> bool {
     true
 }
 
+/// (runs in progress in this process, the marker handle of the Explorer that was started for them, 0: none). Launches that
+/// overlap share the one Explorer, and the last one to finish ends it: one that ended it under another's open page would kill
+/// that page. (Another process's launches are not counted: the named marker only tells them Explorer is lent.)
+static STATE: std::sync::Mutex<(u32, usize)> = std::sync::Mutex::new((0, 0));
+
 fn run(uri: &str) {
-    kill_stale();
-    let mut started = false;
-    let mut lent = std::ptr::null_mut();
-    if !explorer_shell() {
-        lent = unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, w(LENT).as_ptr()) };
-        // our desktop is a window of class Progman too: with it up Explorer thinks a shell exists and starts as a plain folder host
-        proc::pids("rust-explorer.exe").into_iter().filter(|&p| has_desktop(p)).for_each(proc::kill);
-        // a frame host left from an earlier Explorer stays tied to that dead shell: the Settings frame it hosts is cloaked for
-        // good. Without a shell its windows are not on screen anyway; COM starts a fresh one for the new Explorer.
-        proc::pids("ApplicationFrameHost.exe").into_iter().for_each(proc::kill);
-        mark_autostart_done();
-        let _ = proc::start_shell_explorer();
-        wait(200, explorer_shell);
-        // the shell window appears before the immersive shell services behind it are up
-        wait(150, explorer_tray);
-        sleep(Duration::from_secs(1));
-        started = true;
-    }
+    let started = {
+        // under the lock, so a launch that comes while another one is starting Explorer waits for it, and sees it
+        let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if st.0 == 0 {
+            kill_stale(); // not while another launch's page may still be on its splash
+        }
+        st.0 += 1;
+        if st.1 == 0 && !explorer_shell() {
+            st.1 = unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, w(LENT).as_ptr()) } as usize;
+            // our desktop is a window of class Progman too: with it up Explorer thinks a shell exists and starts as a plain folder host
+            proc::pids("rust-explorer.exe").into_iter().filter(|&p| has_desktop(p)).for_each(proc::kill);
+            // a frame host left from an earlier Explorer stays tied to that dead shell: the Settings frame it hosts is cloaked for
+            // good. Without a shell its windows are not on screen anyway; COM starts a fresh one for the new Explorer.
+            proc::pids("ApplicationFrameHost.exe").into_iter().for_each(proc::kill);
+            mark_autostart_done();
+            let _ = proc::start_shell_explorer();
+            wait(200, explorer_shell);
+            // the shell window appears before the immersive shell services behind it are up
+            wait(150, explorer_tray);
+            sleep(Duration::from_secs(1));
+        }
+        st.1 != 0 // the Explorer of this process's launches (this one's or an earlier one's): it ends with the last
+    };
     // through explorer.exe: the page opens with the user's normal token even when this process is elevated
     for _ in 0..2 {
         let _ = Command::new(r"C:\Windows\explorer.exe").arg(uri).status();
@@ -230,15 +240,18 @@ fn run(uri: &str) {
             shown |= on_screen;
             bad = if !enrolling && (any_hung() || (shown && !on_screen)) { bad + 1 } else { 0 };
         }
+    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.0 -= 1;
+    if st.0 == 0 && st.1 != 0 {
         kill_stale();
         proc::kill_shell_explorers();
         let rx = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default()).join(r"rust-explorer\rust-explorer.exe");
         if rx.is_file() && !proc::pids("rust-explorer.exe").into_iter().any(has_desktop) {
             let _ = Command::new(rx).arg("--desktop").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         }
-    }
-    if !lent.is_null() {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(lent) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(st.1 as _) };
+        st.1 = 0;
     }
 }
 
