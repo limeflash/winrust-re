@@ -125,6 +125,10 @@ pub struct View {
     pub lang: String,
     pub time: String,
     pub date: String,
+    /// Unread notifications to count on the clock (0: no badge: none, or Do not disturb, or the centre is open).
+    pub unread: usize,
+    /// Do not disturb is on: the clock wears a little moon.
+    pub dnd: bool,
 }
 
 /// The pointer and the panels that are open.
@@ -238,7 +242,7 @@ fn group_len(g: &[Cell], gap: f32) -> f32 {
 }
 
 /// The three groups of the bar (settings, centre, right), as flex boxes along its length.
-fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>) -> [Vec<Cell>; 3] {
+fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>, clock_extra: f32) -> [Vec<Cell>; 3] {
     let (vert, dock) = (sh.vert, sh.dock);
     let bw = sh.thick - 8.0; // a vertical bar's buttons are the bar less 4 px each side
     let app_w = if dock { 52.0 } else { 42.0 };
@@ -290,9 +294,9 @@ fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>) -> [Vec<Cell
     right.push(b(Kind::Power, POW_S, 0, 38.0, 40.0, 36.0));
     right.push(rsep());
     let (clock_w, clock_h) = if dock {
-        (g.measure(&v.time, FONT_TIME_DOCK) + 20.0, 44.0)
+        (g.measure(&v.time, FONT_TIME_DOCK) + 20.0 + clock_extra, 44.0)
     } else {
-        (g.measure(&v.time, FONT_TIME).max(g.measure(&v.date, FONT_DATE)) + 20.0, 44.0)
+        (g.measure(&v.time, FONT_TIME).max(g.measure(&v.date, FONT_DATE)) + 20.0 + clock_extra, 44.0)
     };
     right.push(b(Kind::Clock, CLOCK, 0, clock_w, clock_h, 16.0 + 2.0 * 16.0));
     [left, mid, right]
@@ -301,12 +305,12 @@ fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>) -> [Vec<Cell
 /// Lays the bar out for `thick` (the animated thickness) on a screen of `v.screen` DIPs; `bar_len` is the length of the bar
 /// along its edge (`None`: as long as its content, the dock).
 #[must_use]
-pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32>) -> Layout {
+pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32>, clock_extra: f32) -> Layout {
     let sh = Shape { thick, ..*sh };
     let (vert, dock) = (sh.vert, sh.dock);
     let (gap_mid, gap_right) = (if vert { 2.0 } else { 4.0 }, if dock { 0.0 } else { 2.0 });
     let gap_left = if vert { 2.0 } else { 0.0 };
-    let mut gs = groups(g, v, &sh, None);
+    let mut gs = groups(g, v, &sh, None, clock_extra);
     let (mut l1, mut l2, mut l3) = (group_len(&gs[0], gap_left), group_len(&gs[1], gap_mid), group_len(&gs[2], gap_right));
     // too long for the bar: the app buttons give way (ponytail: no scrolling when even the shrunk buttons do not fit)
     let pad = if dock { 8.0 } else { 10.0 };
@@ -316,7 +320,7 @@ pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32
         if n > 0 && l2 > room {
             let cur = gs[1][4].main;
             let shrink = ((l2 - room) / n as f32).ceil();
-            gs = groups(g, v, &sh, Some((cur - shrink).max(20.0)));
+            gs = groups(g, v, &sh, Some((cur - shrink).max(20.0)), clock_extra);
             (l1, l2, l3) = (group_len(&gs[0], gap_left), group_len(&gs[1], gap_mid), group_len(&gs[2], gap_right));
         }
     }
@@ -442,6 +446,11 @@ const DROP: u8 = 5;
 const TURN: u8 = 6;
 const SQ: u8 = 7;
 const LANG_IN: u8 = 8;
+/// The room the clock makes for its badge (`padding .25s`), and how far the badge's `badgeIn` has run.
+const EXTRA: u8 = 9;
+const BADGE: u8 = 10;
+/// What the badge takes: 18 wide and 6 of air (the padding goes from 10 to 34).
+const BADGE_ROOM: f32 = 24.0;
 // bar-level properties
 const APPEAR: u8 = 0;
 const HIDE: u8 = 1;
@@ -600,6 +609,11 @@ impl Bar {
         m.go(BAR_KEY, EDGE, edge, now, 300, EASE);
         m.go(BAR_KEY, RING, ring, now, 300, EASE);
         m.go(BAR_KEY, SHADOW, shadow, now, 300, EASE);
+        // the clock widens for its badge (a vertical bar has no room to widen: its badge sits in the corner)
+        let badge = v.unread > 0 && !v.dnd;
+        m.go(CLOCK, EXTRA, if (badge || v.dnd) && !sh.vert { BADGE_ROOM } else { 0.0 }, now, 250, SPRING);
+        if badge { m.go(CLOCK, BADGE, 1.0, now, 400, anim::LINEAR) } else { m.snap(CLOCK, BADGE, 0.0) }
+        let clock_extra = m.val(CLOCK, EXTRA, now);
         let appear = if sh.dock && sh.vert { 1.0 } else { m.val(BAR_KEY, APPEAR, now) }; // a vertical dock has no entry
         let hide = m.val(BAR_KEY, HIDE, now);
         let (thick, inset, radius) = (m.val(BAR_KEY, THICK, now), m.val(BAR_KEY, INSET, now), m.val(BAR_KEY, RADIUS, now));
@@ -615,7 +629,7 @@ impl Bar {
         let along = if sh.vert { shh } else { sw };
         let bar_len = (!sh.dock).then(|| (along - 2 * inset_t) as f32 / s);
         let thick_dip = thick_px as f32 / s;
-        let mut lay = layout(&mut self.gfx, v, &sh, thick_dip, bar_len);
+        let mut lay = layout(&mut self.gfx, v, &sh, thick_dip, bar_len, clock_extra);
         let len_px = px(if sh.dock { lay.bar.w.max(lay.bar.h) } else { (along - 2 * inset_t) as f32 / s });
         // slide: the entry (14 px up from below), the hide (its own length and 14 px more)
         let rise = px((1.0 - appear) * 14.0);
@@ -891,7 +905,7 @@ fn button(c: &mut Canvas<'_>, it: &Item, lay: &Layout, v: &View, live: &Live, m:
         Kind::Qs => qs(c, &lay.qs, v, ink),
         Kind::Restart => c.icon(icons::RESTART, (cx, cy), 18.0, 1.9, ink, 0.0),
         Kind::Power => c.icon(icons::POWER, (cx, cy), 18.0, 1.9, ink, 0.0),
-        Kind::Clock => clock(c, r, v, pal, dock, vert),
+        Kind::Clock => clock(c, r, v, pal, dock, vert, (m, now)),
         Kind::App | Kind::ShowDesk => {}
     }
 }
@@ -943,7 +957,8 @@ fn qs(c: &mut Canvas<'_>, centres: &[(i32, f32, f32)], v: &View, ink: Rgba) {
     }
 }
 
-fn clock(c: &mut Canvas<'_>, r: Rect, v: &View, pal: &Palette, dock: bool, vert: bool) {
+fn clock(c: &mut Canvas<'_>, r: Rect, v: &View, pal: &Palette, dock: bool, vert: bool, (m, now): (&Motion, u64)) {
+    let extra = m.val(CLOCK, EXTRA, now);
     if vert {
         // two stacked numbers, hours over minutes
         let digits: Vec<&str> = v.time.split(|ch: char| !ch.is_ascii_digit()).filter(|s| !s.is_empty()).collect();
@@ -951,16 +966,38 @@ fn clock(c: &mut Canvas<'_>, r: Rect, v: &View, pal: &Palette, dock: bool, vert:
         let top = r.cy() - 16.0;
         c.text(hh, Rect::new(r.x, top, r.w, 16.0), FONT_STACK, pal.text, Align::Center);
         c.text(mm, Rect::new(r.x, top + 16.0, r.w, 16.0), FONT_STACK, pal.dim, Align::Center);
+        badge(c, Rect::new(r.x + r.w - 3.0 - 16.0, r.y + 3.0, 16.0, 16.0), v, pal, m.val(CLOCK, BADGE, now));
         return;
     }
-    let inner = Rect::new(r.x + 10.0, r.y, r.w - 20.0, r.h);
+    let inner = Rect::new(r.x + 10.0, r.y, r.w - 20.0 - extra, r.h);
     if dock {
         c.text(&v.time, inner, FONT_TIME_DOCK, pal.text, Align::End); // the date is hidden in the dock
-        return;
+    } else {
+        let top = r.cy() - 15.5;
+        c.text(&v.time, Rect::new(inner.x, top, inner.w, 15.6), FONT_TIME, pal.text, Align::End);
+        c.text(&v.date, Rect::new(inner.x, top + 16.6, inner.w, 14.4), FONT_DATE, pal.dim, Align::End);
     }
-    let top = r.cy() - 15.5;
-    c.text(&v.time, Rect::new(inner.x, top, inner.w, 15.6), FONT_TIME, pal.text, Align::End);
-    c.text(&v.date, Rect::new(inner.x, top + 16.6, inner.w, 14.4), FONT_DATE, pal.dim, Align::End);
+    badge(c, Rect::new(r.x + r.w - 8.0 - 18.0, r.y + 13.0, 18.0, 18.0), v, pal, m.val(CLOCK, BADGE, now));
+}
+
+/// The count of unread notifications (`.ncbadge`: the accent, 11 px bold, `badgeIn` pops it in), or the moon of Do not disturb.
+/// `at` is the 18 px square at the clock's right edge; `t` how far `badgeIn` has run, 0..1.
+fn badge(c: &mut Canvas<'_>, at: Rect, v: &View, pal: &Palette, t: f32) {
+    if v.dnd {
+        c.fill(at, at.w / 2.0, Rgba::white(0.1));
+        c.glyph(icons::MOON, (at.cx(), at.cy()), 9.0 * at.w / 18.0, Rgba::css(201, 205, 216, 1.0));
+    } else if v.unread > 0 {
+        let label = if v.unread > 9 { "9+".to_string() } else { v.unread.to_string() };
+        let font = Font::new(11.0 * at.w / 18.0, 700);
+        let w = (c.measure(&label, font).ceil() + 10.0).max(at.w);
+        // `badgeIn`: 0 -> 1.25 over the first 60 %, back to 1 over the rest, each leg with the spring curve
+        let k = if t < 0.6 { SPRING.ease(t / 0.6) * 1.25 } else { 1.25 - 0.25 * SPRING.ease((t - 0.6) / 0.4) };
+        let r = Rect::new(at.x + at.w - w, at.y, w, at.h);
+        c.transformed(r.cx(), r.cy(), k, 0.0, 0.0, |c| {
+            c.fill(r, r.h / 2.0, pal.accent);
+            c.text(&label, r, font, Rgba::css(11, 18, 32, 1.0), Align::Center);
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1050,6 +1087,8 @@ mod tests {
             lang: "RUS".into(),
             time: "03:57".into(),
             date: "11/26/2026".into(),
+            unread: 0,
+            dnd: false,
         }
     }
 
@@ -1061,7 +1100,7 @@ mod tests {
         let mut g = Gfx::new(1.0).expect("direct2d");
         let v = view(8);
         let sh = shape(v.style, v.side, v.size);
-        let lay = layout(&mut g, &v, &sh, sh.thick, Some(1440.0));
+        let lay = layout(&mut g, &v, &sh, sh.thick, Some(1440.0), 0.0);
         let cx = |k: i32| lay.rect_of(k).map(|r| r.cx()).unwrap();
         assert!((cx(0) - 573.5).abs() < 0.6, "start {}", cx(0));
         for (i, want) in [636.5, 682.5, 728.5, 774.5, 820.5, 866.5, 912.5, 958.5].into_iter().enumerate() {
@@ -1072,6 +1111,23 @@ mod tests {
         assert_eq!(lay.hit(cx(3) + 23.0, 27.0), NONE); // the 4 px gap between two buttons
         let clock = lay.rect_of(CLOCK).unwrap();
         assert!((clock.x + clock.w - 1430.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn the_clock_makes_room_for_its_badge_and_the_rest_of_the_bar_gives_way() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).expect("direct2d");
+        let v = view(8);
+        let sh = shape(v.style, v.side, v.size);
+        let plain = layout(&mut g, &v, &sh, sh.thick, Some(1440.0), 0.0);
+        let wide = layout(&mut g, &v, &sh, sh.thick, Some(1440.0), BADGE_ROOM);
+        let (a, b) = (plain.rect_of(CLOCK).unwrap(), wide.rect_of(CLOCK).unwrap());
+        assert!((b.w - a.w - 24.0).abs() < 1e-3, "padding 10 -> 34 on the right");
+        assert!((a.x + a.w - (b.x + b.w)).abs() < 1e-3, "the clock stays at the bar's end");
+        let (qs_a, qs_b) = (plain.rect_of(SYS_GRP).unwrap(), wide.rect_of(SYS_GRP).unwrap());
+        assert!((qs_a.x - qs_b.x - 24.0).abs() < 1e-3, "the group before it moves left by the same");
     }
 
     fn live(now: u64) -> Live {

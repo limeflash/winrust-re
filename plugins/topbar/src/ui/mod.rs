@@ -9,6 +9,8 @@ pub mod jump;
 pub mod lang_popup;
 pub mod live;
 pub mod menu;
+pub mod notice;
+pub mod notice_pop;
 pub mod panel;
 pub mod power_popup;
 pub mod preview;

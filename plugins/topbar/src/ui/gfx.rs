@@ -1425,3 +1425,75 @@ impl Canvas<'_> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// wrapped text and a picture that sticks to one edge (the notification cards)
+
+impl Gfx {
+    /// Lays out `s` wrapped to `w` DIPs, `line` DIPs per line, at most `max` lines high (what does not fit ends in an ellipsis);
+    /// `max = 0` is no limit.
+    fn wrapped(&mut self, s: &str, f: Font, w: f32, line: f32, max: usize) -> Option<windows::Win32::Graphics::DirectWrite::IDWriteTextLayout> {
+        use windows::Win32::Graphics::DirectWrite::{
+            DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            DWRITE_WORD_WRAPPING_WRAP,
+        };
+        let fmt = self.format(f)?;
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        let h = if max == 0 { 1e4 } else { line * max as f32 };
+        // SAFETY: plain DirectWrite layout creation and settings on a layout of ours.
+        unsafe {
+            let lay = self.dwrite.CreateTextLayout(&wide, &fmt, w.max(1.0), h).ok()?;
+            let _ = lay.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            let _ = lay.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            // `line-height` of the design: the glyphs sit a little below the middle of their line box
+            let _ = lay.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.78);
+            if max > 0 {
+                let sign = self.dwrite.CreateEllipsisTrimmingSign(&fmt).ok();
+                let t = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, ..Default::default() };
+                let _ = lay.SetTrimming(&t, sign.as_ref());
+            }
+            Some(lay)
+        }
+    }
+
+    /// How many lines `s` takes wrapped to `w` DIPs (at least one).
+    pub fn lines(&mut self, s: &str, f: Font, w: f32) -> usize {
+        let Some(lay) = self.wrapped(s, f, w, f.size * 1.45, 0) else { return 1 };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        // SAFETY: `lay` is live; `m` is a local out-param.
+        unsafe { lay.GetMetrics(&mut m).map_or(1, |()| m.lineCount.max(1) as usize) }
+    }
+}
+
+impl Canvas<'_> {
+    /// How many lines `s` takes wrapped to `w` DIPs (at least one).
+    pub fn lines(&mut self, s: &str, f: Font, w: f32) -> usize {
+        self.g.lines(s, f, w)
+    }
+
+    /// Text wrapped inside `r` from its top, `line` DIPs per line (CSS `line-height`), at most `max` lines; what does not fit
+    /// ends in an ellipsis (`-webkit-line-clamp`).
+    pub fn text_wrapped(&mut self, s: &str, r: Rect, f: Font, c: Rgba, line: f32, max: usize) {
+        if c.a <= 0.0 {
+            return;
+        }
+        let Some(lay) = self.g.wrapped(s, f, r.w, line, max) else { return };
+        let (rt, b) = (self.rt(), self.brush(c));
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe { rt.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &lay, &b, windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_CLIP) };
+    }
+
+    /// Like [`Canvas::picture_cover`], with the picture's own place in the box: `v` is the CSS `object-position` y (0 top, 1 bottom).
+    pub fn picture_cover_at(&mut self, p: &Picture, r: Rect, radius: f32, opacity: f32, v: f32) {
+        use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BRUSH_PROPERTIES};
+        let rt = self.rt();
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+        let brush = D2D1_BRUSH_PROPERTIES { opacity, transform: Matrix3x2::translation(r.cx() - p.w / 2.0, r.y - (p.h - r.h) * v) };
+        // SAFETY: the brush is made and used inside BeginDraw/EndDraw, on the target the picture was made on.
+        unsafe {
+            if let Ok(b) = rt.CreateBitmapBrush(&p.bmp, Some(&props), Some(&brush)) {
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius }, &b);
+            }
+        }
+    }
+}

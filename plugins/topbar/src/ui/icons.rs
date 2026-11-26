@@ -39,3 +39,6 @@ pub const BATTERY: &str = "M4 7.5h12a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2
 pub const START_SQUARES: [(f32, f32); 4] = [(3.5, 3.5), (13.0, 3.5), (3.5, 13.0), (13.0, 13.0)];
 pub const START_SQUARE: f32 = 7.5;
 pub const START_RADIUS: f32 = 1.8;
+
+/// Do not disturb: the moon in the bell's place on the clock and in the centre, filled or stroked.
+pub const MOON: &str = "M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z";
