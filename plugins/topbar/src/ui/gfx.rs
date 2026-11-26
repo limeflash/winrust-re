@@ -1688,10 +1688,49 @@ impl Canvas<'_> {
         }
         let sigma = blur / 2.0; // CSS: the blur radius is twice the Gaussian's standard deviation
         let pad = (sigma * 3.0).ceil();
+        // A box big enough has the same shadow at any size: four corners as they are, edges and middle stretched. So one small
+        // shadow per look, cut in nine, serves every size an animation passes through: no new bitmap and no new blur each
+        // frame (those piled up in the device's memory while a panel's height moved).
+        let k = pad + radius + pad; // a corner: the blur outside the edge, the rounding, the blur inside
+        let dst = Rect::new(r.x - pad, r.y - pad + dy, r.w + 2.0 * pad, r.h + 2.0 * pad);
+        if dst.w >= 2.0 * k + 2.0 && dst.h >= 2.0 * k + 2.0 {
+            let t = 2.0 * (radius + pad) + 2.0; // the small box: its middle two DIPs are edge only
+            let key = [t.to_bits(), t.to_bits(), radius.to_bits(), sigma.to_bits(), c.a.to_bits(), (c.r + c.g * 2.0 + c.b * 4.0).to_bits()];
+            let bmp = match self.dev().shadows.get(&key).cloned() {
+                Some((b, _)) => b,
+                None => {
+                    let Some(b) = self.shadow_bitmap(t, t, radius, sigma, pad, c) else { return };
+                    let dev = self.dev();
+                    if dev.shadows.len() > 8 {
+                        dev.shadows.clear();
+                    }
+                    dev.shadows.insert(key, (b.clone(), pad));
+                    b
+                }
+            };
+            let s = self.g.scale;
+            let snap = |v: f32| (v * s).round() / s; // the pieces meet on whole pixels: no seam
+            let side = 2.0 * k + 2.0;
+            let src = [0.0, k, k + 2.0, side];
+            let xs = [snap(dst.x), snap(dst.x + k), snap(dst.x + dst.w - k), snap(dst.x + dst.w)];
+            let ys = [snap(dst.y), snap(dst.y + k), snap(dst.y + dst.h - k), snap(dst.y + dst.h)];
+            let ctx = self.dev().cur.clone();
+            for j in 0..3 {
+                for i in 0..3 {
+                    let to = D2D_RECT_F { left: xs[i], top: ys[j], right: xs[i + 1], bottom: ys[j + 1] };
+                    let from = D2D_RECT_F { left: src[i], top: src[j], right: src[i + 1], bottom: src[j + 1] };
+                    if to.right > to.left && to.bottom > to.top {
+                        // SAFETY: drawing inside BeginDraw/EndDraw.
+                        unsafe { ctx.DrawBitmap(&bmp, Some(&to), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, Some(&from), None) };
+                    }
+                }
+            }
+            return;
+        }
         let key = [r.w.to_bits(), r.h.to_bits(), radius.to_bits(), sigma.to_bits(), c.a.to_bits(), (c.r + c.g * 2.0 + c.b * 4.0).to_bits()];
         let cached = self.dev().shadows.get(&key).cloned();
-        let (bmp, pad) = match cached {
-            Some(v) => v,
+        let bmp = match cached {
+            Some((b, _)) => b,
             None => {
                 let Some(b) = self.shadow_bitmap(r.w, r.h, radius, sigma, pad, c) else { return };
                 let dev = self.dev();
@@ -1699,11 +1738,10 @@ impl Canvas<'_> {
                     dev.shadows.clear(); // sizes animate; keep only recent ones
                 }
                 dev.shadows.insert(key, (b.clone(), pad));
-                (b, pad)
+                b
             }
         };
         let ctx = self.dev().cur.clone();
-        let dst = Rect::new(r.x - pad, r.y - pad + dy, r.w + 2.0 * pad, r.h + 2.0 * pad);
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
             ctx.DrawBitmap(&bmp, Some(&dst.d2d()), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);

@@ -94,6 +94,8 @@ pub(crate) unsafe fn bench() {
     for name in ["bar", "settings", "start", "quick", "search", "taskview", "power-restart"] {
         render_panel(&["unused.png".into(), name.into(), "width=2560".into(), "height=1440".into(), "bench".into()]);
     }
+    // Quick settings' sound list opening (the height of the panel moves with it)
+    render_panel(&["unused.png".into(), "quick".into(), "click=23".into(), "width=2560".into(), "height=1440".into(), "bench".into()]);
     std::fs::remove_dir_all(scratch).expect("remove benchmark scratch directory");
 }
 
@@ -763,11 +765,17 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         popup.set_hover(hover);
         if benchmarking {
             let mut bench = Bench::new();
+            // `click=<id>`: the panel at rest, then the frames of what that click sets moving (Quick settings' sound list)
+            let t0 = click.map_or(0, |id| {
+                let _ = popup.frame(&mut gfx, 2000);
+                let _ = popup.click_id(id);
+                2000
+            });
             for i in 0..120 {
                 windows_sys::Win32::Graphics::Dwm::DwmFlush();
                 ui::gfx::bench_start();
                 let start = std::time::Instant::now();
-                let shown = popup.frame(&mut gfx, i * 4);
+                let shown = popup.frame(&mut gfx, t0 + i * 4);
                 let elapsed = start.elapsed();
                 let end = ui::gfx::bench_end();
                 let start = std::time::Instant::now();
@@ -779,8 +787,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 let present = start.elapsed();
                 bench.record(elapsed, end, present, ui::gfx::gpu_wait());
             }
-            bench.report(&what);
-            let (mut t, mut busy) = (120 * 4, true);
+            bench.report(&if click.is_some() { format!("{what}+click") } else { what.to_string() });
+            let (mut t, mut busy) = (t0 + 120 * 4, true);
             while busy && t < 120 * 4 + 6000 {
                 busy = popup.frame(&mut gfx, t).busy;
                 t += 16;

@@ -782,23 +782,20 @@ impl Popup {
         let reach = |r: Rect| (-r.x).max(-r.y).max(r.x + r.w - size.0).max(r.y + r.h - size.1).max(0.0);
         let m_px = ((reach(b0).max(reach(b1)).max(content.reach()) + 2.0) * s).ceil() as i32;
         let m = m_px as f32 / s;
-        let win = (at.0 - m_px, at.1 - m_px, bw + 2 * m_px, bh + 2 * m_px);
-        // the shadow window: the box and as far as the shadow reaches
-        let sigma = look.shadow.blur / 2.0;
-        let pad = ((sigma * 3.0 + look.shadow.dy.abs() + 2.0) * s).ceil() as i32;
-        // no shadow (a full-screen dialog draws its own card's): no window for it
-        let sh = if look.shadow.color.a > 0.0 { (at.0 - pad, at.1 - pad, bw + 2 * pad, bh + 2 * pad) } else { (0, 0, 0, 0) };
+        // A panel whose size moves (pages, a list that opens) gets its window for the largest box at once: while the size moves
+        // only the box moves inside the window, so no frame reallocates the surfaces or moves the windows (which made those
+        // animations uneven: a window moves at once, its new picture a frame later).
+        let room = content.max_size(g).map_or((at.0, at.1, bw, bh), |(mw, mh)| {
+            let big = place_box(&anchor, (((mw * s).round() as i32).max(bw), ((mh * s).round() as i32).max(bh)), place, s);
+            let (x0, y0) = (big.0.min(at.0), big.1.min(at.1));
+            let (x1, y1) = ((big.0 + ((mw * s).round() as i32).max(bw)).max(at.0 + bw), (big.1 + ((mh * s).round() as i32).max(bh)).max(at.1 + bh));
+            (x0, y0, x1 - x0, y1 - y0)
+        });
+        let win = (room.0 - m_px, room.1 - m_px, room.2 + 2 * m_px, room.3 + 2 * m_px);
+        let sh = shadow_room(&look, room, s);
         // what the glass blurs: the panel window and the blur's reach beyond it
         let reach_px = (look.blur * 3.0 * s).ceil() as i32;
-        let mut cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
-        if let Some((mw, mh)) = content.max_size(g) {
-            // a panel with pages grows later: the glass under its largest box is grabbed now
-            let (mw, mh) = (((mw * s).round() as i32).max(bw), ((mh * s).round() as i32).max(bh));
-            let big = place_box(&anchor, (mw, mh), place, s);
-            let (x0, y0) = (cr.0.min(big.0 - m_px - reach_px), cr.1.min(big.1 - m_px - reach_px));
-            let (x1, y1) = ((cr.0 + cr.2).max(big.0 + mw + m_px + reach_px), (cr.1 + cr.3).max(big.1 + mh + m_px + reach_px));
-            cr = (x0, y0, x1 - x0, y1 - y0);
-        }
+        let cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
         let mut cap = backdrop(cr, anchor.screen, grab).map(|px| (px, cr));
         // the scrim lies over the screen under the box: what the glass blurs is the dimmed screen, as in a browser
         if let (Some(sc), Some((px, _))) = (look.scrim, cap.as_mut()) {
@@ -934,7 +931,14 @@ impl Popup {
     }
 
     fn local(&self, x: i32, y: i32) -> (f32, f32) {
-        (x as f32 / self.scale - self.m, y as f32 / self.scale - self.m)
+        let (ix, iy) = self.inset();
+        (x as f32 / self.scale - ix, y as f32 / self.scale - iy)
+    }
+
+    /// Where the box's top left corner is in the window, DIPs: the margin the motion needs, plus how far the box stands from the
+    /// window's room when its size has moved.
+    fn inset(&self) -> (f32, f32) {
+        ((self.at.0 - self.win.0) as f32 / self.scale, (self.at.1 - self.win.1) as f32 / self.scale)
     }
 
     /// The pointer moved to a client point of the panel window; true if the hovered item changed.
@@ -1149,14 +1153,18 @@ impl Popup {
         self.reposition(bw, bh);
     }
 
-    /// Places a box of `bw`x`bh` device pixels against the bar again (the size or the bar changed).
+    /// Places a box of `bw`x`bh` device pixels against the bar again (the size or the bar changed). The windows stay as they are
+    /// while the box fits in them; a box that outgrows them (or a bar that moved) gets windows of its own size.
     fn reposition(&mut self, bw: i32, bh: i32) {
         let s = self.scale;
         self.at = place_box(&self.anchor, (bw, bh), self.place, s);
         let m_px = (self.m * s).round() as i32;
-        self.win = (self.at.0 - m_px, self.at.1 - m_px, bw + 2 * m_px, bh + 2 * m_px);
-        let pad = ((self.look.shadow.blur / 2.0 * 3.0 + self.look.shadow.dy.abs() + 2.0) * s).ceil() as i32;
-        self.sh = (self.at.0 - pad, self.at.1 - pad, bw + 2 * pad, bh + 2 * pad);
+        let room = (self.win.0 + m_px, self.win.1 + m_px, self.win.2 - 2 * m_px, self.win.3 - 2 * m_px);
+        let fits = self.at.0 >= room.0 && self.at.1 >= room.1 && self.at.0 + bw <= room.0 + room.2 && self.at.1 + bh <= room.1 + room.3;
+        if !fits {
+            self.win = (self.at.0 - m_px, self.at.1 - m_px, bw + 2 * m_px, bh + 2 * m_px);
+            self.sh = shadow_room(&self.look, (self.at.0, self.at.1, bw, bh), s);
+        }
         self.shade_h = -1.0; // the shadow is painted anew on the next frame
         if let Some((x, y)) = self.ptr {
             let (lx, ly) = self.local(x, y);
@@ -1188,7 +1196,7 @@ impl Popup {
         let (pose, open) = self.pose(now);
         let (w, full_h) = self.size;
         let h = self.content.extent().map_or(full_h, |e| e.min(full_h));
-        let m = self.m;
+        let (mx, my) = self.inset();
         let s = self.scale;
         let (o_in, o_out) = (self.origin(self.entry.origin), self.origin(self.exit.origin));
         let (ox, oy) = if self.closing.is_some() { o_out } else { o_in };
@@ -1205,8 +1213,8 @@ impl Popup {
             self.shade_gen += 1;
             let (sw, sh) = (self.sh.2, self.sh.3);
             if sw > 0 {
-                let pad = (self.at.0 - self.sh.0) as f32 / s;
-                let rs = if cards.is_empty() { vec![Rect::new(pad, pad, w, h)] } else { cards.iter().map(|k| k.shift(pad, pad)).collect() };
+                let (px, py) = ((self.at.0 - self.sh.0) as f32 / s, (self.at.1 - self.sh.1) as f32 / s);
+                let rs = if cards.is_empty() { vec![Rect::new(px, py, w, h)] } else { cards.iter().map(|k| k.shift(px, py)).collect() };
                 let _ = g.paint(&mut self.shade, sw, sh, |c| {
                     for r in &rs {
                         c.shadow(*r, look.radius, look.shadow.dy, look.shadow.blur, look.shadow.color);
@@ -1249,16 +1257,16 @@ impl Popup {
                 *glass = c.glass(&px, cw, ch, look.blur, look.saturate).map(|p| (p, cx, cy));
             }
             let mut f = Frame { now, age, leaving, hover, press, size: (w, h), opacity: pose.opacity, mo };
-            let clip = pose.clip.map_or(Rect::new(m, m, w, h), |i| Rect::new(m + i.left, m + i.top, w - i.left - i.right, h - i.top - i.bottom));
+            let clip = pose.clip.map_or(Rect::new(mx, my, w, h), |i| Rect::new(mx + i.left, my + i.top, w - i.left - i.right, h - i.top - i.bottom));
             let radius = pose.clip.map_or(look.radius, |i| i.radius);
-            let xf = Xf { cx: m + ox, cy: m + oy, k: pose.k, dx: pose.dx, dy: pose.dy };
+            let xf = Xf { cx: mx + ox, cy: my + oy, k: pose.k, dx: pose.dx, dy: pose.dy };
             c.faded(1.0, |c| {
                 if cards.is_empty() {
                 c.masked(clip, radius, xf, |c| {
                     if let Some((p, gx, gy)) = glass.as_ref() {
                         c.picture(p, (*gx - win.0) as f32 / s, (*gy - win.1) as f32 / s);
                     }
-                    c.transformed(0.0, 0.0, 1.0, m, m, |c| {
+                    c.transformed(0.0, 0.0, 1.0, mx, my, |c| {
                         c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| {
                             let tint = if glass.is_some() { look.tint } else { look.tint.alpha(look.tint.a.max(0.97)) };
                             c.fill(Rect::new(0.0, 0.0, w, h), look.radius, tint);
@@ -1271,11 +1279,11 @@ impl Popup {
                 } else {
                     // several cards: each is glass of its own, the content draws inside them
                     for k in &cards {
-                        c.masked(Rect::new(m + k.x, m + k.y, k.w, k.h), look.radius, xf, |c| {
+                        c.masked(Rect::new(mx + k.x, my + k.y, k.w, k.h), look.radius, xf, |c| {
                             if let Some((p, gx, gy)) = glass.as_ref() {
                                 c.picture(p, (*gx - win.0) as f32 / s, (*gy - win.1) as f32 / s);
                             }
-                            c.transformed(0.0, 0.0, 1.0, m, m, |c| {
+                            c.transformed(0.0, 0.0, 1.0, mx, my, |c| {
                                 c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| {
                                     let tint = if glass.is_some() { look.tint } else { look.tint.alpha(look.tint.a.max(0.97)) };
                                     c.fill(*k, look.radius, tint);
@@ -1284,18 +1292,19 @@ impl Popup {
                             });
                         });
                     }
-                    c.transformed(0.0, 0.0, 1.0, m, m, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.draw(c, &mut f)));
+                    c.transformed(0.0, 0.0, 1.0, mx, my, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.draw(c, &mut f)));
                 }
-                c.transformed(0.0, 0.0, 1.0, m, m, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.overlay(c, &mut f)));
+                c.transformed(0.0, 0.0, 1.0, mx, my, |c| c.transformed(ox, oy, pose.k, pose.dx, pose.dy, |c| content.overlay(c, &mut f)));
             });
         }); }
 
         self.posed = Some((pose, (ox, oy)));
         let shadow_k = if pose.clip.is_some() { open } else { pose.opacity };
         // standing still: the box (rounded), not the room around it that the motion needed; the window has no per-pixel hit test
-        let shape = (self.closing.is_none() && at_rest(&pose) && self.content.reach() <= 0.0).then(|| {
+        // (not while the content changes its size: a region set now would cut the frame that is still on its way to the screen)
+        let shape = (self.closing.is_none() && at_rest(&pose) && self.content.reach() <= 0.0 && !self.content.animating(now)).then(|| {
             let px = |d: f32| (d * s).round() as i32;
-            Rgn { x: px(m), y: px(m), w: px(w), h: px(h), r: px(look.radius) }
+            Rgn { x: px(mx), y: px(my), w: px(w), h: px(h), r: px(look.radius) }
         });
         let shown = Shown {
             win: self.win,
@@ -1318,6 +1327,16 @@ impl Popup {
 fn at_rest(p: &Pose) -> bool {
     let clip = p.clip.is_none_or(|c| c.top.abs() + c.right.abs() + c.bottom.abs() + c.left.abs() < 0.01);
     (p.opacity - 1.0).abs() < 1e-3 && p.dx.abs() < 0.01 && p.dy.abs() < 0.01 && (p.k - 1.0).abs() < 1e-3 && clip
+}
+
+/// The shadow window for a box (or the room a box moves in), device pixels: as far as the shadow reaches; none for a look
+/// without a shadow (a full-screen dialog draws its own card's).
+fn shadow_room(look: &Look, (x, y, w, h): (i32, i32, i32, i32), s: f32) -> (i32, i32, i32, i32) {
+    if look.shadow.color.a <= 0.0 {
+        return (0, 0, 0, 0);
+    }
+    let pad = ((look.shadow.blur / 2.0 * 3.0 + look.shadow.dy.abs() + 2.0) * s).ceil() as i32;
+    (x - pad, y - pad, w + 2 * pad, h + 2 * pad)
 }
 
 /// The corner of the box nearest to its button, in the box's own coordinates (what `transform-origin: 100% 100%` means for a
