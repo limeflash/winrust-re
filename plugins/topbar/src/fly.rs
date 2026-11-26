@@ -113,7 +113,6 @@ thread_local! {
     static OVER: Cell<Option<Act>> = const { Cell::new(None) };
     static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider
     static MENU_X: Cell<i32> = const { Cell::new(0) };
-    static MENU_CX: Cell<i32> = const { Cell::new(0) }; // where the open menu was asked to stand (screen px along the bar)
     static CONFIRM: Cell<i32> = const { Cell::new(-1) };
     static FIN: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // where the open flyout rests
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started opening
@@ -315,11 +314,6 @@ pub fn start_pin(path: &str) -> bool {
 
 pub fn is_open(k: Kind) -> bool {
     FLY.get() == Some(k)
-}
-
-/// Where the open menu stands along the bar (the bar lights the button it belongs to), `None` when no menu is open.
-pub fn menu_at() -> Option<i32> {
-    is_open(Kind::Menu).then(|| MENU_CX.get())
 }
 
 pub fn any_open() -> bool {
@@ -744,8 +738,7 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             v
         }
         Kind::Menu => {
-            let heads: Vec<bool> = MITEMS.with_borrow(|m| m.iter().map(|it| it.head).collect());
-            menu_rows().0.into_iter().enumerate().filter(|(i, _)| !heads[*i]).map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect()
+            menu_rows().0.into_iter().enumerate().map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect()
         }
         Kind::Start => {
             let f = filtered();
@@ -782,20 +775,11 @@ pub struct MItem {
     pub on: bool,
     pub danger: bool,
     pub sep: bool,
-    pub head: bool,  // a section caption: small dim text, not clickable
-    pub swatch: u32, // a colour dot before the label (COLORREF), u32::MAX = none
 }
 
 impl MItem {
-    pub fn head(label: impl Into<String>) -> Self {
-        MItem { head: true, ..MItem::new(label) }
-    }
-    pub fn swatch(mut self, c: u32) -> Self {
-        self.swatch = c;
-        self
-    }
     pub fn new(label: impl Into<String>) -> Self {
-        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false, head: false, swatch: u32::MAX }
+        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false }
     }
     pub fn hint(mut self, h: &'static str) -> Self {
         self.hint = h;
@@ -834,7 +818,6 @@ pub fn menu(cx: i32, head: Option<(HICON, &'static str, String, String)>, items:
     MITEMS.set(items);
     MHEAD.set(head);
     MPICK.set(Some(Box::new(pick)));
-    MENU_CX.set(cx);
     MENU_X.set(if vert() { cx } else { cx - sc(MW) / 2 }); // along a side bar it holds the anchor y
     toggle(Kind::Menu);
 }
@@ -848,9 +831,8 @@ fn menu_rows() -> (Vec<(i32, i32)>, i32) {
                 if it.sep {
                     y += 9;
                 }
-                let h = if it.head { 28 } else { MROW };
-                y += h;
-                (y - h, y)
+                y += MROW;
+                (y - MROW, y)
             })
             .collect()
     });
@@ -1676,16 +1658,6 @@ unsafe fn paint(hw: HWND, k: Kind) {
             });
             let rs = rects(k);
             MITEMS.with_borrow(|items| {
-                // section captions have no rect of their own (not clickable): drawn straight from the row layout
-                SelectObject(dc, f_small);
-                for (it, (t, b)) in items.iter().zip(menu_rows().0) {
-                    if it.head {
-                        if it.sep {
-                            fill(dc, r(12, t - 5, w - 12, t - 4), pal().line, 0);
-                        }
-                        text(dc, &it.label, r(20, t + 8, w - 14, b), pal().dim, DT_LEFT);
-                    }
-                }
                 for (rc, a) in rs.iter() {
                     let Act::Menu(i) = *a else { continue };
                     let it = &items[i as usize];
@@ -1699,12 +1671,6 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     if !it.icon.is_null() {
                         DrawIconEx(dc, lx, (rc.top + rc.bottom) / 2 - sc(8), it.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
                         lx += sc(26);
-                    }
-                    if it.swatch != u32::MAX {
-                        let (cy, d) = ((rc.top + rc.bottom) / 2, sc(9));
-                        fill(dc, RECT { left: lx, top: cy - d, right: lx + 2 * d, bottom: cy + d }, pal().line, 2 * d); // ring: the dot shows on any background
-                        fill(dc, RECT { left: lx + 1, top: cy - d + 1, right: lx + 2 * d - 1, bottom: cy + d - 1 }, it.swatch, 2 * d);
-                        lx += sc(28);
                     }
                     let mut rx = rc.right - sc(14);
                     if it.on {

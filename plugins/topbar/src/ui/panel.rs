@@ -102,6 +102,9 @@ pub enum Along {
     End,
     /// Left (or top) edges together.
     Start,
+    /// The far corner of the screen: `gap` in from the left of a bottom bar, `gap` above the bottom of the screen beside a side
+    /// bar (the bar settings panel, which keeps to the corner whichever page it shows).
+    Corner,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -422,6 +425,14 @@ pub trait Content {
     }
     /// The box in DIPs; asked once, before the panel is shown.
     fn size(&mut self, g: &mut Gfx) -> (f32, f32);
+    /// The largest box the panel will ever take (a panel with pages): the screen under all of it is grabbed for the glass.
+    fn max_size(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
+        None
+    }
+    /// Asked before every frame: the new box when the content has changed size (the panel keeps to its button's side).
+    fn resized(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
+        None
+    }
     /// Draws the inside of the box (the glass, the tint and the rings are already there).
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>);
     /// The item under a point; its number is whatever the content chooses.
@@ -480,6 +491,10 @@ pub struct Popup {
     sh: (i32, i32, i32, i32),
     button: (i32, i32, i32, i32),
     side: Side,
+    anchor: Anchor,
+    place: Place,
+    /// The last pointer position (client device pixels), to find what is under it again when the content changes.
+    ptr: Option<(i32, i32)>,
     t0: u64,
     /// When it started closing and how far in it was.
     closing: Option<(u64, f32)>,
@@ -555,7 +570,15 @@ impl Popup {
         let sh = (at.0 - pad, at.1 - pad, bw + 2 * pad, bh + 2 * pad);
         // what the glass blurs: the panel window and the blur's reach beyond it
         let reach_px = (look.blur * 3.0 * s).ceil() as i32;
-        let cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
+        let mut cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
+        if let Some((mw, mh)) = content.max_size(g) {
+            // a panel with pages grows later: the glass under its largest box is grabbed now
+            let (mw, mh) = (((mw * s).round() as i32).max(bw), ((mh * s).round() as i32).max(bh));
+            let big = place_box(&anchor, (mw, mh), place, s);
+            let (x0, y0) = (cr.0.min(big.0 - m_px - reach_px), cr.1.min(big.1 - m_px - reach_px));
+            let (x1, y1) = ((cr.0 + cr.2).max(big.0 + mw + m_px + reach_px), (cr.1 + cr.3).max(big.1 + mh + m_px + reach_px));
+            cr = (x0, y0, x1 - x0, y1 - y0);
+        }
         let cap = backdrop(cr, anchor.screen, grab).map(|px| (px, cr));
         g.forget_icons();
         Self {
@@ -572,6 +595,9 @@ impl Popup {
             sh,
             button: anchor.button,
             side: anchor.side,
+            anchor,
+            place,
+            ptr: None,
             t0: now,
             closing: None,
             hover: None,
@@ -626,6 +652,7 @@ impl Popup {
         if self.closing.is_some() {
             return false;
         }
+        self.ptr = Some((x, y));
         let (lx, ly) = self.local(x, y);
         let h = self.content.hit(lx, ly);
         std::mem::replace(&mut self.hover, h) != h
@@ -634,6 +661,7 @@ impl Popup {
     /// The pointer left the window.
     pub fn leave(&mut self) -> bool {
         self.press = None;
+        self.ptr = None;
         self.hover.take().is_some()
     }
 
@@ -653,6 +681,7 @@ impl Popup {
         if self.closing.is_some() {
             return cx;
         }
+        self.ptr = Some((x, y));
         let (lx, ly) = self.local(x, y);
         self.hover = self.content.hit(lx, ly);
         if let Some(id) = self.hover {
@@ -705,6 +734,7 @@ impl Popup {
             return false;
         }
         let p = self.entry_progress(now);
+        self.exit = self.content.exit(); // a panel with pages leaves from the size it has now
         self.closing = Some((now, p));
         self.hover = None;
         self.press = None;
@@ -762,6 +792,42 @@ impl Popup {
         }
     }
 
+    /// The content took another box: the panel keeps to its side of the bar, the window and its shadow follow.
+    fn resize(&mut self, (w, h): (f32, f32)) {
+        let s = self.scale;
+        let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
+        let size = (bw as f32 / s, bh as f32 / s);
+        if size == self.size {
+            return;
+        }
+        self.size = size;
+        self.reposition(bw, bh);
+    }
+
+    /// Places a box of `bw`x`bh` device pixels against the bar again (the size or the bar changed).
+    fn reposition(&mut self, bw: i32, bh: i32) {
+        let s = self.scale;
+        self.at = place_box(&self.anchor, (bw, bh), self.place, s);
+        let m_px = (self.m * s).round() as i32;
+        self.win = (self.at.0 - m_px, self.at.1 - m_px, bw + 2 * m_px, bh + 2 * m_px);
+        let pad = ((self.look.shadow.blur / 2.0 * 3.0 + self.look.shadow.dy.abs() + 2.0) * s).ceil() as i32;
+        self.sh = (self.at.0 - pad, self.at.1 - pad, bw + 2 * pad, bh + 2 * pad);
+        self.shade_done = false;
+        if let Some((x, y)) = self.ptr {
+            let (lx, ly) = self.local(x, y);
+            self.hover = self.content.hit(lx, ly);
+        }
+    }
+
+    /// The bar moved (the user changed its side or size): the panel follows it.
+    pub fn set_anchor(&mut self, a: Anchor) {
+        self.anchor = a;
+        self.button = a.button;
+        self.side = a.side;
+        let (bw, bh) = ((self.size.0 * self.scale).round() as i32, (self.size.1 * self.scale).round() as i32);
+        self.reposition(bw, bh);
+    }
+
     fn finished(&self, now: u64) -> bool {
         let Some((tc, _)) = self.closing else { return false };
         let (dur, delay) = anim::timing(style::anim(), self.exit.dur, 0);
@@ -771,6 +837,9 @@ impl Popup {
     /// Moves everything to `now` and paints both surfaces.
     pub fn frame(&mut self, g: &mut Gfx, now: u64) -> Shown {
         self.mo.mode = Some(style::anim());
+        if let Some(sz) = self.content.resized(g) {
+            self.resize(sz);
+        }
         let (pose, open) = self.pose(now);
         let (w, h) = self.size;
         let m = self.m;
@@ -858,9 +927,14 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
         Along::Center => (lo + hi) / 2 - len / 2,
         Along::Start => lo,
         Along::End => hi - len,
+        Along::Corner => lo,
     };
+    let corner = p.along == Along::Corner;
     match a.side {
+        Side::Bottom if corner => (gap.max(edge), a.bar.1 - gap - h),
         Side::Bottom => ((along(l, r, w)).clamp(edge, (a.screen.0 - edge - w).max(edge)), a.bar.1 - gap - h),
+        Side::Left if corner => (a.bar.2 + gap, (a.screen.1 - gap - h).max(edge)),
+        Side::Right if corner => (a.bar.0 - gap - w, (a.screen.1 - gap - h).max(edge)),
         Side::Left => (a.bar.2 + gap, along(t, b, h).clamp(edge, (a.screen.1 - edge - h).max(edge))),
         Side::Right => (a.bar.0 - gap - w, along(t, b, h).clamp(edge, (a.screen.1 - edge - h).max(edge))),
     }
@@ -1013,6 +1087,16 @@ pub fn close() {
 /// Closes the open panel without any animation (another panel replaces it, a full-screen app needs the screen).
 pub fn close_now() {
     with(Host::hide);
+}
+
+/// The bar moved: the open panel of `id` follows it.
+pub fn reanchor(id: Id, a: Anchor) {
+    with(|h| {
+        if let Some(p) = h.popup.as_mut().filter(|p| p.id() == id) {
+            p.set_anchor(a);
+            h.frame(now());
+        }
+    });
 }
 
 /// The panel is open (and not on its way out).

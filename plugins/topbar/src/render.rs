@@ -181,8 +181,13 @@ fn demo_cells() -> Vec<ui::tray_popup::Cell> {
     DEMO.with_borrow(|d| d.iter().map(|c| ui::tray_popup::Cell { icon: c.icon, tip: c.tip.clone(), token: c.token }).collect())
 }
 
-/// `topbar --render-panel <file.png> tray|lang|tip [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>]
-/// [n=<icons>] [real] [at=<n>]`
+/// `topbar --render-panel <file.png> tray|lang|tip|settings[:<page>]|toast [classic|floating|dock] [bottom|left|right] [scale=1.25]
+/// [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]`
+///
+/// `settings` takes a page (main, colors, templates, lang, bar, reset, adv, upd, rollback) and, besides the above, `lang=<en|ru|ja|pt|zh>`,
+/// `open=<colour row>`, `upd=busy|done`, `tpl=<n>` sample templates, `tiled`, `del`, `size=<0|1|2>`, `op=<percent>`, `hide`,
+/// `alignl`, `accent=<blue|teal|lilac|amber|rose>`, `dir=fwd|bwd` (the page has just arrived: `t` is the time since); `toast` takes `text=<words>`. Both run on a scratch `%ProgramData%`: the
+/// settings and the language are theirs, the machine's own are never read or written.
 ///
 /// Draws a popup panel through the same frame as the live one, next to the bar, on a backdrop with something to blur, and
 /// writes the area around it to a PNG. `t` is the time since the panel opened (default: at rest), `hover` the hovered item,
@@ -194,18 +199,53 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let Some(file) = args.first() else { return };
     let what = args.get(1).map_or("tray", String::as_str).to_string();
     let (mut style, mut side, mut scale, mut t, mut hover, mut n_icons, mut real, mut at) = (Style::Classic, Side::Bottom, 1.0f32, 5000u64, None, 6usize, false, 3i32);
+    let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
+    let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
+    let mut dir_arg = "";
     for a in args.iter().skip(2) {
         match a.split_once('=') {
             Some(("scale", v)) => scale = v.parse().unwrap_or(1.0),
-            Some(("t", v)) => t = v.parse().unwrap_or(5000),
+            Some(("t", v)) => {
+                t = v.parse().unwrap_or(5000);
+                t_given = true;
+            }
+            Some(("lang", v)) => lang_arg = Box::leak(v.to_string().into_boxed_str()),
+            Some(("open", v)) => open_row = v.parse().ok(),
+            Some(("upd", v)) => upd = Box::leak(v.to_string().into_boxed_str()),
+            Some(("tpl", v)) => tpl = v.parse().unwrap_or(0),
+            Some(("text", v)) => text = Box::leak(v.to_string().into_boxed_str()),
+            Some(("size", v)) => bar_size = v.parse().unwrap_or(1),
+            Some(("op", v)) => opacity = v.parse().unwrap_or(85),
+            Some(("accent", v)) => accent = Box::leak(v.to_string().into_boxed_str()),
+            Some(("dir", v)) => dir_arg = Box::leak(v.to_string().into_boxed_str()),
             Some(("hover", v)) => hover = v.parse().ok(),
             Some(("n", v)) => n_icons = v.parse().unwrap_or(6),
             Some(("at", v)) => at = v.parse().unwrap_or(3),
             _ => match a.as_str() {
                 "real" => real = true,
+                "tiled" => tiled = true,
+                "del" => del = true,
+                "hide" => hide = true,
+                "alignl" => alignl = true,
                 "bottom" | "left" | "right" => side = Side::parse(a),
                 s => style = Style::parse(s),
             },
+        }
+    }
+    let sandbox = what.starts_with("settings") || what == "toast";
+    if sandbox {
+        // SAFETY: single-threaded at this point; the process only ever reads these settings from its own scratch folder.
+        unsafe { std::env::set_var("ProgramData", std::env::temp_dir().join("topbar-render")) };
+        i18n::set_lang(i18n::Lang::parse(lang_arg));
+        i18n::style::set_style(style);
+        i18n::style::set_side(side);
+        i18n::style::set_bar_size(bar_size);
+        i18n::style::set_bar_opacity(opacity);
+        i18n::style::set_autohide(hide);
+        i18n::style::set_align_left(alignl);
+        i18n::style::set_accent(i18n::style::Accent::parse(accent));
+        if !t_given && what == "toast" {
+            t = 800;
         }
     }
     SCALE.set(scale);
@@ -237,7 +277,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         time: "03:57".into(),
         date: "11/26/2026".into(),
     };
-    let lit = barui::Live { now: 100_000, hot: if what == "tip" { at } else { NONE }, tray: what == "tray", lang: what == "lang", ..Default::default() };
+    let lit = barui::Live { now: 100_000, hot: if what == "tip" { at } else { NONE }, tray: what == "tray", lang: what == "lang", gear: what.starts_with("settings"), ..Default::default() };
     bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
     bar.frame(&view, &lit);
     let p = bar.frame(&view, &barui::Live { now: 110_000, ..lit });
@@ -267,9 +307,10 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     blend(&mut canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha);
 
     let mut gfx = ui::gfx::Gfx::new(scale).expect("the renderer");
-    let key = match what.as_str() {
+    let key = match what.split(':').next().unwrap_or("") {
         "lang" => LANG,
         "tip" => at,
+        "settings" | "toast" => GEAR,
         _ => TAPP,
     };
     let r = bar.screen_rect(key).unwrap_or((0, 0, 0, 0));
@@ -279,7 +320,13 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         let (x0, y0, x1, y1) = (b.0 - m, b.1 - m, b.0 + b.2 + m, b.1 + b.3 + m);
         (x0.min(anchor.bar.0).max(0), y0.min(anchor.bar.1).max(0), x1.max(anchor.bar.2).min(sw), y1.max(anchor.bar.3).min(sh))
     };
-    let crop = if what == "tip" {
+    let crop = if what == "toast" {
+        let mut toast = ui::toast::Toast::new(scale, (sw, sh));
+        toast.show(&mut gfx, text, side, (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3), 0);
+        let (win, _) = toast.frame(&mut gfx, t);
+        blend(&mut canvas, (sw, sh), toast.surface().pixels(), win.2, (win.0, win.1), 255);
+        around(win)
+    } else if what == "tip" {
         let mut tip = ui::tip::Tip::new(scale, (sw, sh));
         let text = ["Claude", "File manager", "Microsoft Edge", "Spotify", "Task Manager", "Outlook", "Discord", "Telegram"][(at.max(1) as usize - 1) % 8];
         let along = if side == Side::Bottom { (r.0 + r.2) / 2 } else { (r.1 + r.3) / 2 };
@@ -288,7 +335,33 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
         around(win)
     } else {
-        let content: Box<dyn ui::panel::Content> = if what == "lang" {
+        let content: Box<dyn ui::panel::Content> = if what.starts_with("settings") {
+            use ui::settings_panel::{Info, Page, SettingsPanel, System, Upd};
+            let page = what.split_once(':').and_then(|(_, p)| Page::parse(p)).unwrap_or(Page::Main);
+            let themes: Vec<_> = (0..tpl)
+                .map(|i| i18n::style::Theme {
+                    name: format!("Template {}", i + 1),
+                    style: i18n::style::ALL[(i + 1) % 3],
+                    colors: if i % 2 == 0 { [u32::MAX; 7] } else { [0x2a1a10, u32::MAX, u32::MAX, u32::MAX, 0x48a3ff, u32::MAX, u32::MAX] },
+                    opacity: [85, 70, 55][i % 3],
+                    accent: i18n::style::Accent::ALL[(i + 1) % 5],
+                })
+                .collect();
+            let info = Info {
+                version: "0.5.9".into(),
+                auto: || Some(true),
+                act: |_| {},
+                system: || System { shell: false, tray: None, search_key: true, taskmgr_key: true, clipboard: true, wsearch_off: Some(true), taskbar_hidden: true },
+            };
+            let mut panel = SettingsPanel::new(info, themes, page);
+            let state = match upd {
+                "busy" => Upd::Busy(Some(0)),
+                "done" => Upd::Done(0),
+                _ => Upd::Idle,
+            };
+            panel.show(open_row, state, tiled, del, match dir_arg { "fwd" => Some(true), "bwd" => Some(false), _ => None });
+            Box::new(panel)
+        } else if what == "lang" {
             let items = if real {
                 layout_rows()
             } else {
@@ -321,6 +394,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         };
         let mut popup = Popup::new(&mut gfx, content, anchor, 0, &mut grab);
         popup.set_hover(hover);
+        let _ = popup.frame(&mut gfx, 0); // the first frame stamps what opens with the panel (the rising blocks of the first page)
         let shown = popup.frame(&mut gfx, t);
         let (panel, shade) = popup.surfaces();
         blend(&mut canvas, (sw, sh), shade.pixels(), shown.shadow.2, (shown.shadow.0, shown.shadow.1), shown.shadow_alpha);

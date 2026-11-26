@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
     D2D1_SHADOW_PROP_COLOR, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
     D2D1CreateFactory, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, ID2D1Bitmap, ID2D1BitmapRenderTarget, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1Factory1, ID2D1PathGeometry, ID2D1RenderTarget,
@@ -766,6 +766,52 @@ impl Canvas<'_> {
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: start, endPoint: end };
             if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
                 rt.FillRectangle(&r.d2d(), &b);
+            }
+        }
+    }
+
+    /// A rounded rectangle filled with a vertical gradient, CSS `linear-gradient(180deg, top, bottom)`.
+    pub fn gradient(&mut self, r: Rect, radius: f32, top: Rgba, bottom: Rgba) {
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let rt = self.rt();
+        let stops = [D2D1_GRADIENT_STOP { position: 0.0, color: top.d2d() }, D2D1_GRADIENT_STOP { position: 1.0, color: bottom.d2d() }];
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe {
+            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.cx(), Y: r.y }, endPoint: Vector2 { X: r.cx(), Y: r.y + r.h } };
+            if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
+                rt.FillRoundedRectangle(&rr, &b);
+            }
+        }
+    }
+
+    /// A rounded rectangle with a radial gradient, CSS `radial-gradient(rx ry at (cx, cy), c, transparent <end>)`: `c` at the
+    /// centre fading out to nothing at `end` (0..1 of the radius) and staying clear beyond.
+    pub fn radial(&mut self, r: Rect, radius: f32, (cx, cy): (f32, f32), (rx, ry): (f32, f32), c: Rgba, end: f32) {
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let rt = self.rt();
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c.d2d() },
+            D2D1_GRADIENT_STOP { position: end, color: c.alpha(0.0).d2d() },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c.alpha(0.0).d2d() },
+        ];
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe {
+            let Ok(coll) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                center: Vector2 { X: cx, Y: cy },
+                gradientOriginOffset: Vector2 { X: 0.0, Y: 0.0 },
+                radiusX: rx,
+                radiusY: ry,
+            };
+            if let Ok(b) = rt.CreateRadialGradientBrush(&props, None, &coll) {
+                rt.FillRoundedRectangle(&rr, &b);
             }
         }
     }
