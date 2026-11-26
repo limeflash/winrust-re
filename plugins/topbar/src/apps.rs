@@ -260,6 +260,9 @@ pub fn find_loose_exes(q: &str) {
         }
         // straight to the service's pipe: no rs.exe process per query (and no full disk scan when the service is down)
         let found = winrust_common::search::ask_all(&q);
+        if EXE_GEN.load(Rlx) != gen_ {
+            return; // the answer took long enough for the query to move on: its exes are not what is typed now
+        }
         let mut apps = APPS.lock().unwrap();
         let mut added = false;
         for line in found.iter().filter(|l| l.to_lowercase().ends_with(".exe")).take(12) {
@@ -379,11 +382,26 @@ pub fn image(path: &str) -> Option<Image> {
     if let Some(&(h, w, ht, thumb)) = IMAGES.lock().unwrap().as_ref().and_then(|m| m.get(path)) {
         return (h != 0).then(|| Image { icon: wicon(h as HICON), w, h: ht, thumb });
     }
+    if on_network(path) {
+        return None; // the shell would wait for the share on this thread (once per frame, if it is down)
+    }
     let px = ICON_PX.load(Rlx);
     // SAFETY: shell calls on this thread.
     let got = unsafe { shell_image(path, px, true).map(|(i, w, h)| (i, w, h, true)).or_else(|| shell_image(path, px, false).map(|(i, w, h)| (i, w, h, false))) };
     let (h, w, ht, thumb) = got.map_or((0, 0, 0, false), |(i, w, h, t)| (i as usize, w, h, t));
-    IMAGES.lock().unwrap().get_or_insert_with(HashMap::new).insert(path.to_string(), (h, w, ht, thumb));
+    let mut all = IMAGES.lock().unwrap();
+    let all = all.get_or_insert_with(HashMap::new);
+    if all.len() >= 256 {
+        // the paths of recent files and search results come and go: start over rather than keep every icon for the whole session
+        for (_, (old, ..)) in all.drain().filter(|(_, v)| v.0 != 0) {
+            // SAFETY: icons made by `shell_image`, owned by this cache; the renderer drops its bitmaps of them first.
+            unsafe {
+                ui::gfx::retire_icon(wicon(old as HICON));
+                DestroyIcon(old as HICON);
+            }
+        }
+    }
+    all.insert(path.to_string(), (h, w, ht, thumb));
     (h != 0).then(|| Image { icon: wicon(h as HICON), w, h: ht, thumb })
 }
 
@@ -465,13 +483,16 @@ pub fn recent(n: usize) -> Vec<Recent> {
     lnks.sort_by_key(|l| std::cmp::Reverse(l.0));
     let mut out: Vec<Recent> = Vec::new();
     for (t, lnk) in lnks.into_iter().take(120) {
-        let Some(target) = link_path(&lnk) else { continue };
+        let Some((target, was_dir)) = link_info(&lnk) else { continue };
         let tp = std::path::Path::new(&target);
-        if !tp.exists() || out.iter().any(|r| r.path.eq_ignore_ascii_case(&target)) {
+        // a share that is down would hold the bar for the length of the network's timeout, once per file: the shortcut's own
+        // record says whether it is a folder, and a file on a share is taken to still be there
+        let net = on_network(&target);
+        if (!net && !tp.exists()) || out.iter().any(|r| r.path.eq_ignore_ascii_case(&target)) {
             continue;
         }
         let name = tp.file_name().map_or_else(|| target.clone(), |n| n.to_string_lossy().to_string());
-        let dir = tp.is_dir();
+        let dir = if net { was_dir } else { tp.is_dir() };
         let (when, day) = when_label(t);
         let when = if dir { format!("{} · {when}", t!("Папка", "Folder", ja: "フォルダー", pt: "Pasta", zh: "文件夹")) } else { when };
         out.push(Recent { name, path: target, when, day, dir });
@@ -516,16 +537,32 @@ fn remove_recent_with(dir: &std::path::Path, target: &str, resolve: impl Fn(&std
 
 /// What a shortcut points at, as written in it (not lower-cased).
 fn link_path(lnk: &std::path::Path) -> Option<String> {
+    link_info(lnk).map(|i| i.0)
+}
+
+/// What a shortcut points at, and whether it pointed at a folder when the shortcut was written (read from the shortcut, the
+/// target is not touched).
+fn link_info(lnk: &std::path::Path) -> Option<(String, bool)> {
+    use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
     let w = wide(&lnk.to_string_lossy());
     // SAFETY: COM on this thread; the buffers are locals.
     unsafe {
         let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         sl.cast::<IPersistFile>().ok()?.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
         let mut b = [0u16; 520];
-        sl.GetPath(&mut b, null_mut(), 0).ok()?;
+        let mut fd: WIN32_FIND_DATAW = zeroed();
+        sl.GetPath(&mut b, &mut fd, 0).ok()?;
         let p = String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0)?]);
-        (!p.is_empty()).then_some(p)
+        (!p.is_empty()).then_some((p, fd.dwFileAttributes & 0x10 != 0))
     }
+}
+
+/// A path on a network share (UNC, or a mapped drive): touching it can wait for the network.
+fn on_network(p: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    let b = p.as_bytes();
+    // SAFETY: a NUL-terminated root string.
+    p.starts_with(r"\\") || (b.len() >= 2 && b[1] == b':' && unsafe { GetDriveTypeW(wide(&format!("{}:\\", b[0] as char)).as_ptr()) } == 4) // DRIVE_REMOTE
 }
 
 /// "Today, 08:12" / "Yesterday, 18:20" / "11/20/2026, 09:05" in the user's own format.

@@ -11,7 +11,8 @@ pub(crate) unsafe fn screenshot() -> Option<(Saved, (u32, u32))> {
         windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(prev);
         return None;
     }
-    let (scr, mem) = (GetDC(null_mut()), CreateCompatibleDC(GetDC(null_mut())));
+    let scr = GetDC(null_mut());
+    let mem = CreateCompatibleDC(scr);
     let bmp = CreateCompatibleBitmap(scr, w, h);
     let old = SelectObject(mem, bmp);
     BitBlt(mem, 0, 0, w, h, scr, x, y, SRCCOPY | 0x4000_0000); // CAPTUREBLT: layered windows (the wallpaper, overlays) too
@@ -49,14 +50,26 @@ pub(crate) unsafe fn write_png(bmp: HBITMAP, path: &std::path::Path) -> bool {
 pub(crate) unsafe fn save_bitmap(bmp: HBITMAP, clip: bool, save: bool) -> Option<Saved> {
     let mut t: SYSTEMTIME = zeroed();
     GetLocalTime(&mut t);
-    let name = format!("Screenshot {:04}-{:02}-{:02} {:02}-{:02}-{:02}.png", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    let name = format!("Screenshot {:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     let dir = PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(r"Pictures\Screenshots");
     let _ = std::fs::create_dir_all(&dir);
+    let name = free_name(&dir, &name, "png");
     let path = dir.join(&name);
     let saved = save && write_png(bmp, &path);
     let copied = clip && to_clipboard(bmp, saved.then_some(path.as_path()));
     DeleteObject(bmp);
     (saved || copied).then_some(Saved { name, saved, copied })
+}
+
+/// `<stem>.<ext>`, or `<stem> (2).<ext>`, `(3)`... when the folder has that already (two shots in one second).
+fn free_name(dir: &std::path::Path, stem: &str, ext: &str) -> String {
+    let mut name = format!("{stem}.{ext}");
+    let mut n = 2;
+    while dir.join(&name).exists() {
+        name = format!("{stem} ({n}).{ext}");
+        n += 1;
+    }
+    name
 }
 
 /// Puts a screen bitmap on the clipboard the way image editors and browsers read it: a PNG and a 32-bit DIB (Windows makes the
@@ -134,5 +147,20 @@ pub(crate) unsafe fn screenshot_notice(bar: HWND) {
     match screenshot() {
         Some((s, size)) => notify::screenshot_done(s.saved.then_some(s.name.as_str()), Some(size), s.copied, None),
         None => notify::screenshot_failed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn two_shots_in_one_second_get_two_names() {
+        let dir = std::env::temp_dir().join(format!("winrust-shot-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::free_name(&dir, "Screenshot a", "png"), "Screenshot a.png");
+        std::fs::write(dir.join("Screenshot a.png"), b"x").unwrap();
+        assert_eq!(super::free_name(&dir, "Screenshot a", "png"), "Screenshot a (2).png");
+        std::fs::write(dir.join("Screenshot a (2).png"), b"x").unwrap();
+        assert_eq!(super::free_name(&dir, "Screenshot a", "png"), "Screenshot a (3).png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

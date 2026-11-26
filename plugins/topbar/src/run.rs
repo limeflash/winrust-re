@@ -10,6 +10,7 @@ pub(crate) fn run_dialog() {
             type RunFileDlg = unsafe extern "system" fn(HWND, HICON, *const u16, *const u16, *const u16, u32);
             std::mem::transmute::<unsafe extern "system" fn() -> isize, RunFileDlg>(f)(null_mut(), null_mut(), null(), null(), null(), 0);
         }
+        FreeLibrary(sh); // LoadLibraryW counted a reference per dialog
     });
 }
 

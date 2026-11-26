@@ -35,6 +35,11 @@ pub unsafe fn capture(window: HWND) {
         if IsIconic(window) != 0 || GetWindowRect(window, &mut rect) == 0 || rect.left <= -32000 { return; }
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
         if w <= 0 || h <= 0 || w > 8192 || h > 8192 { return; }
+        // PrintWindow waits for the window's own thread, and this runs on the bar's: a program that does not answer (it is the
+        // one being minimized because it hangs, often) would freeze the bar with it. A probe that gives up after 100 ms asks first;
+        // (ponytail: a program that hangs after the probe still holds the bar; PrintWindow on a thread of its own would not.)
+        let mut answer = 0usize;
+        if SendMessageTimeoutW(window, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &mut answer) == 0 { return; }
         let dc = GetDC(std::ptr::null_mut());
         if dc.is_null() { return; }
         let src = CreateCompatibleDC(dc);

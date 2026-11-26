@@ -1,12 +1,18 @@
 //! topbar: status (split out of main.rs; shares its items through `super::*`).
 use super::*;
 
+thread_local! {
+    static EP_ID: RefCell<String> = const { RefCell::new(String::new()) }; // the device `EP` was made for
+}
+
 pub(crate) unsafe fn endpoint() -> Option<IAudioEndpointVolume> {
     EP.with_borrow_mut(|e| {
         if e.is_none() {
             *e = (|| -> windows::core::Result<IAudioEndpointVolume> {
                 let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-                en.GetDefaultAudioEndpoint(eRender, eConsole)?.Activate(CLSCTX_ALL, None)
+                let d = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
+                EP_ID.set(crate::audio::id_of(&d).unwrap_or_default());
+                d.Activate(CLSCTX_ALL, None)
             })()
             .ok();
         }
@@ -15,6 +21,15 @@ pub(crate) unsafe fn endpoint() -> Option<IAudioEndpointVolume> {
 }
 
 pub(crate) unsafe fn read_volume() {
+    // the default output can change under a working endpoint (headphones, the sound settings, another app): a device that is
+    // still there answers happily for itself, so the default is looked at each time
+    let id = (|| -> Option<String> {
+        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        crate::audio::id_of(&en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?)
+    })();
+    if id.is_some_and(|id| EP_ID.with_borrow(|c| *c != id)) {
+        EP.set(None);
+    }
     let v = endpoint().and_then(|e| Some(((e.GetMasterVolumeLevelScalar().ok()? * 100.0).round() as i32, e.GetMute().ok()?.as_bool())));
     if v.is_none() {
         EP.set(None); // device changed: look the endpoint up again next time

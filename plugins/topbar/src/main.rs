@@ -459,25 +459,34 @@ unsafe fn set_work_area(mut want: RECT) {
         // SPIF_SENDCHANGE waits for every top-level window (took ~3 s, #94): set quietly and post the notice instead
         SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut want as *mut _ as *mut _, 0);
         PostMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA as usize, 0);
-        EnumWindows(Some(fit_maximized), &want as *const RECT as isize);
+        EnumWindows(Some(fit_maximized), &[want, cur] as *const [RECT; 2] as isize);
     }
 }
 
-/// A window that was already maximized keeps its old height when the work area shrinks: trim it (size only, no restore).
+/// A window that was already maximized keeps its old size when the work area changes: trim it where the area shrank, and
+/// stretch the edges that sat on the old area's edge where it grew (size only, no restore).
 unsafe extern "system" fn fit_maximized(h: HWND, lp: isize) -> i32 {
-    let want = &*(lp as *const RECT);
+    let [want, old] = *(lp as *const [RECT; 2]);
     // the work area is the primary monitor's: a window maximized on another monitor would be cut to a sliver
     if IsWindowVisible(h) == 0 || IsZoomed(h) == 0 || MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) {
         return 1;
     }
     let mut r: RECT = zeroed();
     GetWindowRect(h, &mut r);
-    let f =GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER); // a maximized window overhangs by its border
-    let n = RECT { left: r.left.max(want.left - f), top: r.top.max(want.top - f), right: r.right.min(want.right + f), bottom: r.bottom.min(want.bottom + f) };
+    let f = GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER); // a maximized window overhangs by its border
+    let n = fit_edges(r, old, want, f);
     if (n.left, n.top, n.right, n.bottom) != (r.left, r.top, r.right, r.bottom) && n.right > n.left && n.bottom > n.top {
         SetWindowPos(h, null_mut(), n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     1
+}
+
+/// A maximized window's rectangle `r` (it overhangs the work area by `f`) once the work area went from `old` to `want`: an
+/// edge on the old area's edge follows the new one, an edge past the new area comes in.
+fn fit_edges(r: RECT, old: RECT, want: RECT, f: i32) -> RECT {
+    let lo = |r: i32, old: i32, want: i32| if r == old - f || r < want - f { want - f } else { r };
+    let hi = |r: i32, old: i32, want: i32| if r == old + f || r > want + f { want + f } else { r };
+    RECT { left: lo(r.left, old.left, want.left), top: lo(r.top, old.top, want.top), right: hi(r.right, old.right, want.right), bottom: hi(r.bottom, old.bottom, want.bottom) }
 }
 
 // ---------- data: windows, pins, tray apps, volume, wifi, battery ----------
@@ -1057,7 +1066,7 @@ fn refresh_status() {
             t.retain(|x| {
                 let alive = IsWindow(x.hwnd) != 0;
                 if !alive {
-                    DestroyIcon(x.icon);
+                    destroy_icon(x.icon);
                 }
                 alive
             })
@@ -1468,6 +1477,12 @@ fn wicon(ic: HICON) -> windows::Win32::UI::WindowsAndMessaging::HICON {
     windows::Win32::UI::WindowsAndMessaging::HICON(ic.cast())
 }
 
+/// `DestroyIcon` for an icon the renderer may have drawn: its cached bitmaps go first (the handle value will be reused).
+unsafe fn destroy_icon(ic: HICON) {
+    ui::gfx::retire_icon(wicon(ic));
+    DestroyIcon(ic);
+}
+
 /// What the bar shows now, gathered from the program's state.
 unsafe fn build_view() -> barui::View {
     let s = SCALE.get();
@@ -1850,8 +1865,17 @@ unsafe fn unpin(i: usize) {
         let _ = std::fs::create_dir_all(appdata_file("topbar-taskband"));
         let _ = std::fs::write(unpinned_file(), t);
     }
-    let _ = std::fs::remove_file(String::from_utf16_lossy(&p.lnk[..n]));
-    DestroyIcon(p.icon);
+    // only a file that is the pin itself: one from ImplicitAppShortcuts (a browser profile's) belongs to the browser
+    let file = PathBuf::from(String::from_utf16_lossy(&p.lnk[..n]));
+    if pin_file_is_ours(&file, &[pin_dir(), appdata_file("topbar-taskband")]) {
+        let _ = std::fs::remove_file(file);
+    }
+    destroy_icon(p.icon);
+}
+
+/// `file` sits directly in one of the folders that hold the bar's pins (the TaskBar folder, our copies of Taskband entries).
+fn pin_file_is_ours(file: &std::path::Path, dirs: &[PathBuf]) -> bool {
+    file.parent().is_some_and(|d| dirs.iter().any(|o| d.as_os_str().eq_ignore_ascii_case(o.as_os_str())))
 }
 
 /// Arguments of a shortcut ("" if none).
@@ -2021,14 +2045,18 @@ unsafe extern "system" fn snap_proc(_: windows_sys::Win32::UI::Accessibility::HW
     if ev == 0x000A {
         // the drag starts: its size, so that the end can tell a move (magnet) from a resize (left alone)
         let r = frame(w);
-        DRAG_SIZE.set((r.right - r.left, r.bottom - r.top));
+        DRAG_SIZE.set(if IsZoomed(w) != 0 { (0, 0) } else { (r.right - r.left, r.bottom - r.top) }); // a maximized window is restored by the drag: its size says nothing
         return;
     }
     if IsWindowVisible(w) == 0 || IsZoomed(w) != 0 {
         return;
     }
+    // the end of a resize ends here too: the pointer at the screen edge then only means the border was dragged there
+    let r = frame(w);
+    if DRAG_SIZE.get() != (0, 0) && DRAG_SIZE.get() != (r.right - r.left, r.bottom - r.top) {
+        return;
+    }
     if stick() && !edge_snap(w) {
-        let r = frame(w);
         if DRAG_SIZE.get() == (r.right - r.left, r.bottom - r.top) {
             magnet_window(w, r);
         }
@@ -2666,6 +2694,28 @@ mod tests {
         assert_eq!(super::magnet(r, &[512, 100], &[], 14), (-5, 0)); // 105->100 (5) beats 505->512 (7)
         assert_eq!(super::magnet(r, &[515], &[340], 14), (10, -10)); // right edge to 515, bottom to 340
         assert_eq!(super::magnet(r, &[130, 0], &[80], 14), (0, 0)); // nothing close enough
+    }
+
+    #[test]
+    fn unpinning_deletes_only_the_bars_own_pin_files() {
+        use std::path::{Path, PathBuf};
+        let dirs = [PathBuf::from(r"C:\u\TaskBar"), PathBuf::from(r"C:\u\topbar-taskband")];
+        assert!(super::pin_file_is_ours(Path::new(r"c:\U\taskbar\Chrome.lnk"), &dirs));
+        assert!(super::pin_file_is_ours(Path::new(r"C:\u\topbar-taskband\x-1.lnk"), &dirs));
+        assert!(!super::pin_file_is_ours(Path::new(r"C:\u\TaskBar\ImplicitAppShortcuts\ab\Profile 2.lnk"), &dirs));
+        assert!(!super::pin_file_is_ours(Path::new(r"C:\Users\x\Desktop\a.lnk"), &dirs));
+    }
+
+    #[test]
+    fn maximized_windows_follow_the_work_area_both_ways() {
+        let rc = |l, t, r, b| super::RECT { left: l, top: t, right: r, bottom: b };
+        let t = |r: super::RECT| (r.left, r.top, r.right, r.bottom);
+        // the bar (48 high) went away: a window that filled the old area grows, f = 8 overhang
+        assert_eq!(t(super::fit_edges(rc(-8, -8, 1928, 1032), rc(0, 0, 1920, 1032 - 8 - 8 + 8), rc(0, 0, 1920, 1080), 8)), (-8, -8, 1928, 1088));
+        // the bar came back: it shrinks
+        assert_eq!(t(super::fit_edges(rc(-8, -8, 1928, 1088), rc(0, 0, 1920, 1080), rc(0, 0, 1920, 1032), 8)), (-8, -8, 1928, 1040));
+        // a window that was not filling the old area is left alone
+        assert_eq!(t(super::fit_edges(rc(-8, -8, 1928, 900), rc(0, 0, 1920, 1080), rc(0, 0, 1920, 1080), 8)), (-8, -8, 1928, 900));
     }
 
     #[test]

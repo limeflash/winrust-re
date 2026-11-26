@@ -37,7 +37,7 @@ fn enumerator() -> Option<IMMDeviceEnumerator> {
     unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok() }
 }
 
-fn id_of(d: &IMMDevice) -> Option<String> {
+pub(crate) fn id_of(d: &IMMDevice) -> Option<String> {
     // SAFETY: `GetId` hands out a string we free.
     unsafe {
         let p = d.GetId().ok()?;

@@ -142,13 +142,24 @@ pub(crate) unsafe fn miniatures(desks: &[Desktop], cur: usize) -> Vec<Vec<(isize
         } else {
             desktop_of(h).and_then(|d| desks.iter().position(|x| x.id == d)).or_else(|| (desks.len() == 2).then_some(1 - cur.min(1)))
         };
-        if let Some(i) = at.filter(|&i| i < out.len()) {
-            let f = |v: i32, m: f32| (v as f32 / m).clamp(0.0, 1.0);
-            let (x0, y0, x1, y1) = (f(l, sw), f(t, sh), f(r, sw), f(b, sh));
-            out[i].push((h as isize, (x0, y0, x1 - x0, y1 - y0)));
+        if let (Some(i), Some(m)) = (at.filter(|&i| i < out.len()), on_screen((l, t, r, b), sw, sh)) {
+            out[i].push((h as isize, m));
         }
     }
     out
+}
+
+/// A window's frame as fractions of the primary screen (left, top, width, height), or None when its centre is on another
+/// monitor: the tile shows this screen only, and a window of the next monitor would be a zero-width ghost (or, when it spans
+/// both, its whole picture squeezed into the part that is here). A window mostly here is cut at the screen's edges.
+pub(crate) fn on_screen((l, t, r, b): (i32, i32, i32, i32), sw: f32, sh: f32) -> Option<(f32, f32, f32, f32)> {
+    let (cx, cy) = ((l + r) as f32 / 2.0, (t + b) as f32 / 2.0);
+    if !(0.0..sw).contains(&cx) || !(0.0..sh).contains(&cy) {
+        return None;
+    }
+    let f = |v: i32, m: f32| (v as f32 / m).clamp(0.0, 1.0);
+    let (x0, y0, x1, y1) = (f(l, sw), f(t, sh), f(r, sw), f(b, sh));
+    Some((x0, y0, x1 - x0, y1 - y0))
 }
 
 thread_local! {
@@ -180,6 +191,15 @@ pub(crate) unsafe fn add() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_of_other_monitors_stay_off_the_tile() {
+        let s = |f: (i32, i32, i32, i32)| super::on_screen(f, 1000.0, 500.0);
+        assert_eq!(s((100, 50, 500, 250)), Some((0.1, 0.1, 0.4, 0.4)));
+        assert_eq!(s((-800, 0, -100, 300)), None); // left of the primary monitor
+        assert_eq!(s((1100, 0, 1900, 300)), None); // right of it
+        assert_eq!(s((-100, -100, 300, 100)), Some((0.0, 0.0, 0.3, 0.2))); // mostly here: cut at the edge
+    }
+
     #[test]
     fn the_list_has_a_current_desktop_and_windows_have_one() {
         unsafe {
