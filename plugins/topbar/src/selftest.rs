@@ -126,6 +126,7 @@ fn view(style: Style, side: Side, apps: Vec<barui::AppView>) -> View {
         date: "11/26/2026".into(),
         unread: 0,
         dnd: false,
+        rec: None,
     }
 }
 

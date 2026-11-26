@@ -94,6 +94,8 @@ pub struct Note {
     pub acts: Vec<Act>,
     /// A picture file shown under the text (a screenshot).
     pub image: Option<String>,
+    /// The picture is the cover of a video of this length (`0:24`): a play button over it and the length in a corner.
+    pub video: Option<String>,
     pub avatar: Option<Avatar>,
     /// The first button is red (a warning).
     pub danger: bool,
@@ -117,6 +119,7 @@ impl Note {
             body: body.into(),
             acts: Vec::new(),
             image: None,
+            video: None,
             avatar: None,
             danger: false,
             target: Target::Nothing,
@@ -136,6 +139,12 @@ impl Note {
     #[must_use]
     pub fn image(mut self, path: impl Into<String>) -> Self {
         self.image = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn video(mut self, length: impl Into<String>) -> Self {
+        self.video = Some(length.into());
         self
     }
 
@@ -706,19 +715,26 @@ fn screenshots_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(r"Pictures\Screenshots")
 }
 
-/// PrtSc or the snip tool saved `name` into Pictures\Screenshots (and put it on the clipboard).
-pub fn screenshot_saved(name: &str, snip: bool) {
-    let path = screenshots_dir().join(name);
-    let title = if snip {
-        t!("Фрагмент сохранён", "Snip saved", ja: "スニップを保存しました", pt: "Recorte salvo", zh: "截图已保存")
-    } else {
-        t!("Скриншот сохранён", "Screenshot saved", ja: "スクリーンショットを保存しました", pt: "Captura de tela salva", zh: "截图已保存")
+/// The picker or PrtSc took a screenshot: the file `name` in Pictures\Screenshots (when it was saved) and/or the clipboard. `size`
+/// is the picture's size in pixels; `preview` a picture file to show when nothing was saved.
+pub fn screenshot_done(name: Option<&str>, size: Option<(u32, u32)>, copied: bool, preview: Option<String>) {
+    let at = size.map(|(w, h)| format!(" \u{b7} {w} \u{d7} {h}")).unwrap_or_default();
+    let title = match name {
+        Some(_) => t!("Скриншот сохранён", "Screenshot saved", ja: "スクリーンショットを保存しました", pt: "Captura de tela salva", zh: "截图已保存"),
+        None => t!("Скриншот скопирован", "Screenshot copied", ja: "スクリーンショットをコピーしました", pt: "Captura de tela copiada", zh: "截图已复制"),
     };
-    let mut n = Note::new(shot_app(), title, tf!("Скопирован в буфер обмена · {name}", "Copied to the clipboard · {name}", ja: "クリップボードにコピーしました · {name}", pt: "Copiado para a área de transferência · {name}", zh: "已复制到剪贴板 · {name}"));
-    if path.is_file() {
-        let p = path.to_string_lossy().into_owned();
+    let body = match name {
+        Some(n) => format!("{} \u{203a} {n}{at}", t!("Изображения \u{203a} Снимки экрана", "Pictures \u{203a} Screenshots", ja: "ピクチャ \u{203a} スクリーンショット", pt: "Imagens \u{203a} Capturas de tela", zh: "图片 \u{203a} 屏幕截图")),
+        None => format!("{}{at}", t!("Скопирован в буфер обмена", "Copied to clipboard", ja: "クリップボードにコピーしました", pt: "Copiado para a área de transferência", zh: "已复制到剪贴板")),
+    };
+    let _ = copied;
+    let mut n = Note::new(shot_app(), title, body);
+    let file = name.map(|n| screenshots_dir().join(n)).filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned());
+    if let Some(p) = file.clone().or(preview) {
+        n = n.image(p);
+    }
+    if let Some(p) = file {
         n = n
-            .image(p.clone())
             .acts(vec![
                 Act { label: t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开").to_string(), does: Do::Open(p.clone()) },
                 Act { label: t!("Показать в папке", "Show in folder", ja: "フォルダーで表示", pt: "Mostrar na pasta", zh: "在文件夹中显示").to_string(), does: Do::Show(p.clone()) },
@@ -726,6 +742,37 @@ pub fn screenshot_saved(name: &str, snip: bool) {
             .target(Target::File(p));
     }
     post(n);
+}
+
+/// The face of the screen recorder.
+fn rec_app() -> App {
+    App {
+        key: "winrust-recording".into(),
+        name: t!("Запись экрана", "Screen recording", ja: "画面録画", pt: "Gravação de tela", zh: "屏幕录制").to_string(),
+        icon: AppIcon::Plate("M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12zM12 12h.01", 0xe5484d, 0xc13a40),
+    }
+}
+
+/// A recording was saved: the video at `path` (`secs` long, `bytes` big), with `thumb` as its cover.
+pub fn recording_saved(path: &str, secs: u64, bytes: u64, thumb: Option<String>) {
+    let file = std::path::Path::new(path).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let mb = format!("{:.1} MB", bytes as f64 / 1_048_576.0);
+    let body = format!("{} \u{203a} {file} \u{b7} {mb}", t!("Видео \u{203a} Captures", "Videos \u{203a} Captures", ja: "ビデオ \u{203a} Captures", pt: "Vídeos \u{203a} Captures", zh: "视频 \u{203a} Captures"));
+    let mut n = Note::new(rec_app(), t!("Запись экрана сохранена", "Screen recording saved", ja: "画面録画を保存しました", pt: "Gravação de tela salva", zh: "屏幕录制已保存"), body)
+        .acts(vec![
+            Act { label: t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开").to_string(), does: Do::Open(path.to_string()) },
+            Act { label: t!("Показать в папке", "Show in folder", ja: "フォルダーで表示", pt: "Mostrar na pasta", zh: "在文件夹中显示").to_string(), does: Do::Show(path.to_string()) },
+        ])
+        .target(Target::File(path.to_string()))
+        .video(crate::ui::snip::clock_text(secs));
+    if let Some(t) = thumb {
+        n = n.image(t);
+    }
+    post(n);
+}
+
+pub fn recording_failed(why: &str) {
+    post(Note::new(rec_app(), t!("Не удалось записать экран", "Could not record the screen", ja: "画面を録画できませんでした", pt: "Não foi possível gravar a tela", zh: "无法录制屏幕"), why));
 }
 
 pub fn screenshot_failed() {

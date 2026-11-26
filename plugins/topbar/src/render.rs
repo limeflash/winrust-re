@@ -156,6 +156,7 @@ pub(crate) unsafe fn render(args: &[String]) {
     let (mut hover, mut press, mut open, mut scale, mut op) = (NONE, NONE, "", 1.0f32, 0.85f32);
     let (mut battery, mut tray, mut n_apps) = (false, 0usize, 8usize);
     let (mut unread, mut dnd) = (0usize, false);
+    let mut rec_time = None::<String>;
     let Some(file) = args.first() else { return };
     for a in &args[1..] {
         match a.split_once('=') {
@@ -167,6 +168,7 @@ pub(crate) unsafe fn render(args: &[String]) {
             Some(("tray", v)) => tray = v.parse().unwrap_or(0),
             Some(("apps", v)) => n_apps = v.parse().unwrap_or(8),
             Some(("unread", v)) => unread = v.parse().unwrap_or(0),
+            Some(("rec", v)) => rec_time = Some(v.to_string()),
             _ => match a.as_str() {
                 "dnd" => dnd = true,
                 "battery" => battery = true,
@@ -207,6 +209,7 @@ pub(crate) unsafe fn render(args: &[String]) {
         date: "11/26/2026".into(),
         unread,
         dnd,
+        rec: rec_time,
     };
     let still = barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() };
     let shown = barui::Live {
@@ -524,6 +527,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         date: "11/26/2026".into(),
         unread: 0,
         dnd: false,
+        rec: None,
     };
     let lit = barui::Live {
         now: 100_000,
@@ -842,6 +846,7 @@ fn demo_app(key: &str) -> notify::App {
         "tm" => ("Task Manager", AppIcon::Plate("M4 18V9M9 18V5M14 18v-7M19 18V7", 0x3a3f4b, 0x22252d)),
         "winrust" => ("WinRust", AppIcon::Winrust),
         "cal" => ("Calendar", AppIcon::Plate("M5 8h14v11H5zM5 11h14M9 5v3M15 5v3", 0xe5484d, 0xc13a40)),
+        "rec" => ("Screen recording", AppIcon::Plate("M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12zM12 12h.01", 0xe5484d, 0xc13a40)),
         _ => ("Screenshot", AppIcon::Plate("M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M12 12h.01", 0x7b6cf0, 0x5b4bd8)),
     };
     App { key: key.into(), name: name.into(), icon }
@@ -864,6 +869,7 @@ fn demo_notes(popups: bool, which: &str, expand: &str, reply: Option<&str>, (dnd
             for (k, name) in pops.split(',').enumerate() {
                 let n = match name {
                     "shot" => mk("snip", "Screenshot saved", "Copied to clipboard \u{b7} Pictures \u{203a} Screenshots", acts(&[("Open", go("x")), ("Show in folder", Do::Show("x".into()))])).image(wall),
+                    "rec" => mk("rec", "Screen recording saved", "Videos \u{203a} Captures \u{203a} Recording 2026-11-26 207.mp4 \u{b7} 2.4 MB", acts(&[("Open", go("x")), ("Show in folder", Do::Show("x".into()))])).image(wall).video("0:24"),
                     "cal" => mk("cal", "Design sync in 10 minutes", "19:30 \u{2013} 20:00 \u{b7} Google Meet", acts(&[("Join", go("x")), ("Snooze", Do::Read)])),
                     "long" => mk("telegram", "A very long title that does not fit on one line of a pop-up at all, truly", "The body of this one runs on and on and on, past the three lines a pop-up allows, so that its last line has to end in an ellipsis instead of spilling out of the card over the buttons.", chat()).avatar('A', 0xf472b6, 0xbe185d),
                     "sus" => mk("tm", "winhelper.exe looks suspicious", "Unsigned, runs from %TEMP% and opens outbound connections.", acts(&[("End task", go("x")), ("Show", Do::Show("x".into()))])).danger(),
@@ -890,6 +896,9 @@ fn demo_notes(popups: bool, which: &str, expand: &str, reply: Option<&str>, (dnd
                         s.mark_read(id);
                     }
                 }
+            }
+            if which == "rec" {
+                s.push(mk("rec", "Screen recording saved", "Videos \u{203a} Captures \u{203a} Recording 2026-11-26 207.mp4 \u{b7} 2.4 MB", acts(&[("Open", go("x")), ("Show in folder", Do::Show("x".into()))])).image(wall).video("0:24"), base);
             }
             if undo {
                 s.clear_all(base);
@@ -1066,7 +1075,7 @@ fn demo_menu(kind: &str, side: Side, max_h: f32, sub_left: bool) -> Box<dyn ui::
 }
 
 /// Something that looks like a window where a live thumbnail would be: a title bar, a tab, a few lines.
-fn fake_window(canvas: &mut [u32], (sw, sh): (i32, i32), r: (i32, i32, i32, i32), seed: usize) {
+pub(crate) fn fake_window(canvas: &mut [u32], (sw, sh): (i32, i32), r: (i32, i32, i32, i32), seed: usize) {
     let (w, h) = (r.2 - r.0, r.3 - r.1);
     let hero = [0xff3a5f8a_u32, 0xff8a4a3a, 0xff3a8a5f][seed % 3];
     for y in 0..h {

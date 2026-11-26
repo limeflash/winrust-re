@@ -19,7 +19,7 @@ use std::{
 extern crate winrust_common;
 use winrust_common as i18n;
 use winrust_common::style::{Side, Style, pal, style, ui_face};
-mod clip;
+mod snip;
 mod hist;
 mod fly;
 mod apps;
@@ -257,6 +257,7 @@ unsafe fn tip_text(h: i32) -> String {
         POW_S => t!("Завершение работы", "Shut down", ja: "シャットダウン", pt: "Desligar", zh: "关机").into(),
         0 => "Start".into(),
         TAPP => "Hidden icons".into(),
+        REC_I => t!("Остановить запись (Win+Shift+R)", "Stop and save (Win+Shift+R)", ja: "録画を停止して保存 (Win+Shift+R)", pt: "Parar e salvar (Win+Shift+R)", zh: "停止并保存 (Win+Shift+R)").into(),
         GEAR => t!("Настройки панели", "Bar settings", ja: "バーの設定", pt: "Configurações da barra", zh: "任务栏设置").into(),
         SHOWDESK => t!("Показать рабочий стол", "Show desktop", ja: "デスクトップを表示", pt: "Mostrar a área de trabalho", zh: "显示桌面").into(),
         CLOCK => {
@@ -1515,6 +1516,7 @@ unsafe fn build_view() -> barui::View {
         date,
         unread: notify::with(|s| s.badge()).unwrap_or(0),
         dnd: notify::with(|s| s.dnd()),
+        rec: snip::rec_time(),
     }
 }
 
@@ -2178,6 +2180,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         WIFI_I if left => quick_toggle(h),
         WIFI_I => wifi_toggle(), // right click: the network list
         VOL_I | BAT_I => quick_toggle(h),
+        REC_I if left => snip::stop_rec(),
         CLOCK if left => cal_toggle(),
         CLOCK => {
             // right click: like Windows 11, a menu with the date and time and notification settings (#126)
@@ -2348,7 +2351,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         ALT_UP => alt_done(wp == 1),
         SNIP if wp == 1 => screenshot_notice(hwnd),
         SNIP if wp == 2 => clip_notice(hwnd),
-        SNIP => clip::start(),
+        SNIP if wp == 4 => _ = InvalidateRect(hwnd, null(), 0), // the recording's time and dot move
+        SNIP => {
+            // Win+Shift+S (0) and Win+Shift+R (3): what is open closes first, so the picture the picker freezes is the desktop
+            ui::tip::hide();
+            if ui::panel::any_open() {
+                ui::panel::close_now();
+                windows_sys::Win32::Graphics::Dwm::DwmFlush();
+            }
+            if wp == 3 { snip::toggle_rec() } else { snip::open(ui::snip::Kind::Shot) }
+        }
         VOLKEY => {
             if wp == 2 { toggle_mute() } else { add_volume(if wp == 0 { 4 } else { -4 }) }
             KillTimer(hwnd, 2);
@@ -2481,6 +2493,15 @@ fn main() {
         }
         // `topbar --render-panel <file.png> tray|lang|tip ...`: one popup panel (or the hint over a button) next to the bar, into a PNG
         if let Some(i) = std::env::args().position(|a| a == "--render-panel") {
+            let rest = std::env::args().skip(i + 1).collect::<Vec<_>>();
+            if rest.get(1).is_some_and(|w| w == "shot-live") {
+                snip::smoke(&rest[..1]); // the real windows on a stage in the top left corner (snip.rs)
+                return;
+            }
+            if rest.get(1).is_some_and(|w| w.starts_with("shot") || w.starts_with("rec-")) {
+                snip::render(&rest); // the screenshot picker and the recording overlay (snip.rs)
+                return;
+            }
             render::render_panel(&std::env::args().skip(i + 1).collect::<Vec<_>>());
             return;
         }

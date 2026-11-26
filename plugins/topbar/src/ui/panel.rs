@@ -1437,7 +1437,7 @@ fn now() -> u64 {
     anim::now_ms()
 }
 
-pub(super) fn whwnd(h: HWND) -> windows::Win32::Foundation::HWND {
+pub(crate) fn whwnd(h: HWND) -> windows::Win32::Foundation::HWND {
     windows::Win32::Foundation::HWND(h.cast())
 }
 
@@ -1534,7 +1534,7 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
 }
 
 /// Registers a window class of this module (an arrow cursor for the one that takes the mouse).
-pub(super) fn register_class(hi: HINSTANCE, name: &[u16], proc: windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC, cursor: bool) {
+pub(crate) fn register_class(hi: HINSTANCE, name: &[u16], proc: windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC, cursor: bool) {
     // SAFETY: `name` is NUL-terminated and outlives the call; the class stores what it needs.
     unsafe {
         let wc = WNDCLASSW {

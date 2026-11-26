@@ -17,6 +17,9 @@ const BELL: &str = "M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15zM10 21h4";
 pub(crate) const LOCK: &str = "M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 0 1 7 0v3";
 pub(crate) const MOON: &str = "M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z";
 const CLOSE_BAR: &str = "M7 7l10 10M17 7L7 17";
+const SHOT: &str = "M8 4H4v4M16 4h4v4M8 20H4v-4M16 20h4v-4M12 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z";
+const REC: &str = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 15.4a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0 0 6.8z";
+const REC_STOP: &str = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM9.5 9.5h5v5h-5z";
 
 /// The rows of a bar menu (`ctx`: an empty spot of the bar, `clock`) and its width in DIPs.
 pub(crate) fn bar_menu_items(kind: &str) -> (Vec<Item>, f32) {
@@ -34,6 +37,12 @@ pub(crate) fn bar_menu_items(kind: &str) -> (Vec<Item>, f32) {
                 Item::new(PALETTE, t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização", zh: "个性化")),
                 Item::new(CHART, t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器")).keys(&["Ctrl", "Shift", "Esc"]).rule(),
                 Item::new(BROOM, t!("Чистильщик диска", "Disk Cleaner", ja: "ディスク クリーナー", pt: "Limpador de Disco", zh: "磁盘清理")),
+                Item::new(SHOT, t!("Скриншот", "Screenshot", ja: "スクリーンショット", pt: "Captura de tela", zh: "截图")).keys(&["Win", "Shift", "S"]).rule(),
+                if snip::recording() {
+                    Item::new(REC_STOP, t!("Остановить запись", "Stop recording", ja: "録画を停止", pt: "Parar gravação", zh: "停止录制")).keys(&["Win", "Shift", "R"]).danger()
+                } else {
+                    Item::new(REC, t!("Запись экрана", "Record screen", ja: "画面を録画", pt: "Gravar a tela", zh: "录制屏幕")).keys(&["Win", "Shift", "R"])
+                },
             ];
             if purge_installed() {
                 items.push(Item::new(BROOM, t!("Удалить мусор Windows (необратимо)", "Remove Windows junk (irreversible)", ja: "Windows の不要なものを削除 (元に戻せません)", pt: "Remover lixo do Windows (irreversível)", zh: "删除 Windows 垃圾文件（不可恢复）")).danger());
@@ -57,13 +66,15 @@ unsafe fn pick(kind: &str, i: usize) {
         }
         _ => {
             let pu = purge_installed();
-            let i = if pu && i == 4 { 99 } else { i };
+            let i = if pu && i == 6 { 99 } else { i };
             match i {
                 0 => open(&wide("ms-settings:")),
                 1 => open(&wide("ms-settings:personalization")),
                 // with rtaskmgr-win32 installed this is our task manager; a full path because explorer.exe does not search PATH
                 2 => open(&wide(&format!(r"{}\System32\taskmgr.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())))),
                 3 => open_cleaner(),
+                4 => snip::open(ui::snip::Kind::Shot),
+                5 => snip::toggle_rec(),
                 99 => open_purge(),
                 _ => _ = PostMessageW(FindWindowW(wide("topbar").as_ptr(), null()), WM_CLOSE, 0, 0), // quits the bar, brings the Windows taskbar back
             }
