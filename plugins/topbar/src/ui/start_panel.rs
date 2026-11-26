@@ -11,6 +11,7 @@ use winrust_common::style::{Side, pal};
 use super::anim::{EASE, SNAP, SPRING};
 use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba};
 use super::icons;
+use super::menu::Item;
 use super::panel::{Button, Content, Cx, Dir, Entry, Exit, Frame, Id, Inset, Look, Mods, Origin, Place, Pose, Shadow, Along};
 use crate::apps::{self, App, Recent};
 
@@ -590,28 +591,41 @@ fn open_str(what: &str) {
     unsafe { crate::open(&crate::wide(what)) };
 }
 
+const OPEN: &str = "M5 4l14 8-14 8z";
+const SHIELD: &str = "M12 3l7 3v5c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6z";
+const FOLDER: &str = "M3.5 7.5V18h17V9h-9l-2-2h-6z";
+const PIN: &str = "M9 4h6l-1 6 3 3H7l3-3zM12 13v7";
+
+/// Opens a menu next to the pointer along the bar, like a right click on the bar does.
+fn menu_at_pointer(items: Vec<Item>, width: f32, pick: impl Fn(usize) + 'static) {
+    // SAFETY: the cursor position and the bar's own anchor.
+    unsafe {
+        let at = crate::cursor();
+        if let Some(a) = crate::menus::anchor_at(if crate::vert() { at.1 } else { at.0 }) {
+            crate::menus::menu_at(items, width, a, pick);
+        }
+    }
+}
+
 /// The right-click menu of an app: open, open as administrator, show its folder, pin or unpin.
 fn app_menu(app: App) {
-    use crate::fly::{MItem, menu};
     let pinned = apps::start_pinned(&crate::wstr_of(&app.path));
     let file = apps::is_file(&app);
-    let mut items = vec![MItem::new(t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开"))];
+    let mut items = vec![Item::new(OPEN, t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开"))];
     let mut acts = vec![0];
     if file {
-        items.push(MItem::new(t!("Запуск от имени администратора", "Run as administrator", ja: "管理者として実行", pt: "Executar como administrador", zh: "以管理员身份运行")));
+        items.push(Item::new(SHIELD, t!("Запуск от имени администратора", "Run as administrator", ja: "管理者として実行", pt: "Executar como administrador", zh: "以管理员身份运行")));
         acts.push(1);
-        items.push(MItem::new(t!("Расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置")));
+        items.push(Item::new(FOLDER, t!("Расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置")));
         acts.push(2);
     }
-    items.push(MItem::new(if pinned {
+    items.push(Item::new(PIN, if pinned {
         t!("Убрать из Пуска", "Remove from Start", ja: "スタートから削除", pt: "Remover do Iniciar", zh: "从开始菜单移除")
     } else {
         t!("Добавить в Пуск", "Add to Start", ja: "スタートに追加", pt: "Adicionar ao Iniciar", zh: "添加到开始菜单")
     }));
     acts.push(3);
-    // SAFETY: the cursor position, for the menu to stand near it.
-    let at = unsafe { crate::cursor() };
-    menu(if crate::vert() { at.1 } else { at.0 }, None, items, move |i| match acts[i] {
+    menu_at_pointer(items, 288.0, move |i| match acts[i] {
         0 => apps::launch(&app),
         1 => apps::launch_admin(&app),
         2 => apps::reveal(&app),
@@ -621,16 +635,13 @@ fn app_menu(app: App) {
 
 /// The power button: lock, sleep, restart, shut down (the last two ask first).
 fn power_menu() {
-    use crate::fly::{MItem, menu};
     let items = vec![
-        MItem::new(t!("Блокировка", "Lock", ja: "ロック", pt: "Bloquear", zh: "锁定")),
-        MItem::new(t!("Сон", "Sleep", ja: "スリープ", pt: "Suspender", zh: "睡眠")),
-        MItem::new(t!("Перезагрузка", "Restart", ja: "再起動", pt: "Reiniciar", zh: "重启")),
-        MItem::new(t!("Завершение работы", "Shut down", ja: "シャットダウン", pt: "Desligar", zh: "关机")),
+        Item::new(crate::menus::LOCK, t!("Блокировка", "Lock", ja: "ロック", pt: "Bloquear", zh: "锁定")),
+        Item::new(crate::menus::MOON, t!("Сон", "Sleep", ja: "スリープ", pt: "Suspender", zh: "睡眠")),
+        Item::new(icons::RESTART, t!("Перезагрузка", "Restart", ja: "再起動", pt: "Reiniciar", zh: "重启")),
+        Item::new(icons::POWER, t!("Завершение работы", "Shut down", ja: "シャットダウン", pt: "Desligar", zh: "关机")),
     ];
-    // SAFETY: the cursor position, for the menu to stand near it.
-    let at = unsafe { crate::cursor() };
-    menu(if crate::vert() { at.1 } else { at.0 }, None, items, |i| match i {
+    menu_at_pointer(items, 288.0, |i| match i {
         0 => apps::lock(),
         1 => apps::sleep(),
         // SAFETY: the bar's own confirmation box.

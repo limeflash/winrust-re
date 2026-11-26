@@ -41,8 +41,10 @@ use winrust_common::style::{self, Anim, Side};
 
 use super::anim::{self, CubicBezier, EASE, POP, Transition};
 use super::gfx::{Canvas, Gfx, Picture, Rect, Rgba, Surface, Xf};
+use super::live::Thumbs;
 
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
+const WM_MOUSEACTIVATE: u32 = 0x0021;
 const VK_ESCAPE: u32 = 0x1B;
 const VK_RETURN: u32 = 0x0D;
 const VK_SPACE: u32 = 0x20;
@@ -71,6 +73,12 @@ pub enum Id {
     Preview,
     Power,
     Toast,
+    /// Task view: the whole screen under a scrim, the desktops and the windows.
+    Task,
+    /// The Alt+Tab switcher.
+    Switch,
+    /// A plain menu of the bar (right click on it, the clock, Win+X).
+    Menu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +126,8 @@ pub enum Along {
     /// The far corner of the screen: `gap` in from the left of a bottom bar, `gap` above the bottom of the screen beside a side
     /// bar (the bar settings panel, which keeps to the corner whichever page it shows).
     Corner,
+    /// The box's top left corner at these device pixels (a full-screen panel, a centred switcher).
+    Abs(i32, i32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +382,14 @@ impl Cx {
     pub fn run(&mut self, f: impl FnOnce() + 'static) {
         self.then = Some(Box::new(f));
     }
+
+    /// What a test does in place of the frame: runs the callback the click asked for.
+    #[cfg(test)]
+    pub fn run_for_test(self) {
+        if let Some(f) = self.then {
+            f();
+        }
+    }
 }
 
 /// Modifier keys held with a key.
@@ -393,6 +411,8 @@ pub struct Frame<'a> {
     pub press: Option<i32>,
     /// The box in DIPs.
     pub size: (f32, f32),
+    /// The panel's own opacity (its entry and exit fade), for a content that must follow it.
+    pub opacity: f32,
     mo: &'a mut Motion,
 }
 
@@ -547,6 +567,33 @@ pub trait Content {
     fn pulse(&self) -> u32 {
         0
     }
+    /// The panel takes the keyboard focus when it opens (and closes when it loses it). A panel that only shows something
+    /// under the pointer (the previews over an app button, the Alt+Tab switcher) must not.
+    fn activates(&self) -> bool {
+        true
+    }
+    /// The holes this content cut in the glass in its last `draw`: live window thumbnails are shown through them.
+    fn holes(&self) -> Vec<Hole> {
+        Vec::new()
+    }
+}
+
+/// A place where a live thumbnail of a window shows through the panel (DWM draws it in a window under the panel's own).
+#[derive(Clone, Copy, Debug)]
+pub struct Hole {
+    /// The window whose thumbnail it is.
+    pub win: isize,
+    /// In DIPs from the box's top left corner, with the item's own motion in it (the panel's pose is added by the frame).
+    pub rect: Rect,
+    pub opacity: f32,
+}
+
+/// A [`Hole`] on the screen, device pixels (left, top, right, bottom).
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenHole {
+    pub win: isize,
+    pub rect: (i32, i32, i32, i32),
+    pub opacity: u8,
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -611,6 +658,9 @@ pub struct Popup {
     scrim_done: bool,
     screen: (i32, i32),
     last: Shown,
+    /// The pose of the last frame and the point it scales around, for the holes.
+    posed: Option<(Pose, (f32, f32))>,
+    act: bool,
 }
 
 /// The pixels of a screen rectangle that may reach beyond the screen: the part on the screen comes from `grab`, the rest
@@ -652,6 +702,7 @@ impl Popup {
     ) -> Self {
         let s = g.scale();
         let (look, place) = (content.look(), content.place());
+        let act = content.activates();
         let (w, h) = content.size(g);
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
         let size = (bw as f32 / s, bh as f32 / s);
@@ -724,6 +775,8 @@ impl Popup {
             scrim_done: false,
             screen: anchor.screen,
             last: Shown::default(),
+            posed: None,
+            act,
         }
     }
 
@@ -735,6 +788,33 @@ impl Popup {
     #[must_use]
     pub const fn is_closing(&self) -> bool {
         self.closing.is_some()
+    }
+
+    /// The panel takes the focus.
+    #[must_use]
+    pub const fn activates(&self) -> bool {
+        self.act
+    }
+
+    /// Where the content's holes are on the screen now (after the panel's own motion).
+    #[must_use]
+    pub fn holes(&self) -> Vec<ScreenHole> {
+        let Some((p, (ox, oy))) = self.posed else { return Vec::new() };
+        let s = self.scale;
+        let map = |x: f32, y: f32| (self.at.0 as f32 + (ox + (x - ox) * p.k + p.dx) * s, self.at.1 as f32 + (oy + (y - oy) * p.k + p.dy) * s);
+        self.content
+            .holes()
+            .into_iter()
+            .map(|h| {
+                let (x0, y0) = map(h.rect.x, h.rect.y);
+                let (x1, y1) = map(h.rect.x + h.rect.w, h.rect.y + h.rect.h);
+                ScreenHole {
+                    win: h.win,
+                    rect: (x0.round() as i32, y0.round() as i32, x1.round() as i32, y1.round() as i32),
+                    opacity: (h.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+                }
+            })
+            .collect()
     }
 
     /// The box on the screen (left, top, width, height), device pixels.
@@ -1066,7 +1146,7 @@ impl Popup {
             if let Some((px, (cx, cy, cw, ch))) = cap.take() {
                 *glass = c.glass(&px, cw, ch, look.blur, look.saturate).map(|p| (p, cx, cy));
             }
-            let mut f = Frame { now, age, leaving, hover, press, size: (w, h), mo };
+            let mut f = Frame { now, age, leaving, hover, press, size: (w, h), opacity: pose.opacity, mo };
             let clip = pose.clip.map_or(Rect::new(m, m, w, h), |i| Rect::new(m + i.left, m + i.top, w - i.left - i.right, h - i.top - i.bottom));
             let radius = pose.clip.map_or(look.radius, |i| i.radius);
             let xf = Xf { cx: m + ox, cy: m + oy, k: pose.k, dx: pose.dx, dy: pose.dy };
@@ -1088,6 +1168,7 @@ impl Popup {
             });
         });
 
+        self.posed = Some((pose, (ox, oy)));
         let shadow_k = if pose.clip.is_some() { open } else { pose.opacity };
         let shown = Shown {
             win: self.win,
@@ -1121,6 +1202,9 @@ fn button_origin(a: &Anchor, at: (i32, i32), size: (f32, f32), s: f32) -> (f32, 
 
 /// The top left corner of a `size` px box next to its button.
 fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
+    if let Along::Abs(x, y) = p.along {
+        return (x, y);
+    }
     let gap = (p.gap * s).round() as i32;
     let (l, t, r, b) = a.button;
     let edge = (8.0 * s).round() as i32;
@@ -1130,6 +1214,7 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
         Along::End => hi - len,
         Along::ScreenEnd => screen - gap - len,
         Along::Corner => lo,
+        Along::Abs(..) => lo,
     };
     let middle = (a.screen.0 - w) / 2;
     match p.along {
@@ -1176,6 +1261,8 @@ struct Host {
     pulsing: u32,
     shown: (i32, i32, i32, i32, u8, u32),
     scrim_shown: u8,
+    /// The window under the panel that shows the live thumbnails of its holes.
+    thumbs: Thumbs,
 }
 
 /// The panel window, for the threads that ask for a repaint (a search that finished, an icon that arrived).
@@ -1220,13 +1307,29 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
     let name: Vec<u16> = "topbar_panel\0".encode_utf16().collect();
     let shade: Vec<u16> = "topbar_panel_shadow\0".encode_utf16().collect();
     let sheet: Vec<u16> = "topbar_panel_scrim\0".encode_utf16().collect();
+    let thumbs: Vec<u16> = "topbar_panel_thumbs\0".encode_utf16().collect();
     // SAFETY: class and window creation with live, NUL-terminated names.
-    let (panel, shadow, scrim) = unsafe {
+    let (panel, shadow, scrim, live) = unsafe {
         register_class(hi, &name, Some(proc), true);
         register_class(hi, &shade, Some(DefWindowProcW), false);
         register_class(hi, &sheet, Some(DefWindowProcW), false);
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+        register_class(hi, &thumbs, Some(DefWindowProcW), false);
         let panel = CreateWindowExW(ex, name.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null());
+        let live = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            thumbs.as_ptr(),
+            std::ptr::null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hi,
+            std::ptr::null(),
+        );
         let shadow = CreateWindowExW(
             ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
             shade.as_ptr(),
@@ -1260,9 +1363,9 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
         for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, 0x4A /* WM_COPYDATA */] {
             ChangeWindowMessageFilterEx(panel, m, MSGFLT_ALLOW, std::ptr::null_mut());
         }
-        (panel, shadow, scrim)
+        (panel, shadow, scrim, live)
     };
-    if panel.is_null() || shadow.is_null() || scrim.is_null() {
+    if panel.is_null() || shadow.is_null() || scrim.is_null() || live.is_null() {
         return false;
     }
     PANEL.store(panel as isize, Relaxed);
@@ -1281,6 +1384,7 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
         pulsing: 0,
         shown: (0, 0, 0, 0, 0, 0),
         scrim_shown: 0,
+        thumbs: Thumbs::new(live),
     }));
     true
 }
@@ -1314,26 +1418,24 @@ pub fn open(content: Box<dyn Content>, anchor: Anchor) {
         let mut grabber = |x, y, w, ht| if grab.grab(x, y, w, ht) { Some(grab.pixels().to_vec()) } else { None };
         let p = Popup::new(gfx, content, anchor, t, &mut grabber);
         let dims = p.has_scrim();
+        let act = p.activates();
         h.popup = Some(p);
         h.shown = (0, 0, 0, 0, 0, 0);
         h.scrim_shown = 0;
-        h.frame(t);
-        // SAFETY: z-order and focus of our own windows: shadow under the panel, the bar above both (under the scrim, which
-        // dims it with the rest of the screen).
+        h.frame_with(t, false);
+        // SAFETY: show our own windows without activating them; the panel takes the focus only when it wants the keyboard.
         unsafe {
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
             if dims {
-                SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
                 SetWindowPos(h.scrim, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
             }
             SetWindowPos(h.shadow, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
             SetWindowPos(h.panel, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
-            SetWindowPos(h.shadow, h.panel, 0, 0, 0, 0, flags);
-            if !dims {
-                SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
-            }
-            winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
         }
+        h.stack();
+        if act {            winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
+        }
+        h.live();
         (h.notify)();
     });
 }
@@ -1399,9 +1501,61 @@ pub fn any_open() -> bool {
     with(|h| h.popup.as_ref().is_some_and(|p| !p.is_closing())).unwrap_or(false)
 }
 
+/// The box of the open panel `id` on the screen (left, top, width, height), device pixels.
+#[must_use]
+pub fn rect_of(id: Id) -> Option<(i32, i32, i32, i32)> {
+    with(|h| h.popup.as_ref().filter(|p| p.id() == id && !p.is_closing()).map(Popup::rect)).flatten()
+}
+
+/// Closes the panel `id` if it is the one that is open.
+pub fn close_id(id: Id, animated: bool) {
+    if is_open(id) {
+        if animated { close() } else { close_now() }
+    }
+}
+
 impl Host {
     /// Paints a frame and puts it on screen.
     fn frame(&mut self, t: u64) {
+        self.frame_with(t, true);
+    }
+
+    /// The z-order of our windows, top to bottom: the panel, the thumbnails' window, the shadow, then the bar. A panel that dims
+    /// the screen puts the scrim over the bar (the bar is dimmed with the rest), under its own shadow.
+    fn stack(&self) {
+        let f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        let live = self.thumbs.visible().then_some(self.thumbs.host());
+        let dims = self.popup.as_ref().is_some_and(Popup::has_scrim);
+        // SAFETY: z-order of our own windows.
+        unsafe {
+            if dims {
+                SetWindowPos(self.bar, HWND_TOPMOST, 0, 0, 0, 0, f);
+                SetWindowPos(self.scrim, HWND_TOPMOST, 0, 0, 0, 0, f);
+            }
+            SetWindowPos(self.shadow, HWND_TOPMOST, 0, 0, 0, 0, f);
+            if let Some(l) = live {
+                SetWindowPos(l, HWND_TOPMOST, 0, 0, 0, 0, f);
+            }
+            SetWindowPos(self.panel, HWND_TOPMOST, 0, 0, 0, 0, f);
+            if let Some(l) = live {
+                SetWindowPos(l, self.panel, 0, 0, 0, 0, f);
+            }
+            SetWindowPos(self.shadow, live.unwrap_or(self.panel), 0, 0, 0, 0, f);
+            if !dims {
+                SetWindowPos(self.bar, HWND_TOPMOST, 0, 0, 0, 0, f);
+            }
+        }
+    }
+
+    /// Moves the live thumbnails to where the content's holes are now.
+    fn live(&mut self) {
+        let Some(p) = self.popup.as_ref() else { return };
+        if self.thumbs.update(&p.holes()) {
+            self.stack();
+        }
+    }
+
+    fn frame_with(&mut self, t: u64, live: bool) {
         let Some(p) = self.popup.as_mut() else { return };
         let shown = p.frame(&mut self.gfx, t);
         let (win, sh) = (shown.win, shown.shadow);
@@ -1419,6 +1573,9 @@ impl Host {
         }
         let _ = p.surfaces().0.present(whwnd(self.panel), win.0, win.1, 255);
         let done = shown.done;
+        if live && !done {
+            self.live();
+        }
         if done {
             self.hide();
         } else {
@@ -1459,6 +1616,7 @@ impl Host {
         let had = self.popup.take().is_some();
         self.timer(false);
         self.pulse(0);
+        self.thumbs.clear();
         // SAFETY: hiding our own windows.
         unsafe {
             ShowWindow(self.panel, SW_HIDE);
@@ -1503,6 +1661,8 @@ fn xy(lp: LPARAM) -> (i32, i32) {
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => return 1,
+        // a panel that only shows something (previews, the switcher) must not take the focus from the app under it
+        WM_MOUSEACTIVATE if with(|h| h.popup.as_ref().is_some_and(|p| !p.activates())).unwrap_or(false) => return 3, // MA_NOACTIVATE
         WM_MOUSEMOVE => {
             let (x, y) = xy(lp);
             // SAFETY: asks for WM_MOUSELEAVE.

@@ -128,6 +128,8 @@ pub(crate) unsafe fn render(args: &[String]) {
         cal: open == "clock",
         lang: open == "lang",
         tray: open == "tray",
+        task: open == "taskview",
+        jump: None,
         hidden: false,
     };
     bar.frame(&view, &still);
@@ -272,8 +274,9 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
     Some((p.next()??, p.next()??, p.next().flatten().unwrap_or(1)))
 }
 
-/// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|start|search|settings[:<page>]|toast [classic|floating|dock]
-/// [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>] [q=<text>] [page=<n>] [pins=<n>]
+/// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|start|search|settings[:<page>]|toast|jumplist|preview|taskview|
+/// switcher|menu [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]
+/// [q=<text>] [page=<n>] [pins=<n>] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
 ///
 /// `quick` and `wifi` also take the state of the mockup's fake machine: `on=<tiles, 0..8>` `vol=<n>` `muted` `bright=<n>`
 /// `batt=<n|none>` `charging` `media` `wifioff`, and for `wifi` `ask=<ssid>` (the password prompt) or `menu=<ssid>` (the context
@@ -289,7 +292,9 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
 /// `n` the number of tray icons, `real` the machine's own keyboard layouts instead of the three of the mockup, and for `tip`
 /// the element it hints at is `at` (an app button number, default 3). For `start` and `search`: `q` is what is typed, `page` the
 /// page of pinned apps, `pins` how many of the machine's apps stand for the pinned ones (the machine's own pins are whatever they
-/// are); the apps, the recent files and the account are the machine's.
+/// are); the apps, the recent files and the account are the machine's. `jumplist` and `preview` belong to app button `at`
+/// (`wins` windows, `recent` files in the jump list), `menu` is the bar's context menu (`kind=ctx`), the clock's or Win+X, and
+/// `taskview` shows `wins` windows on `desks` desktops; the live thumbnails are faked here (there is no window to show).
 pub(crate) unsafe fn render_panel(args: &[String]) {
     use ui::panel::{Anchor, Popup};
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -300,6 +305,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let mut dir_arg = "";
+    let (mut n_wins, mut recent, mut kind, mut n_desks) = (3usize, false, "ctx", 2usize);
     for a in args.iter().skip(2) {
         match a.split_once('=') {
             Some(("q", v)) => query = v.to_string(),
@@ -322,12 +328,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("hover", v)) => hover = v.parse().ok(),
             Some(("n", v)) => n_icons = v.parse().unwrap_or(6),
             Some(("at", v)) => at = v.parse().unwrap_or(3),
+            Some(("wins", v)) => n_wins = v.parse().unwrap_or(3),
+            Some(("desks", v)) => n_desks = v.parse().unwrap_or(2),
+            Some(("kind", v)) => kind = Box::leak(v.to_string().into_boxed_str()),
             _ => match a.as_str() {
                 "real" => real = true,
                 "tiled" => tiled = true,
                 "del" => del = true,
                 "hide" => hide = true,
                 "alignl" => alignl = true,
+                "recent" => recent = true,
                 "bottom" | "left" | "right" => side = Side::parse(a),
                 s => style = Style::parse(s),
             },
@@ -380,7 +390,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     };
     let lit = barui::Live {
         now: 100_000,
-        hot: if what == "tip" { at } else { NONE },
+        hot: if what == "tip" || what == "preview" { at } else { NONE },
         tray: what == "tray",
         lang: what == "lang",
         start: what == "start",
@@ -388,6 +398,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         gear: what.starts_with("settings"),
         qs: what == "quick" || what == "wifi",
         cal: what == "calendar",
+        task: what == "taskview",
+        jump: (what == "jumplist").then_some(at),
         ..Default::default()
     };
     bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
@@ -419,14 +431,18 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     blend(&mut canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha);
 
     let mut gfx = ui::gfx::Gfx::new(scale).expect("the renderer");
-    let key = match what.split(':').next().unwrap_or("") {
-        "lang" => LANG,
-        "tip" => at,
-        "quick" | "wifi" => WIFI_I,
-        "calendar" => CLOCK,
-        "start" => 0,
-        "search" => SEARCH,
-        "settings" | "toast" => GEAR,
+    let key = match (what.split(':').next().unwrap_or(""), kind) {
+        ("lang", _) => LANG,
+        ("tip" | "jumplist" | "preview", _) => at,
+        ("taskview" | "switcher", _) => TASKVIEW,
+        ("menu", "clock") => CLOCK,
+        ("menu", "winx") => 0,
+        ("menu", _) => at,
+        ("quick" | "wifi", _) => WIFI_I,
+        ("calendar", _) => CLOCK,
+        ("start", _) => 0,
+        ("search", _) => SEARCH,
+        ("settings" | "toast", _) => GEAR,
         _ => TAPP,
     };
     let r = bar.screen_rect(key).unwrap_or((0, 0, 0, 0));
@@ -480,7 +496,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 };
                 Box::new(ui::search_panel::SearchPanel::with_query(900.0, &query, files, recent))
             }
-                } else if what.starts_with("settings") {
+        } else if what.starts_with("settings") {
             use ui::settings_panel::{Info, Page, SettingsPanel, System, Upd};
             let page = what.split_once(':').and_then(|(_, p)| Page::parse(p)).unwrap_or(Page::Main);
             let themes: Vec<_> = (0..tpl)
@@ -506,6 +522,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             };
             panel.show(open_row, state, tiled, del, match dir_arg { "fwd" => Some(true), "bwd" => Some(false), _ => None });
             Box::new(panel)
+        } else if what == "jumplist" {
+            demo_jump(side, n_wins, recent, &icon, at)
+        } else if what == "preview" {
+            demo_preview(n_wins, &icon, at)
+        } else if what == "taskview" {
+            demo_taskview(scale, (sw, sh), n_wins, n_desks, &icon)
+        } else if what == "switcher" {
+            demo_switcher(scale, (sw, sh), n_wins, &icon)
+        } else if what == "menu" {
+            demo_menu(kind, side, (sh as f32 / scale) - 130.0)
         } else if what == "lang" {
             let items = if real {
                 layout_rows()
@@ -541,12 +567,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         popup.set_hover(hover);
         let _ = popup.frame(&mut gfx, 0); // the first frame stamps what opens with the panel (the rising blocks of the first page)
         let shown = popup.frame(&mut gfx, t);
+        for (i, h) in popup.holes().iter().enumerate() {
+            fake_window(&mut canvas, (sw, sh), h.rect, i);
+        }
         let (panel, shade) = popup.surfaces();
         if let Some((r, a)) = shown.scrim {
             blend(&mut canvas, (sw, sh), popup.scrim_surface().pixels(), r.2, (r.0, r.1), a);
         }
         blend(&mut canvas, (sw, sh), shade.pixels(), shown.shadow.2, (shown.shadow.0, shown.shadow.1), shown.shadow_alpha);
         blend(&mut canvas, (sw, sh), panel.pixels(), shown.win.2, (shown.win.0, shown.win.1), 255);
+        blend(&mut canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha); // the bar stands above every panel
         if let Some((text, along, top)) = popup.tip() {
             let mut tip = ui::tip::Tip::new(scale, (sw, sh));
             let place = ui::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * scale).round() as i32 };
@@ -565,4 +595,258 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     if gfx.save_png(file, w as u32, h as u32, &out).is_err() {
         let _ = std::fs::write(format!("{file}.err.txt"), "could not write the png");
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// what the panels of the mockup hold, for `--render-panel`
+
+type Hi = windows::Win32::UI::WindowsAndMessaging::HICON;
+
+const DEMO_EXES: [&str; 3] = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Windows\explorer.exe", r"C:\Windows\System32\notepad.exe"];
+
+fn demo_icon(icon: &dyn Fn(&str) -> Hi, i: usize) -> Hi {
+    let ic = icon(DEMO_EXES[i % 3]);
+    if ic.0.is_null() { icon(r"C:\Windows\System32\notepad.exe") } else { ic }
+}
+
+fn demo_jump(side: Side, n_wins: usize, recent: bool, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui::panel::Content> {
+    use ui::jump::{Act, Data, JumpPanel, Recent, Win};
+    let titles = ["Lemxy/WinRust \u{b7} GitHub", "heydamir/unslop \u{b7} GitHub", "New Tab"];
+    let wins: Vec<Win> = (0..n_wins.min(3)).map(|i| Win { hwnd: i as isize + 1, title: titles[i].into(), active: i == 0 }).collect();
+    let running = !wins.is_empty();
+    let name = ["Claude", "File manager", "Microsoft Edge", "Spotify", "Task Manager", "Outlook", "Discord", "Telegram"][(at.max(1) as usize - 1) % 8];
+    let meta = if running { format!("Pinned \u{b7} {} window{}", wins.len(), if wins.len() == 1 { "" } else { "s" }) } else { "Pinned \u{b7} not running".into() };
+    let act = |icon: &'static str, label: &str| Act { icon, label: label.into() };
+    let acts = vec![
+        act("M4 5h16v14H4zM12 9v6M9 12h6", "New window"),
+        act("M12 17v5M9 4h6l-1 5 3 3v2H7v-2l3-3zM3 3l18 18", "Unpin from the bar"),
+        act("M15 6l-6 6 6 6", "Move left"),
+        act("M9 6l6 6-6 6", "Move right"),
+        act("M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM14 16.5h6", "Remove from Start"),
+    ];
+    let recent = if recent {
+        vec![Recent { name: "WinRust".into(), folder: true }, Recent { name: "README.md".into(), folder: false }, Recent { name: "Plan 2027.docx".into(), folder: false }]
+    } else {
+        Vec::new()
+    };
+    let d = Data {
+        icon: demo_icon(icon, 0),
+        name: name.into(),
+        meta,
+        running,
+        wins,
+        recent,
+        acts,
+        close: running.then(|| if n_wins > 1 { "Close all windows".to_string() } else { "Close window".to_string() }),
+        kill: running.then(|| "End process".to_string()),
+    };
+    Box::new(JumpPanel::new(d, side, |_| {}))
+}
+
+fn demo_preview(n_wins: usize, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui::panel::Content> {
+    use ui::preview::{Card, PreviewPanel};
+    let titles = ["Lemxy/WinRust \u{b7} GitHub", "heydamir/unslop \u{b7} GitHub", "New Tab"];
+    let cards: Vec<Card> = (0..n_wins.min(3)).map(|i| Card { hwnd: i as isize + 1, title: titles[i].into(), src: (1280, 720 + 80 * i as i32), minimized: false, current: i == 0 }).collect();
+    let color = APPS[(at.max(1) as usize - 1) % 8].1;
+    Box::new(PreviewPanel::new(cards, demo_icon(icon, 0), ui::gfx::Rgba::hex(color), false, |_| {}))
+}
+
+fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
+    use std::rc::Rc;
+    use ui::taskview::{Desk, OwnedIcon, TaskView, WinCard};
+    let fr = |l: f32, t: f32, w: f32, h: f32| ((l * scale) as i32, (t * scale) as i32, ((l + w) * scale) as i32, ((t + h) * scale) as i32);
+    let frames = [fr(300.0, 120.0, 850.0, 560.0), fr(520.0, 200.0, 760.0, 300.0), fr(80.0, 90.0, 640.0, 420.0), fr(700.0, 60.0, 600.0, 400.0)];
+    let titles = ["File manager", "Task Manager", "Lemxy/WinRust \u{b7} GitHub", "Notepad"];
+    let cards: Vec<WinCard> = (0..n_wins.min(4))
+        .map(|i| WinCard { hwnd: i as isize + 1, title: titles[i].into(), icon: Rc::new(OwnedIcon(demo_icon(icon, i + 1))), frame: frames[i], minimized: false })
+        .collect();
+    let on_first = [(0.2, 0.13, 0.59, 0.62), (0.36, 0.22, 0.52, 0.33)];
+    let desks: Vec<Desk> = (0..n_desks)
+        .map(|i| Desk { name: format!("Desktop {}", i + 1), current: i == 0, wallpaper: r"C:\Windows\Web\Wallpaper\Windows\img19.jpg".into(), wins: if i == 0 { on_first.to_vec() } else { Vec::new() } })
+        .collect();
+    Box::new(TaskView::new(scale, screen, desks, n_desks < 4, cards, false, |_| {}))
+}
+
+fn demo_switcher(scale: f32, screen: (i32, i32), n_wins: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
+    use std::rc::Rc;
+    use ui::taskview::{OwnedIcon, Switch, Switcher, WinCard};
+    let fr = |l: f32, t: f32, w: f32, h: f32| ((l * scale) as i32, (t * scale) as i32, ((l + w) * scale) as i32, ((t + h) * scale) as i32);
+    let frames = [fr(300.0, 120.0, 850.0, 560.0), fr(520.0, 200.0, 760.0, 300.0), fr(80.0, 90.0, 640.0, 420.0), fr(700.0, 60.0, 600.0, 400.0)];
+    let titles = ["File manager", "Task Manager", "Lemxy/WinRust \u{b7} GitHub", "Notepad"];
+    let cards: Vec<WinCard> = (0..n_wins)
+        .map(|i| WinCard { hwnd: i as isize + 1, title: titles[i % 4].into(), icon: Rc::new(OwnedIcon(demo_icon(icon, i + 1))), frame: frames[i % 4], minimized: i == 3 })
+        .collect();
+    Box::new(Switcher::new(scale, (0, 0, screen.0, screen.1), cards, Switch { selected: || 1, point: |_| {}, pick: |_| {} }))
+}
+
+fn demo_menu(kind: &str, side: Side, max_h: f32) -> Box<dyn ui::panel::Content> {
+    let (items, w) = menus::bar_menu_items(kind);
+    Box::new(ui::menu::MenuPanel::new(items, w, max_h, side, |_| {}))
+}
+
+/// Something that looks like a window where a live thumbnail would be: a title bar, a tab, a few lines.
+fn fake_window(canvas: &mut [u32], (sw, sh): (i32, i32), r: (i32, i32, i32, i32), seed: usize) {
+    let (w, h) = (r.2 - r.0, r.3 - r.1);
+    let hero = [0xff3a5f8a_u32, 0xff8a4a3a, 0xff3a8a5f][seed % 3];
+    for y in 0..h {
+        for x in 0..w {
+            let (px, py) = (r.0 + x, r.1 + y);
+            if px < 0 || py < 0 || px >= sw || py >= sh {
+                continue;
+            }
+            let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+            let line = (0.3..0.4).contains(&fy) && (0.58..0.94).contains(&fx) || (0.45..0.52).contains(&fy) && (0.58..0.84).contains(&fx) || (0.7..0.76).contains(&fy) && (0.06..0.9).contains(&fx);
+            let c = if fy < 0.1 {
+                0xff26272f
+            } else if (0.12..0.2).contains(&fy) && (0.05..0.95).contains(&fx) {
+                0xff32343c
+            } else if (0.3..0.6).contains(&fy) && (0.06..0.5).contains(&fx) {
+                hero
+            } else if line {
+                0xff3a3c46
+            } else {
+                0xff1d1e24
+            };
+            canvas[(py * sw + px) as usize] = c;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// `topbar --render-thumbs <file.png>`: does `DwmRegisterThumbnail` draw into the windows the panels are made of? Creates a
+/// source window (left half red, right half blue), then tries three ways to show its thumbnail and looks at the screen:
+/// A) registered on a layered window painted with `UpdateLayeredWindow` (what a panel is); B) registered on a plain window
+/// under that layered one, which has a hole over the thumbnail (what `ui::live` does); C) on a layered window set up with
+/// `SetLayeredWindowAttributes` (what the old flyouts were). Prints the colours found to `<file.png>.txt`. The windows are on
+/// the screen for about a second and never take the focus.
+pub(crate) unsafe fn render_thumbs(args: &[String]) {
+    use ui::gfx::{Gfx, Rect, Rgba, Surface};
+    use windows_sys::Win32::Graphics::Dwm::{DWM_THUMBNAIL_PROPERTIES, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE, DwmFlush, DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties};
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    SetProcessDPIAware();
+    let Some(file) = args.first() else { return };
+    let hi = GetModuleHandleW(null());
+    unsafe extern "system" fn gray_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if m == WM_PAINT {
+            let mut ps: PAINTSTRUCT = zeroed();
+            let dc = BeginPaint(h, &mut ps);
+            let mut r: RECT = zeroed();
+            GetClientRect(h, &mut r);
+            let b = CreateSolidBrush(0x0040_4040);
+            FillRect(dc, &r, b);
+            DeleteObject(b);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        DefWindowProcW(h, m, w, l)
+    }
+    unsafe extern "system" fn src_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if m == WM_PAINT {
+            let mut ps: PAINTSTRUCT = zeroed();
+            let dc = BeginPaint(h, &mut ps);
+            let mut r: RECT = zeroed();
+            GetClientRect(h, &mut r);
+            let (red, blue) = (CreateSolidBrush(0x0000_00FF), CreateSolidBrush(0x00FF_0000));
+            FillRect(dc, &RECT { left: 0, top: 0, right: r.right / 2, bottom: r.bottom }, red);
+            FillRect(dc, &RECT { left: r.right / 2, top: 0, right: r.right, bottom: r.bottom }, blue);
+            DeleteObject(red);
+            DeleteObject(blue);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        DefWindowProcW(h, m, w, l)
+    }
+    let class = |name: &str, p: WNDPROC| {
+        let n = wide(name);
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: p, hInstance: hi, lpszClassName: n.as_ptr(), ..zeroed() });
+        n
+    };
+    let (src_c, gray_c) = (class("topbar_probe_src", Some(src_proc)), class("topbar_probe_gray", Some(gray_proc)));
+    let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+    let make = |c: &[u16], ex: u32, x: i32, y: i32, w: i32, h: i32| CreateWindowExW(ex, c.as_ptr(), null(), WS_POPUP | WS_VISIBLE, x, y, w, h, null_mut(), null_mut(), hi, null());
+    let pump = |ms: u32| {
+        let end = GetTickCount64() + u64::from(ms);
+        let mut m: MSG = zeroed();
+        while GetTickCount64() < end {
+            while PeekMessageW(&mut m, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        DwmFlush();
+    };
+    let src = make(&src_c, ex, 40, 40, 300, 200);
+    pump(200);
+    let (px, py, pw, ph) = (500, 300, 400, 300);
+    let rect = RECT { left: 50, top: 50, right: 350, bottom: 250 };
+    let props = DWM_THUMBNAIL_PROPERTIES { dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE, rcDestination: rect, rcSource: zeroed(), opacity: 255, fVisible: 1, fSourceClientAreaOnly: 0 };
+    let mut gfx = Gfx::new(1.0).expect("the renderer");
+    let mut grab = Surface::new();
+    let mut report = String::new();
+    // what colour the screen shows at three places of the probe area: left of the thumbnail, right of it, in the glass
+    let look = |g: &mut Surface| -> (u32, u32, u32) {
+        g.grab(px, py, pw, ph);
+        let p = g.pixels();
+        let at = |x: i32, y: i32| p[(y * pw + x) as usize] & 0x00ff_ffff;
+        (at(130, 150), at(270, 150), at(20, 20))
+    };
+    let tint = |gfx: &mut Gfx, s: &mut Surface, a: f32, hole: bool| {
+        let _ = gfx.paint(s, pw, ph, |c| {
+            c.fill(Rect::new(0.0, 0.0, pw as f32, ph as f32), 20.0, Rgba::css(16, 17, 24, a));
+            if hole {
+                c.erase(Rect::new(50.0, 50.0, 300.0, 200.0), 12.0);
+                c.fill(Rect::new(50.0, 50.0, 300.0, 200.0), 12.0, Rgba::new(0.0, 0.0, 0.0, 1.0 / 255.0));
+            }
+        });
+    };
+
+    // A: a layered window with per-pixel alpha, the thumbnail on it
+    let l = make(&gray_c, ex | WS_EX_LAYERED, px, py, pw, ph);
+    let mut surf = Surface::new();
+    tint(&mut gfx, &mut surf, 0.3, false);
+    surf.present(whwnd(l), px, py, 255);
+    let mut id = 0isize;
+    let r = DwmRegisterThumbnail(l, src, &mut id);
+    DwmUpdateThumbnailProperties(id, &props);
+    pump(500);
+    let (a, b, c) = look(&mut grab);
+    report += &format!("A UpdateLayeredWindow, thumbnail on it: register={r} left={a:06x} right={b:06x} corner={c:06x}\n");
+    DwmUnregisterThumbnail(id);
+    DestroyWindow(l);
+
+    // B: a plain window under a layered one with a hole
+    let h = make(&gray_c, ex, px, py, pw, ph);
+    let mut id = 0isize;
+    let r = DwmRegisterThumbnail(h, src, &mut id);
+    DwmUpdateThumbnailProperties(id, &props);
+    let l = make(&gray_c, ex | WS_EX_LAYERED, px, py, pw, ph);
+    tint(&mut gfx, &mut surf, 0.82, true);
+    surf.present(whwnd(l), px, py, 255);
+    SetWindowPos(h, l, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); // under it
+    pump(500);
+    let (a, b, c) = look(&mut grab);
+    let top = WindowFromPoint(POINT { x: px + 130, y: py + 150 });
+    let glass = WindowFromPoint(POINT { x: px + 20, y: py + 20 });
+    let which = |w: HWND| if w == l { "layered" } else if w == h { "plain" } else { "other" };
+    report += &format!("B plain window under a layered one with a hole: register={r} left={a:06x} right={b:06x} corner={c:06x} pointer in the hole: {} in the glass: {}\n", which(top), which(glass));
+    let _ = gfx.save_png(file, pw as u32, ph as u32, grab.pixels());
+    DwmUnregisterThumbnail(id);
+    DestroyWindow(l);
+    DestroyWindow(h);
+
+    // C: a layered window with a constant alpha (the old flyouts)
+    let l = make(&gray_c, ex | WS_EX_LAYERED, px, py, pw, ph);
+    SetLayeredWindowAttributes(l, 0, 255, LWA_ALPHA);
+    let mut id = 0isize;
+    let r = DwmRegisterThumbnail(l, src, &mut id);
+    DwmUpdateThumbnailProperties(id, &props);
+    pump(500);
+    let (a, b, c) = look(&mut grab);
+    report += &format!("C SetLayeredWindowAttributes, thumbnail on it: register={r} left={a:06x} right={b:06x} corner={c:06x}\n");
+    DwmUnregisterThumbnail(id);
+    DestroyWindow(l);
+    DestroyWindow(src);
+    let _ = std::fs::write(format!("{file}.txt"), report);
 }
