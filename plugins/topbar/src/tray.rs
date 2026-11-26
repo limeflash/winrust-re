@@ -86,6 +86,58 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
     });
 }
 
+/// A Shell_NotifyIconGetRect request (WM_COPYDATA, dwData 3): the icon asked about and which corner of its rectangle.
+#[derive(Debug, PartialEq)]
+pub(crate) struct IconQuery {
+    /// 1 = top left corner, 2 = bottom right corner.
+    corner: u32,
+    hwnd: HWND,
+    uid: u32,
+    guid: [u8; 16],
+}
+
+/// The request Windows sends (32-bit handles for every app): u32 signature 0x34753423, u32 corner, u32 cbSize, u32 padding,
+/// u32 hWnd@16, u32 uID@20, GUID@24. None for anything else.
+pub(crate) fn parse_icon_query(d: &[u8]) -> Option<IconQuery> {
+    let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    if d.len() < 40 || u(0) != 0x3475_3423 || !matches!(u(4), 1 | 2) {
+        return None;
+    }
+    Some(IconQuery { corner: u(4), hwnd: u(16) as i32 as isize as HWND, uid: u(20), guid: d[24..40].try_into().unwrap() })
+}
+
+/// left, top, right, bottom in screen pixels.
+type ScreenRect = (i32, i32, i32, i32);
+
+thread_local! {
+    /// The icon of the hidden icons panel clicked last, and its cell on the screen: where `Shell_NotifyIconGetRect` puts it.
+    static PANEL_CLICK: Cell<(usize, u32, ScreenRect)> = const { Cell::new((0, 0, (0, 0, 0, 0))) };
+}
+
+/// Where the icon of the query is on the screen (left, top, right, bottom): its button on the bar, its cell in the panel that
+/// was clicked last, else the arrow that opens the panel. None if no such icon is known.
+unsafe fn icon_rect(q: &IconQuery) -> Option<(i32, i32, i32, i32)> {
+    let (i, hwnd, uid) = TAPPS.with_borrow(|t| {
+        let by_guid = q.guid != [0; 16];
+        let i = t.iter().position(|x| if by_guid { x.guid == q.guid } else { x.hwnd == q.hwnd && x.uid == q.uid })?;
+        Some((i, t[i].hwnd, t[i].uid))
+    })?;
+    let key = match bar_idx().iter().position(|&b| b == i) {
+        Some(slot) => TAPP + slot as i32 + 1, // the same key click() works out for the button
+        None => match PANEL_CLICK.get() {
+            (h, u, r) if h == hwnd as usize && u == uid => return Some(r),
+            _ => TAPP,
+        },
+    };
+    anchor(key).map(|a| a.button)
+}
+
+/// The answer to a request for one corner: MAKELONG(x, y) in screen pixels.
+fn rect_reply(corner: u32, r: (i32, i32, i32, i32)) -> LRESULT {
+    let (x, y) = if corner == 1 { (r.0, r.1) } else { (r.2, r.3) };
+    ((x as i16 as u16 as u32) | (y as i16 as u16 as u32) << 16) as LRESULT
+}
+
 /// What ITaskbarList asks of the task band, applied to `skip`: DeleteTab (HSHELL_WINDOWDESTROYED for a window that lives
 /// on) takes the window's button away, AddTab (HSHELL_WINDOWCREATED) gives it back. Closed windows are forgotten.
 /// true = the window's button comes or goes.
@@ -117,6 +169,14 @@ pub(crate) unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM,
         if c.dw == 1 && c.cb >= 964 {
             tray_msg(std::slice::from_raw_parts(c.p, c.cb as usize));
             return 1;
+        }
+        if c.dw == 3 && c.cb >= 40 {
+            // Shell_NotifyIconGetRect: apps (Tauri tray-icon, Epic Games Launcher) ask where an icon is before they open a menu
+            if let Some(q) = parse_icon_query(std::slice::from_raw_parts(c.p, c.cb as usize))
+                && let Some(r) = icon_rect(&q)
+            {
+                return rect_reply(q.corner, r);
+            }
         }
         // SHAppBarMessage (our own bar's work-area reservation, ABM_SETSTATE...) also goes to "Shell_TrayWnd": hand it to explorer's
         // with a timeout: a hung explorer must not freeze the bar
@@ -195,6 +255,27 @@ pub(crate) fn toggle_shown(key: &str) {
 mod tests {
     use super::*;
 
+    fn query(sig: u32, corner: u32) -> Vec<u8> {
+        let mut d = [sig, corner, 40, 0, 0x1234, 7].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        d.extend(0..16u8); // the GUID
+        d
+    }
+
+    #[test]
+    fn get_rect_request_is_parsed_and_answered() {
+        for corner in [1, 2] {
+            let q = parse_icon_query(&query(0x3475_3423, corner)).unwrap();
+            assert_eq!((q.corner, q.hwnd as usize, q.uid, q.guid[15]), (corner, 0x1234, 7, 15));
+        }
+        assert_eq!(parse_icon_query(&query(0x1111_1111, 1)), None, "somebody else's signature");
+        assert_eq!(parse_icon_query(&query(0x3475_3423, 3)), None, "an unknown corner");
+        assert_eq!(parse_icon_query(&query(0x3475_3423, 1)[..39]), None, "too short");
+        // MAKELONG(x, y), negative coordinates (a monitor on the left) keep their 16 bits
+        assert_eq!(rect_reply(1, (100, 200, 300, 400)), 100 | 200 << 16);
+        assert_eq!(rect_reply(2, (100, 200, 300, 400)), 300 | 400 << 16);
+        assert_eq!(rect_reply(1, (-5, 2, 0, 0)), 0xfffb | 2 << 16);
+    }
+
     #[test]
     fn delete_tab_hides_and_add_tab_brings_back() {
         let (a, b, gone) = (1 as HWND, 2 as HWND, 3 as HWND);
@@ -227,11 +308,12 @@ fn panel_cells() -> Vec<ui::tray_popup::Cell> {
     })
 }
 
-/// A click on an icon of the panel: left and right go to its program, middle moves it onto the bar.
-fn panel_click(token: usize, b: ui::panel::Button) {
+/// A click on an icon of the panel (`cell`: its rectangle on the screen): left and right go to its program, middle moves it onto the bar.
+fn panel_click(token: usize, b: ui::panel::Button, cell: (i32, i32, i32, i32)) {
     use ui::panel::Button;
     let icon = TAPPS.with_borrow(|t| t.get(token).map(|x| ((x.hwnd, x.uid, x.cb, x.ver), x.key.clone())));
     let Some((t, key)) = icon else { return };
+    PANEL_CLICK.set((t.0 as usize, t.1, cell)); // before the click: the program asks where the icon is as it opens its menu
     // SAFETY: posts the click to the program's own window.
     unsafe {
         match b {

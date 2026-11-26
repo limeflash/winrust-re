@@ -305,6 +305,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let mut dir_arg = "";
+    let (mut click, mut after, mut busy) = (None::<i32>, 0u64, false);
     let (mut n_wins, mut recent, mut kind, mut n_desks) = (3usize, false, "ctx", 2usize);
     for a in args.iter().skip(2) {
         match a.split_once('=') {
@@ -326,6 +327,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("accent", v)) => accent = Box::leak(v.to_string().into_boxed_str()),
             Some(("dir", v)) => dir_arg = Box::leak(v.to_string().into_boxed_str()),
             Some(("hover", v)) => hover = v.parse().ok(),
+            Some(("click", v)) => click = v.parse().ok(),
+            Some(("after", v)) => after = v.parse().unwrap_or(0),
             Some(("n", v)) => n_icons = v.parse().unwrap_or(6),
             Some(("at", v)) => at = v.parse().unwrap_or(3),
             Some(("wins", v)) => n_wins = v.parse().unwrap_or(3),
@@ -333,6 +336,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("kind", v)) => kind = Box::leak(v.to_string().into_boxed_str()),
             _ => match a.as_str() {
                 "real" => real = true,
+                "busy" => busy = true,
                 "tiled" => tiled = true,
                 "del" => del = true,
                 "hide" => hide = true,
@@ -421,6 +425,12 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             lit(900.0, 600.0, 120.0, 40.0, [240.0, 240.0, 245.0]);
             lit(1060.0, 640.0, 140.0, 120.0, [232.0, 112.0, 90.0]);
             lit(700.0, 500.0, 160.0, 160.0, [60.0, 190.0, 120.0]);
+            if busy {
+                // text-like stripes everywhere: what a panel with a hole in its glass would show through it
+                if (y as i32 % 6) < 2 && (x as i32 % 23) < 15 {
+                    c = [235.0, 235.0, 240.0];
+                }
+            }
             0xff00_0000 | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32
         })
         .collect();
@@ -512,6 +522,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 version: "0.5.9".into(),
                 auto: || Some(true),
                 act: |_| {},
+                wallpaper: || r"C:\Windows\Web\Wallpaper\Windows\img19.jpg".into(),
                 system: || System { shell: false, tray: None, search_key: true, taskmgr_key: true, clipboard: true, wsearch_off: Some(true), taskbar_hidden: true },
             };
             let mut panel = SettingsPanel::new(info, themes, page);
@@ -561,7 +572,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             DEMO.with_borrow_mut(|d| {
                 *d = (0..n_icons).map(|i| ui::tray_popup::Cell { icon: icon(exes[i % exes.len()]), tip: format!("Icon {}", i + 1), token: i }).collect();
             });
-            Box::new(ui::tray_popup::TrayPanel::new(demo_cells, |_, _| {}))
+            Box::new(ui::tray_popup::TrayPanel::new(demo_cells, |_, _, _| {}))
         };
         let snap = canvas.clone();
         let mut grab = |x: i32, y: i32, w: i32, h: i32| {
@@ -570,7 +581,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         let mut popup = Popup::new(&mut gfx, content, anchor, 0, &mut grab);
         popup.set_hover(hover);
         let _ = popup.frame(&mut gfx, 0); // the first frame stamps what opens with the panel (the rising blocks of the first page)
-        let shown = popup.frame(&mut gfx, t);
+        if let Some(id) = click {
+            // the panel at rest, a click on item `id`, then the frame `after` ms later (the ones in between run as the live timer does)
+            let _ = popup.frame(&mut gfx, t);
+            let _ = popup.click_id(id); // what it asks of the bar (a repaint, a toast) is not done here
+            for ms in (0..after).step_by(16) {
+                let _ = popup.frame(&mut gfx, t + ms);
+            }
+        }
+        let shown = popup.frame(&mut gfx, t + after);
         for (i, h) in popup.holes().iter().enumerate() {
             fake_window(&mut canvas, (sw, sh), h.rect, i);
         }

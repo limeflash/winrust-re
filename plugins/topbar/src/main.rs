@@ -135,6 +135,7 @@ const WIN_X: u32 = WM_APP + 17; // posted by the keyboard hook: Win+X = our powe
 const NEXT_LANG: u32 = WM_APP + 16; // posted by the keyboard hook: Win+Space with no explorer (wp 1 = Shift held: previous layout)
 const VOLKEY: u32 = WM_APP + 14; // posted by the keyboard hook: a volume key (wp 0 up, 1 down, 2 mute)
 const WIN_V: u32 = WM_APP + 18; // posted by the keyboard hook: Win+V with no explorer (our clipboard history, #171)
+const ALT_SPACE: u32 = WM_APP + 19; // posted by the keyboard hook: Alt+Space = our search panel (not rs-launcher's card)
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
 
@@ -609,11 +610,53 @@ unsafe fn item_icon(path: &str, px: i32) -> HICON {
     let Ok(f) = item.cast::<IShellItemImageFactory>() else { return null_mut() };
     let Ok(bmp) = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_ICONONLY) else { return null_mut() };
     let color = bmp.0 as HBITMAP;
+    if !bitmap_has_alpha(color) {
+        DeleteObject(color);
+        return sysimage_icon(path);
+    }
     let mask = CreateBitmap(px, px, 1, 1, null()); // ignored: the 32-bit colour bitmap carries the alpha
     let mut ii = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
     let ic = CreateIconIndirect(&mut ii);
     DeleteObject(mask);
     DeleteObject(color);
+    ic
+}
+
+/// Whether a 32-bit bitmap from `IShellItemImageFactory` carries any alpha. Old icons keep their transparency only in the AND
+/// mask, which the factory drops: every alpha byte is 0, and an icon built from such a bitmap would be opaque with a black
+/// background. (A bitmap that cannot be read counts as having alpha: nothing better to do with it.)
+unsafe fn bitmap_has_alpha(bmp: HBITMAP) -> bool {
+    let mut bm: BITMAP = zeroed();
+    if GetObjectW(bmp, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+        return true;
+    }
+    let (w, h) = (bm.bmWidth, bm.bmHeight);
+    let mut px = vec![0u32; (w * h) as usize];
+    let mut bi: BITMAPINFO = zeroed();
+    bi.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB, ..zeroed() };
+    let dc = GetDC(null_mut());
+    let rows = GetDIBits(dc, bmp, 0, h as u32, px.as_mut_ptr().cast(), &mut bi, DIB_RGB_COLORS);
+    ReleaseDC(null_mut(), dc);
+    rows == 0 || px.iter().any(|p| p >> 24 != 0)
+}
+
+/// The icon of `path` from the system image list (48 px, `SHIL_EXTRALARGE`), where the mask of an old icon is kept and
+/// `ILD_TRANSPARENT` turns it into real transparency. Used when the shell item's bitmap has no alpha at all. Null if there is none.
+unsafe fn sysimage_icon(path: &str) -> HICON {
+    use windows_sys::{Win32::UI::Controls::{HIMAGELIST, ILD_TRANSPARENT, ImageList_GetIcon}, core::GUID};
+    let mut sfi: SHFILEINFOW = zeroed();
+    if SHGetFileInfoW(wide(path).as_ptr(), 0, &mut sfi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX) == 0 {
+        return null_mut();
+    }
+    const IID_IIMAGELIST: GUID = GUID { data1: 0x46EB5926, data2: 0x582E, data3: 0x4017, data4: [0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x50] };
+    let mut list: *mut core::ffi::c_void = null_mut();
+    if SHGetImageList(SHIL_EXTRALARGE as i32, &IID_IIMAGELIST, &mut list) < 0 || list.is_null() {
+        return null_mut();
+    }
+    let ic = ImageList_GetIcon(list as HIMAGELIST, sfi.iIcon, ILD_TRANSPARENT);
+    // SAFETY: `list` is a COM object; slot 2 of its vtable is IUnknown::Release, dropping the reference SHGetImageList added.
+    let release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 = std::mem::transmute(*(*list.cast::<*const usize>()).add(2));
+    release(list);
     ic
 }
 
@@ -2291,6 +2334,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             hist::show(hwnd, x + w / 2);
         }
         0x031D => hist::on_update(hwnd), // WM_CLIPBOARDUPDATE
+        ALT_SPACE => {
+            ui::panel::forget_deact(); // pressed right after the search closed by losing the focus: it must open again
+            search_toggle();
+        }
         NEXT_LANG => next_lang(hwnd, wp == 1),
         ALT_UP if wp == 2 => alt_close(),
         ALT_UP => alt_done(wp == 1),
@@ -2622,6 +2669,19 @@ mod tests {
         let f = super::msix_family(r"C:\Program Files\WindowsApps\Claude_5.11492.5.0_x64__pzs8sxrjxfjjc\app\claude.exe");
         assert_eq!(f, Some(("claude_pzs8sxrjxfjjc".into(), r"app\claude.exe".into())));
         assert_eq!(super::msix_family(r"C:\Program Files\Steam\steam.exe"), None);
+    }
+
+    #[test]
+    fn a_bitmap_without_alpha_is_told_from_one_with_it() {
+        let make = |px: [u32; 4]| unsafe { super::CreateBitmap(2, 2, 1, 32, px.as_ptr().cast()) };
+        // SAFETY: bitmaps made and freed here.
+        unsafe {
+            let (clear, lit) = (make([0x0012_3456; 4]), make([0x0012_3456, 0, 0, 0x8012_3456]));
+            assert!(!super::bitmap_has_alpha(clear), "an old icon: all alpha bytes are 0");
+            assert!(super::bitmap_has_alpha(lit));
+            super::DeleteObject(clear);
+            super::DeleteObject(lit);
+        }
     }
 
     #[test]

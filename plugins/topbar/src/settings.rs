@@ -2,7 +2,7 @@
 //! through `super::*`). The panel itself is `ui::settings_panel`; it writes the look through `winrust_common::style` and asks
 //! for everything that needs the bar through [`act`].
 use super::*;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU64, AtomicU8};
 use ui::settings_panel::{Act, Info, Page, SettingsPanel, System};
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
 
@@ -23,7 +23,13 @@ pub(crate) unsafe fn settings_toggle() {
 
 /// What the panel needs to know about the program around it.
 fn info() -> Info {
-    Info { version: version(), auto: auto_update, act, system }
+    Info { version: version(), auto: auto_update, act, system, wallpaper }
+}
+
+/// The desktop wallpaper's file, for the previews.
+fn wallpaper() -> String {
+    // SAFETY: a plain system query into a local buffer.
+    unsafe { vdesk::system_wallpaper() }
 }
 
 /// The version of the root crate (the installer's `CARGO_PKG_VERSION`, read from its manifest at build time).
@@ -69,13 +75,43 @@ fn reg_dword(path: &str, name: &str) -> Option<u32> {
     (r == 0).then_some(v)
 }
 
+/// %ProgramData%\WinRust\alt-space.txt: `0` leaves Alt+Space to the program in front (and to rs-launcher's own hotkey), anything
+/// else, or no file, lets the bar's hook open its search with it. Read again at most once a second: the hook asks on each Alt+Space.
+fn alt_space_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("alt-space.txt"))
+}
+
+static ALT_SPACE_ON: AtomicU8 = AtomicU8::new(0); // 0 not read yet, 1 on, 2 off
+static ALT_SPACE_AT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn alt_space() -> bool {
+    // SAFETY: a plain clock read.
+    let now = unsafe { GetTickCount64() };
+    if ALT_SPACE_ON.load(Relaxed) == 0 || now.saturating_sub(ALT_SPACE_AT.load(Relaxed)) > 1000 {
+        let off = alt_space_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "0");
+        ALT_SPACE_ON.store(if off { 2 } else { 1 }, Relaxed);
+        ALT_SPACE_AT.store(now, Relaxed);
+    }
+    ALT_SPACE_ON.load(Relaxed) == 1
+}
+
+fn set_alt_space(on: bool) {
+    ALT_SPACE_ON.store(if on { 1 } else { 2 }, Relaxed);
+    // SAFETY: a plain clock read.
+    ALT_SPACE_AT.store(unsafe { GetTickCount64() }, Relaxed);
+    if let Some(f) = alt_space_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, if on { "1" } else { "0" });
+    }
+}
+
 /// What the advanced page can tell about this machine (it only shows it: the installer changes these).
 fn system() -> System {
     let pf = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_default();
     System {
         shell: !EXPLORER_UP.load(Relaxed),
         tray: None,
-        search_key: pf.join(r"rs-search\rs-launcher.exe").is_file(),
+        search_key: alt_space(),
         taskmgr_key: pf.join(r"rtaskmgr\rtaskmgr-win32.exe").is_file(),
         clipboard: true, // the bar itself keeps the history (hist.rs)
         wsearch_off: reg_dword(r"SYSTEM\CurrentControlSet\Services\WSearch", "Start").map(|s| s == 4),
@@ -96,6 +132,14 @@ fn act(a: Act) {
             Act::Remove => remove_plugins(),
             Act::CheckUpdate => check_update(),
             Act::AutoUpdate(on) => set_auto_update(on),
+            Act::AltSpace(on) => {
+                set_alt_space(on);
+                say(if on {
+                    t!("Alt+Space открывает поиск WinRust", "Alt+Space opens WinRust search", ja: "Alt+Space で WinRust 検索を開きます", pt: "Alt+Space abre a busca do WinRust", zh: "Alt+Space 打开 WinRust 搜索")
+                } else {
+                    t!("Alt+Space оставлен программам", "Alt+Space is left to other programs", ja: "Alt+Space は他のプログラムに任せます", pt: "Alt+Space fica para outros programas", zh: "Alt+Space 交给其他程序")
+                });
+            }
             Act::Say(text) => say(text),
         }
     }

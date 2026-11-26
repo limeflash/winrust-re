@@ -1253,10 +1253,24 @@ impl Canvas<'_> {
         unsafe { ctx.DrawBitmap(&p.bmp, Some(&dst.d2d()), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None) };
     }
 
+    /// A picture from [`Canvas::image`] (made for a box of `r`'s size) filling the rounded rectangle `r`, centred and cut to it, at
+    /// `opacity`: CSS `object-fit: cover` with a `border-radius`. It goes through a brush, so it follows an enclosing transform.
+    pub fn picture_cover(&mut self, p: &Picture, r: Rect, radius: f32, opacity: f32) {
+        use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BRUSH_PROPERTIES};
+        let rt = self.rt();
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+        let brush = D2D1_BRUSH_PROPERTIES { opacity, transform: Matrix3x2::translation(r.cx() - p.w / 2.0, r.cy() - p.h / 2.0) };
+        // SAFETY: the brush is made and used inside BeginDraw/EndDraw, on the target the picture was made on.
+        unsafe {
+            if let Ok(b) = rt.CreateBitmapBrush(&p.bmp, Some(&props), Some(&brush)) {
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius }, &b);
+            }
+        }
+    }
+
     /// Runs `f` with everything it draws clipped to the rounded rectangle `r` as `xf` moves it (CSS `clip-path: inset(..
     /// round ..)` on an element with a transform). Call it with no transform in force: the shape is in window coordinates.
     pub fn masked(&mut self, r: Rect, radius: f32, xf: Xf, f: impl FnOnce(&mut Self)) {
-        let ctx = self.dev().ctx.clone();
         let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius.max(0.0), radiusY: radius.max(0.0) };
         // SAFETY: plain geometry creation on the factory.
         let mask = unsafe {
@@ -1268,6 +1282,37 @@ impl Canvas<'_> {
                 .ok()
         };
         let Some(mask) = mask else { return f(self) };
+        self.under_mask(mask, f);
+    }
+
+    /// Runs `f` with everything it draws kept out of the rounded rectangle `r`: a CSS outer `box-shadow` is not painted under
+    /// its own box. [`Canvas::erase`] does that by cutting a hole, which in a window with a see-through backdrop (a panel's
+    /// glass) shows the desktop; this leaves whatever is already under the box alone.
+    pub fn outside(&mut self, r: Rect, radius: f32, f: impl FnOnce(&mut Self)) {
+        let rr = |r: Rect, k: f32| D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: k, radiusY: k };
+        let f_ = &self.g.factory;
+        // SAFETY: plain geometry work on the factory.
+        let mask = unsafe {
+            (|| -> Result<ID2D1Geometry> {
+                let all = f_.CreateRoundedRectangleGeometry(&rr(Rect::new(-1e5, -1e5, 2e5, 2e5), 0.0))?;
+                let hole = f_.CreateRoundedRectangleGeometry(&rr(r, radius))?;
+                let path = f_.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                all.CombineWithGeometry(&hole, D2D1_COMBINE_MODE_EXCLUDE, None, 0.1, &sink)?;
+                sink.Close()?;
+                path.cast()
+            })()
+            .ok()
+        };
+        match mask {
+            Some(mask) => self.under_mask(mask, f),
+            None => f(self),
+        }
+    }
+
+    /// Runs `f` with everything it draws clipped to the geometry `mask` (a layer; the shape is in window coordinates).
+    fn under_mask(&mut self, mask: ID2D1Geometry, f: impl FnOnce(&mut Self)) {
+        let ctx = self.dev().ctx.clone();
         let mut params = D2D1_LAYER_PARAMETERS1 {
             contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
             geometricMask: std::mem::ManuallyDrop::new(Some(mask)),

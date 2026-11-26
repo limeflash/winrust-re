@@ -27,6 +27,9 @@ pub(crate) unsafe fn run_box() {
     PostMessageW(h, WM_HOTKEY, 2, 0); // id 2: Run mode (1 is its Alt+Space)
 }
 
+/// Alt+Space is down (the hook swallowed it): its key repeat must not toggle the panel again.
+static ALT_SPACE_HELD: AtomicBool = AtomicBool::new(false);
+
 /// Win key on its own opens our Start. Runs on its own thread so a busy bar can never stall the system keyboard.
 pub(crate) unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 {
@@ -121,6 +124,18 @@ pub(crate) unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LR
             }
             let down = w == WM_KEYDOWN as usize || w == WM_SYSKEYDOWN as usize;
             let bar = BAR.load(Relaxed) as HWND;
+            // Alt+Space on its own (no Ctrl, Shift or Win): our search panel. The key is swallowed, so rs-launcher's own hotkey
+            // (the old search card) and the window menu never see it; the switch on the advanced page turns this off.
+            if k.vkCode == VK_SPACE as u32 && !down {
+                ALT_SPACE_HELD.store(false, Relaxed); // Alt may come up before the space does: any release ends the hold
+            }
+            if k.vkCode == VK_SPACE as u32 && k.flags & LLKHF_ALTDOWN != 0 && !held(VK_CONTROL) && !held(VK_SHIFT) && !held(VK_LWIN) && !held(VK_RWIN) && alt_space() {
+                if down && !ALT_SPACE_HELD.swap(true, Relaxed) { // key repeat sends more downs: only the first one counts
+                    keys(&[0xE8]); // a key between Alt down and up: the program in front does not take the lone Alt as "open the menu bar"
+                    PostMessageW(bar, ALT_SPACE, 0, 0);
+                }
+                return 1;
+            }
             // Alt+Tab: our own switcher. Without explorer Windows only flips to the next window blindly, and a fullscreen
             // game often takes the focus straight back.
             if k.vkCode == VK_TAB as u32 && k.flags & LLKHF_ALTDOWN != 0 && GetAsyncKeyState(VK_CONTROL as i32) >= 0 {

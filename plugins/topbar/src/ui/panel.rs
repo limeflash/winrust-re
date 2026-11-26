@@ -367,9 +367,19 @@ impl Rise {
 pub struct Cx {
     close: bool,
     then: Option<Box<dyn FnOnce()>>,
+    /// Where the box is on the screen (device pixels) and its scale: set by the frame for clicks and keys.
+    at: (i32, i32),
+    scale: f32,
 }
 
 impl Cx {
+    /// A rectangle of the box (DIPs) on the screen: left, top, right, bottom in device pixels.
+    #[must_use]
+    pub fn screen_rect(&self, r: Rect) -> (i32, i32, i32, i32) {
+        let s = self.scale;
+        (self.at.0 + (r.x * s).round() as i32, self.at.1 + (r.y * s).round() as i32, self.at.0 + ((r.x + r.w) * s).round() as i32, self.at.1 + ((r.y + r.h) * s).round() as i32)
+    }
+
     /// Close the panel.
     pub fn close(&mut self) {
         self.close = true;
@@ -923,6 +933,14 @@ impl Popup {
         self.hover
     }
 
+    /// A left click on item `id` as if the pointer were over it (the renderer plays a click with it).
+    pub fn click_id(&mut self, id: i32) -> Cx {
+        let mut cx = Cx { at: self.at, scale: self.scale, ..Cx::default() };
+        self.hover = Some(id);
+        self.content.click(id, Button::Left, &mut cx);
+        cx
+    }
+
     /// Puts the hover on an item (the keyboard does it; so does the renderer of previews).
     pub fn set_hover(&mut self, id: Option<i32>) {
         self.hover = id;
@@ -930,7 +948,7 @@ impl Popup {
 
     /// A mouse button went down at a client point.
     pub fn button(&mut self, x: i32, y: i32, b: Button) -> Cx {
-        let mut cx = Cx::default();
+        let mut cx = Cx { at: self.at, scale: self.scale, ..Cx::default() };
         if self.closing.is_some() {
             return cx;
         }
@@ -962,7 +980,7 @@ impl Popup {
 
     /// A key went down; Esc closes, arrows move the hover, Enter and Space click it.
     pub fn key(&mut self, vk: u32, mods: Mods) -> Cx {
-        let mut cx = Cx::default();
+        let mut cx = Cx { at: self.at, scale: self.scale, ..Cx::default() };
         if self.closing.is_some() || self.content.key(vk, &mut cx) {
             return cx;
         }
@@ -1886,7 +1904,7 @@ mod tests {
         let mut g = Gfx::new(1.0).unwrap();
         let anchor = Anchor { side: Side::Bottom, button: (1000, 846, 1032, 886), bar: (0, 846, 1440, 900), screen: (1440, 900) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
-        let mut p = Popup::new(&mut g, Box::new(TrayPanel::new(cells, |_, _| {})), anchor, 0, &mut grab);
+        let mut p = Popup::new(&mut g, Box::new(TrayPanel::new(cells, |_, _, _| {})), anchor, 0, &mut grab);
         let (x, y, w, h) = p.rect();
         assert_eq!((w, h), (188, 100)); // 4 columns of 40, two rows, padding 8, gap 4
         assert_eq!(y + h, 846 - 12); // 12 above the bar

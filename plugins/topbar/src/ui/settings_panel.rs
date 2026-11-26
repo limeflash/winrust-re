@@ -14,7 +14,7 @@ use winrust_common::style::{self, Accent, Anim, Side, Style, Theme, pal};
 use winrust_common::{Lang, lang};
 
 use super::anim::{self, EASE, SNAP, SPRING};
-use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba};
+use super::gfx::{Align, Canvas, Font, Gfx, Picture, Rect, Rgba};
 use super::icons;
 use super::panel::{Along, Button, Content, Cx, Dir, Entry, Exit, Frame, Id, Inset, Look, Place, Rise, Shadow};
 
@@ -91,6 +91,7 @@ const BEHAVIOR: i32 = 620;
 const CANCEL: i32 = 700;
 const YES: i32 = 701;
 const ANIM: i32 = 820;
+const ALT_SPACE: i32 = 840;
 const OPEN_LOG: i32 = 830;
 const RESTART: i32 = 831;
 const CHECK_NOW: i32 = 900;
@@ -149,6 +150,8 @@ pub enum Act {
     /// Ask the updater for a new release.
     CheckUpdate,
     AutoUpdate(bool),
+    /// Alt+Space opens the bar's search (true) or is left to the program in front (false).
+    AltSpace(bool),
     /// A toast (the text of the mockup for that switch).
     Say(&'static str),
 }
@@ -163,6 +166,8 @@ pub struct Info {
     /// Whether the machine runs WinRust as its shell, has `rs-launcher` and the task manager installed (the advanced page
     /// shows them; the installer changes them).
     pub system: fn() -> System,
+    /// The file of the desktop wallpaper (empty when there is none): it goes under the previews.
+    pub wallpaper: fn() -> String,
 }
 
 /// What the advanced page can tell about the machine.
@@ -170,6 +175,7 @@ pub struct Info {
 pub struct System {
     pub shell: bool,
     pub tray: Option<bool>,
+    /// Whether Alt+Space opens the bar's search (the switch on the advanced page; the bar keeps it in a file).
     pub search_key: bool,
     pub taskmgr_key: bool,
     pub clipboard: bool,
@@ -341,8 +347,22 @@ fn wrap(m: Measure<'_>, s: &str, f: Font, w: f32) -> Vec<String> {
 /// The panel's own sub-page animation and rise delays.
 const RISE_DELAYS: [u32; 12] = [0, 30, 60, 85, 105, 0, 0, 0, 0, 0, 0, 0];
 
+/// The wallpaper under the previews, made once for each of the three boxes it fills (`object-fit: cover`).
+struct Walls {
+    path: String,
+    card: Option<Picture>,
+    thumb: Option<Picture>,
+    preview: Option<Picture>,
+}
+
+/// The boxes of the previews: a theme card, a template's thumbnail, the bar page's preview (width, height).
+const CARD: (f32, f32) = ((CW - 8.0 - 16.0) / 3.0, 64.0);
+const THUMB: (f32, f32) = (44.0, 28.0);
+const PREVIEW_BOX: (f32, f32) = (364.0, 112.0);
+
 pub struct SettingsPanel {
     info: Info,
+    walls: Option<Walls>,
     page: Page,
     /// How the page arrived: `Some(true)` forward (`pgF`), `Some(false)` back (`pgB`), `None` it was the first one.
     dir: Option<bool>,
@@ -367,6 +387,7 @@ impl SettingsPanel {
         let sys = (info.system)();
         Self {
             info,
+            walls: None,
             page,
             dir: None,
             page_at: None,
@@ -398,6 +419,16 @@ impl SettingsPanel {
         self.page_at = None;
         self.open = None;
         self.del = false;
+    }
+
+    /// Loads the wallpaper for the three previews, unless the cached one is the file that is the wallpaper now.
+    fn load_walls(&mut self, c: &mut Canvas<'_>) {
+        let path = (self.info.wallpaper)();
+        if self.walls.as_ref().is_some_and(|w| w.path == path) {
+            return;
+        }
+        let mut load = |(w, h): (f32, f32)| if path.is_empty() { None } else { c.image(&path, w, h) };
+        self.walls = Some(Walls { card: load(CARD), thumb: load(THUMB), preview: load(PREVIEW_BOX), path: path.clone() });
     }
 
     fn say(&self, cx: &mut Cx, text: &'static str) {
@@ -455,7 +486,7 @@ impl SettingsPanel {
         let (look, theme) = (t!("Внешний вид", "Look", ja: "外観", pt: "Aparência", zh: "外观"), t!("Тема", "Theme", ja: "テーマ", pt: "Tema", zh: "主题"));
         b.text(Rect::new(18.0, 68.0, 340.0, 15.0), format!("{look} · {theme}"), LABEL, Tone::Dim);
         b.stage = 2;
-        let cw = (CW - 8.0 - 16.0) / 3.0;
+        let cw = CARD.0;
         for (i, _) in style::ALL.iter().enumerate() {
             b.put(THEME + i as i32, Rect::new(12.0 + i as f32 * (cw + 8.0), 91.0, cw, 85.0), K::Theme(style::ALL[i]));
         }
@@ -641,27 +672,27 @@ impl SettingsPanel {
         let mut y = self.head(b, m, t!("Расширенные настройки", "Advanced settings"), t!("Оболочка, клавиши, Windows и анимации", "Shell, keys, Windows and animations"));
         let s = self.sys;
         let group = |b: &mut B, y: f32, name: &str| b.put(0, Rect::new(PAD, y, CW, 31.0), K::Group(name.to_string()));
-        let sw = |b: &mut B, m: Measure<'_>, y: f32, label: &str, sub: &str, on: Option<bool>| -> f32 {
+        let sw = |b: &mut B, m: Measure<'_>, y: f32, id: i32, label: &str, sub: &str, on: Option<bool>| -> f32 {
             let subs = if sub.is_empty() { vec![] } else { wrap(m, sub, SMALL, 308.0) };
             let lines = wrap(m, label, BODY, 308.0).len() as f32;
             let h = (12.0 + 17.5 * lines + if subs.is_empty() { 0.0 } else { 2.0 + 16.2 * subs.len() as f32 }).max(40.0);
-            // not wired to a setting the bar can change: shown as the machine has it, greyed out (the installer changes it)
-            b.put(0, Rect::new(PAD, y, CW, h), K::Switch { label: label.to_string(), sub: subs, on: on.unwrap_or(false), off: true });
+            // `id` 0: not wired to a setting the bar can change, shown as the machine has it and greyed out (the installer changes it)
+            b.put(id, Rect::new(PAD, y, CW, h), K::Switch { label: label.to_string(), sub: subs, on: on.unwrap_or(false), off: id == 0 });
             y + h
         };
         group(b, y, t!("Оболочка", "Shell"));
         y += 31.0;
-        y = sw(b, m, y, t!("WinRust вместо Проводника как оболочка", "WinRust replaces Explorer as the shell"), t!("Применится после повторного входа", "Applies after you sign in again"), Some(s.shell));
-        y = sw(b, m, y, t!("Диспетчер задач остаётся в трее при закрытии", "Task Manager stays in the tray when closed"), "", s.tray);
+        y = sw(b, m, y, 0, t!("WinRust вместо Проводника как оболочка", "WinRust replaces Explorer as the shell"), t!("Применится после повторного входа", "Applies after you sign in again"), Some(s.shell));
+        y = sw(b, m, y, 0, t!("Диспетчер задач остаётся в трее при закрытии", "Task Manager stays in the tray when closed"), "", s.tray);
         group(b, y, t!("Клавиши", "Keys"));
         y += 31.0;
-        y = sw(b, m, y, t!("Alt+Space — поиск WinRust", "Alt+Space opens WinRust search"), "", Some(s.search_key));
-        y = sw(b, m, y, t!("Ctrl+Shift+Esc — Диспетчер задач WinRust", "Ctrl+Shift+Esc opens WinRust Task Manager"), "", Some(s.taskmgr_key));
-        y = sw(b, m, y, t!("Win+V — история буфера обмена", "Win+V clipboard history"), t!("Текст, хранится в памяти. Когда Проводник не оболочка", "Text, kept in memory. When Explorer is not the shell"), Some(s.clipboard));
+        y = sw(b, m, y, ALT_SPACE, t!("Alt+Space — поиск WinRust", "Alt+Space opens WinRust search"), "", Some(s.search_key));
+        y = sw(b, m, y, 0, t!("Ctrl+Shift+Esc — Диспетчер задач WinRust", "Ctrl+Shift+Esc opens WinRust Task Manager"), "", Some(s.taskmgr_key));
+        y = sw(b, m, y, 0, t!("Win+V — история буфера обмена", "Win+V clipboard history"), t!("Текст, хранится в памяти. Когда Проводник не оболочка", "Text, kept in memory. When Explorer is not the shell"), Some(s.clipboard));
         group(b, y, "Windows");
         y += 31.0;
-        y = sw(b, m, y, t!("Отключить поиск Windows (WSearch)", "Turn off Windows Search (WSearch)"), t!("При удалении всё вернётся как было", "Put back when WinRust is removed"), s.wsearch_off);
-        y = sw(b, m, y, t!("Скрыть панель задач Windows", "Hide the Windows taskbar"), "", Some(s.taskbar_hidden));
+        y = sw(b, m, y, 0, t!("Отключить поиск Windows (WSearch)", "Turn off Windows Search (WSearch)"), t!("При удалении всё вернётся как было", "Put back when WinRust is removed"), s.wsearch_off);
+        y = sw(b, m, y, 0, t!("Скрыть панель задач Windows", "Hide the Windows taskbar"), "", Some(s.taskbar_hidden));
         group(b, y, t!("Анимации", "Animations"));
         y += 31.0;
         let labels = vec![t!("Полные", "Full").to_string(), t!("Короткие", "Reduced").to_string(), t!("Выкл.", "Off").to_string()];
@@ -760,7 +791,8 @@ fn colorref(hex: u32) -> u32 {
 // painting
 
 /// What painting needs besides the items.
-struct Dc {
+struct Dc<'a> {
+    walls: Option<&'a Walls>,
     accent: Rgba,
     now: u64,
     open_at: u64,
@@ -769,10 +801,14 @@ struct Dc {
     themes: Vec<Theme>,
 }
 
-/// A dark stand-in for the wallpaper the mockup puts under its previews (the mockup's own image is not shipped).
-fn wallpaper(c: &mut Canvas<'_>, r: Rect, radius: f32, k: f32) {
+/// What the mockup puts under its previews: `#0b0d14` with the user's wallpaper over it at `opacity` (.6 on the cards and
+/// thumbnails, .55 on the bar preview), cut to the rounded box. Without a wallpaper file a dark gradient stands in.
+fn wallpaper(c: &mut Canvas<'_>, r: Rect, radius: f32, pic: Option<&Picture>, opacity: f32) {
     c.fill(r, radius, Rgba::css(11, 13, 20, 1.0));
-    c.gradient(r, radius, Rgba::css(36, 48, 92, 0.6 * k), Rgba::css(10, 12, 22, 0.6 * k));
+    match pic {
+        Some(p) => c.picture_cover(p, r, radius, opacity),
+        None => c.gradient(r, radius, Rgba::css(36, 48, 92, 0.6), Rgba::css(10, 12, 22, 0.6)),
+    }
 }
 
 /// A bar in miniature: the fill, the half-pixel ring, and optionally the three squares.
@@ -792,7 +828,7 @@ fn mini_bar(c: &mut Canvas<'_>, r: Rect, radius: f32, accent: Rgba, o: f32, dots
     });
 }
 
-fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc) {
+fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
     let r = it.r;
     match &it.k {
         K::Header => {
@@ -808,7 +844,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc) {
             let on = *st == style::style();
             let hot = f.hover(it.id, 160, EASE);
             let prev = Rect::new(r.x, r.y, r.w, 64.0);
-            wallpaper(c, prev, 10.0, 1.0);
+            wallpaper(c, prev, 10.0, d.walls.and_then(|w| w.card.as_ref()), 0.6);
             let (l, bottom, rad) = match st {
                 Style::Classic => (0.0, 0.0, 0.0),
                 Style::Floating => (5.0, 5.0, 4.0),
@@ -916,7 +952,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc) {
             let thumb = Rect::new(r.x + 10.0, r.cy() - 14.0, 44.0, 28.0);
             let bg = if thm.colors[0] != u32::MAX { thm.colors[0] } else { style::BASE.bg };
             let acc = if thm.colors[4] != u32::MAX { thm.colors[4] } else { thm.accent.color() };
-            wallpaper(c, thumb, 6.0, 1.0);
+            wallpaper(c, thumb, 6.0, d.walls.and_then(|w| w.thumb.as_ref()), 0.6);
             c.clipped(Rect::new(thumb.x, thumb.y + 21.0, 44.0, 7.0), |c| c.fill(Rect::new(thumb.x, thumb.y + 8.0, 44.0, 20.0), 6.0, Rgba::colorref(bg)));
             c.fill(Rect::new(thumb.x + 19.0, thumb.y + 28.0 - 2.0 - 3.0, 6.0, 3.0), 1.0, Rgba::colorref(acc));
             c.text(name, Rect::new(r.x + 66.0, r.y + 8.0, 250.0, 16.0), MEDIUM, INK, Align::Start);
@@ -1043,7 +1079,7 @@ fn color_name(i: usize) -> &'static str {
 }
 
 /// `chipsIn`: the chips of a row that has just opened fade in and settle 4 px (opacity, dy).
-fn chips_in(d: &Dc) -> (f32, f32) {
+fn chips_in(d: &Dc<'_>) -> (f32, f32) {
     let (dur, _) = anim::timing(style::anim(), 220, 0);
     if dur == 0 {
         return (1.0, 0.0);
@@ -1052,7 +1088,7 @@ fn chips_in(d: &Dc) -> (f32, f32) {
     (e, anim::lerp(-4.0, 0.0, e))
 }
 
-fn draw_row(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, row: &Row, d: &Dc) {
+fn draw_row(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, row: &Row, d: &Dc<'_>) {
     let r = it.r;
     let hot = f.hover(it.id, 140, SPRING);
     let hov = if row.danger { Rgba::css(229, 72, 77, 0.14) } else { Rgba::white(0.09) };
@@ -1095,8 +1131,7 @@ fn draw_seg(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, labels: &[String], c
     let w = (r.w - 6.0) / n as f32;
     let pos = f.tween(base, 7, cur as f32, 320, SNAP);
     let thumb = Rect::new(r.x + 3.0 + pos * w, r.y + 3.0, w, 28.0);
-    c.shadow(thumb, 7.0, 1.0, 3.0, Rgba::css(0, 0, 0, 0.45));
-    c.erase(thumb, 7.0);
+    c.outside(thumb, 7.0, |c| c.shadow(thumb, 7.0, 1.0, 3.0, Rgba::css(0, 0, 0, 0.45)));
     c.gradient(thumb, 7.0, Rgba::white(0.16), Rgba::white(0.1));
     c.fill(Rect::new(thumb.x + 3.0, thumb.y, thumb.w - 6.0, 1.0), 0.0, Rgba::white(0.14));
     for (k, l) in labels.iter().enumerate() {
@@ -1116,7 +1151,7 @@ fn switch(c: &mut Canvas<'_>, f: &mut Frame<'_>, key: i32, (x, y): (f32, f32), o
     c.circle(x + 2.0 + 8.0 + 16.0 * slide, y + 10.0, 8.0, Rgba::white(1.0));
 }
 
-fn draw_preview(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, d: &Dc) {
+fn draw_preview(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, d: &Dc<'_>) {
     let (side, st, size) = (style::side(), style::style(), style::bar_size().min(2));
     let classic = st == Style::Classic;
     let pill = st == Style::Dock;
@@ -1137,7 +1172,7 @@ fn draw_preview(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, d: &Dc) {
     let (x0, y0, x1, y1) = (g(0, x0), g(1, y0), g(2, x1), g(3, y1));
     let rad = f.tween(PREVIEW, 4, rad, 350, EASE);
     let o = f.tween(PREVIEW, 5, if style::autohide() { 0.35 } else { 1.0 }, 300, EASE);
-    wallpaper(c, r, 12.0, 0.92);
+    wallpaper(c, r, 12.0, d.walls.and_then(|w| w.preview.as_ref()), 0.55);
     let bar = Rect::new(r.x + x0, r.y + y0, x1 - x0, y1 - y0);
     let bg = Rgba::colorref(pal().bg).alpha(f32::from(style::bar_opacity()) / 100.0);
     c.clipped(r, |c| {
@@ -1146,18 +1181,16 @@ fn draw_preview(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, d: &Dc) {
             c.ring(bar, rad, 0.5, Rgba::white(0.2));
         });
     });
-    let _ = d;
     c.ring(r, 12.0, 1.0, Rgba::white(0.08));
 }
 
-fn draw_hero(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, when: &str, d: &Dc) {
+fn draw_hero(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, when: &str, d: &Dc<'_>) {
     c.fill(r, 18.0, Rgba::white(0.04));
     c.radial(r, 18.0, (r.x, r.y), (r.w * 1.2, r.h * 0.9), d.accent.fade(0.2), 0.6);
     c.ring(r, 18.0, 1.0, Rgba::white(0.07));
     // the logo tile
     let logo = Rect::new(r.x + 18.0, r.y + 20.0, 56.0, 56.0);
-    c.shadow(logo, 16.0, 8.0, 20.0, Rgba::css(0, 0, 0, 0.35));
-    c.erase(logo, 16.0);
+    c.outside(logo, 16.0, |c| c.shadow(logo, 16.0, 8.0, 20.0, Rgba::css(0, 0, 0, 0.35)));
     c.gradient(logo, 16.0, Rgba::css(35, 37, 46, 1.0), Rgba::css(23, 24, 30, 1.0));
     c.ring(logo, 16.0, 1.0, Rgba::white(0.08));
     let (lx, ly) = (logo.cx() - 12.0 * 32.0 / 24.0, logo.cy() - 12.0 * 32.0 / 24.0);
@@ -1262,6 +1295,9 @@ impl Content for SettingsPanel {
 
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
         let now = f.now;
+        if self.walls.is_none() || self.page_at.is_none() {
+            self.load_walls(c); // when the panel opens and when a page arrives: the wallpaper may have changed
+        }
         let page_at = *self.page_at.get_or_insert(now);
         let open_at = *self.open_at.get_or_insert(now);
         match self.upd {
@@ -1269,7 +1305,7 @@ impl Content for SettingsPanel {
             Upd::Busy(Some(at)) if now.saturating_sub(at) >= 1600 => self.upd = Upd::Done(now),
             _ => {}
         }
-        let d = Dc { accent: Rgba::colorref(pal().accent), now, open_at, upd: self.upd, version: self.info.version.clone(), themes: self.themes.clone() };
+        let d = Dc { walls: self.walls.as_ref(), accent: Rgba::colorref(pal().accent), now, open_at, upd: self.upd, version: self.info.version.clone(), themes: self.themes.clone() };
         let leave = f.fade_out(100);
         // the page arrives: pgF / pgB, .3 s
         let (po, pdx) = match self.dir {
@@ -1405,6 +1441,11 @@ impl Content for SettingsPanel {
                 self.relook(cx);
             }
             i if (ANIM..ANIM + 3).contains(&i) => style::set_anim(Anim::ALL[(i - ANIM) as usize]),
+            ALT_SPACE => {
+                self.sys.search_key = !self.sys.search_key;
+                let on = self.sys.search_key;
+                cx.run(move || act(Act::AltSpace(on)));
+            }
             OPEN_LOG => cx.run(move || act(Act::OpenLog)),
             RESTART => cx.close_then(move || act(Act::Restart)),
             CHECK_NOW => {
@@ -1501,7 +1542,7 @@ mod tests {
     use super::*;
 
     fn panel(page: Page, themes: usize) -> SettingsPanel {
-        let info = Info { version: "0.5.9".into(), auto: || None, act: |_| {}, system: System::default };
+        let info = Info { version: "0.5.9".into(), auto: || None, act: |_| {}, system: System::default, wallpaper: String::new };
         let themes = (0..themes).map(|i| Theme { name: format!("T{i}"), style: Style::Classic, colors: [u32::MAX; 7], opacity: 85, accent: Accent::Blue }).collect();
         SettingsPanel::new(info, themes, page)
     }

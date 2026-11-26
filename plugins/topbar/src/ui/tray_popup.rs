@@ -22,14 +22,14 @@ pub struct Cell {
 pub struct TrayPanel {
     cells: Vec<Cell>,
     read: fn() -> Vec<Cell>,
-    /// A click on the cell with this token.
-    act: fn(usize, Button),
+    /// A click on the cell with this token; the cell's rectangle on the screen (device pixels) goes along.
+    act: fn(usize, Button, (i32, i32, i32, i32)),
     rows: usize,
 }
 
 impl TrayPanel {
     #[must_use]
-    pub fn new(read: fn() -> Vec<Cell>, act: fn(usize, Button)) -> Self {
+    pub fn new(read: fn() -> Vec<Cell>, act: fn(usize, Button, (i32, i32, i32, i32))) -> Self {
         Self { cells: read(), read, act, rows: 1 }
     }
 
@@ -83,7 +83,8 @@ impl Content for TrayPanel {
         let Some(token) = self.cells.get(id as usize).map(|c| c.token) else { return };
         let act = self.act;
         // the program answers a click with its own window or menu: the panel must be gone first
-        cx.close_then(move || act(token, b));
+        let screen = cx.screen_rect(Self::cell_rect(id as usize));
+        cx.close_then(move || act(token, b, screen));
     }
 
     fn nav(&self, from: Option<i32>, dir: Dir) -> Option<i32> {
