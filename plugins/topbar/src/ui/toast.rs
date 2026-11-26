@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HWND_TOPMOST, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetWindowPos, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SetWindowPos, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use winrust_common::style::{self, Anim, Side, pal};
 
@@ -55,7 +55,7 @@ pub struct Toast {
     scale: f32,
     since: Option<u64>,
     surf: Surface,
-    painted: Option<(i32, i32, u32, u32)>,
+    painted: Option<(i32, i32, u32)>,
 }
 
 impl Toast {
@@ -69,7 +69,7 @@ impl Toast {
             screen,
             scale,
             since: None,
-            surf: Surface::new(),
+            surf: Surface::composed(),
             painted: None,
         }
     }
@@ -119,35 +119,34 @@ impl Toast {
         (cx - self.width / 2.0, bottom - HEIGHT)
     }
 
-    /// Paints the pill at `now`. Returns the window rectangle in device pixels and whether the window should be shown.
-    pub fn frame(&mut self, g: &mut Gfx, now: u64) -> ((i32, i32, i32, i32), bool) {
+    /// Paints the pill at `now`. Returns the window rectangle in device pixels, whether the window should be shown, and its
+    /// opacity (the fade is the window's, not repainted).
+    pub fn frame(&mut self, g: &mut Gfx, now: u64) -> ((i32, i32, i32, i32), bool, u8) {
         let Some((o, dy)) = self.pose(now) else {
             self.since = None;
-            return ((0, 0, 0, 0), false);
+            return ((0, 0, 0, 0), false, 0);
         };
         let s = self.scale;
         let (bx, by) = self.rest();
         let (wx, wy) = (((bx - ROOM) * s).round() as i32, ((by - ROOM) * s).round() as i32);
         let (ww, wh) = (((self.width + 2.0 * ROOM) * s).round() as i32, ((HEIGHT + 2.0 * ROOM) * s).round() as i32);
-        let key = (wx, wy, o.to_bits(), dy.to_bits());
-        if self.painted != Some(key) {
+        let key = (ww, wh, dy.to_bits());
+        if self.painted != Some(key) || !self.surf.is_current() {
             self.painted = Some(key);
             let r = Rect::new(ROOM, ROOM + dy, self.width, HEIGHT);
             let text = &self.text;
             let accent = Rgba::colorref(pal().accent);
             let _ = g.paint(&mut self.surf, ww, wh, |c: &mut Canvas<'_>| {
-                c.faded(o, |c| {
-                    c.shadow(r, 20.0, 16.0, 40.0, Rgba::css(0, 0, 0, 0.5));
-                    c.ring(r.inset(-1.0), 21.0, 1.0, Rgba::css(0, 0, 0, 0.5));
-                    c.erase(r, 20.0);
-                    c.fill(r, 20.0, TINT);
-                    c.ring(r, 20.0, 1.0, Rgba::white(0.1));
-                    c.icon(CHECK, (r.x + 16.0 + 8.0, r.cy()), 16.0, 2.4, accent, 0.0);
-                    c.text(text, Rect::new(r.x + 42.0, r.y, self.width - 42.0 - 16.0 + 8.0, HEIGHT), FONT, INK, Align::Start);
-                });
+                c.shadow(r, 20.0, 16.0, 40.0, Rgba::css(0, 0, 0, 0.5));
+                c.ring(r.inset(-1.0), 21.0, 1.0, Rgba::css(0, 0, 0, 0.5));
+                c.erase(r, 20.0);
+                c.fill(r, 20.0, TINT);
+                c.ring(r, 20.0, 1.0, Rgba::white(0.1));
+                c.icon(CHECK, (r.x + 16.0 + 8.0, r.cy()), 16.0, 2.4, accent, 0.0);
+                c.text(text, Rect::new(r.x + 42.0, r.y, self.width - 42.0 - 16.0 + 8.0, HEIGHT), FONT, INK, Align::Start);
             });
         }
-        ((wx, wy, ww, wh), true)
+        ((wx, wy, ww, wh), true, (255.0 * o.clamp(0.0, 1.0)).round() as u8)
     }
 
     #[must_use]
@@ -188,7 +187,7 @@ pub fn init(hi: HINSTANCE, scale: f32, screen: (i32, i32)) -> bool {
     // SAFETY: window creation with a live, NUL-terminated class name.
     let wnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | super::gfx::window_ex_through(),
             name.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
@@ -205,6 +204,7 @@ pub fn init(hi: HINSTANCE, scale: f32, screen: (i32, i32)) -> bool {
     if wnd.is_null() {
         return false;
     }
+    super::gfx::through(super::panel::whwnd(wnd));
     HOST.set(Some(Host { toast: Toast::new(scale, screen), gfx, wnd, shown: false, timer: false }));
     true
 }
@@ -227,9 +227,10 @@ pub fn hide() {
 
 impl Host {
     fn frame(&mut self, t: u64) {
-        let (rect, up) = self.toast.frame(&mut self.gfx, t);
+        let (rect, up, alpha) = self.toast.frame(&mut self.gfx, t);
         if up {
-            let _ = self.toast.surface().present(super::panel::whwnd(self.wnd), rect.0, rect.1, 255);
+            let _ = self.toast.surface().present(super::panel::whwnd(self.wnd), rect.0, rect.1, alpha);
+            super::gfx::commit();
             if !self.shown {
                 self.shown = true;
                 // SAFETY: showing our own window without activating it.

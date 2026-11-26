@@ -66,7 +66,7 @@ pub(crate) unsafe fn bench() {
 }
 
 /// What the mockup's bar holds: name, colour of its indicators, windows, an exe whose icon stands in for the brand's.
-const APPS: [(&str, u32, usize, &str); 8] = [
+pub(crate) const APPS: [(&str, u32, usize, &str); 8] = [
     ("Claude", 0xe58a66, 1, r"C:\Windows\System32\mspaint.exe"),
     ("File manager", 0xf6c453, 2, r"C:\Windows\explorer.exe"),
     ("Microsoft Edge", 0x3cc4f2, 3, r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
@@ -96,7 +96,7 @@ fn key_of(name: &str) -> i32 {
 }
 
 /// Alpha-blends a premultiplied BGRA layer onto an opaque canvas, `alpha` being the window's constant alpha.
-fn blend(dst: &mut [u32], (dw, dh): (i32, i32), src: &[u32], sw: i32, (x, y): (i32, i32), alpha: u8) {
+pub(crate) fn blend(dst: &mut [u32], (dw, dh): (i32, i32), src: &[u32], sw: i32, (x, y): (i32, i32), alpha: u8) {
     for sy in 0..src.len() as i32 / sw.max(1) {
         let ty = y + sy;
         if ty < 0 || ty >= dh {
@@ -557,16 +557,16 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let crop = if what == "toast" {
         let mut toast = ui::toast::Toast::new(scale, (sw, sh));
         toast.show(&mut gfx, text, side, (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3), 0);
-        let (win, _) = toast.frame(&mut gfx, t);
-        blend(&mut canvas, (sw, sh), toast.surface().pixels(), win.2, (win.0, win.1), 255);
+        let (win, _, alpha) = toast.frame(&mut gfx, t);
+        blend(&mut canvas, (sw, sh), toast.surface().pixels(), win.2, (win.0, win.1), alpha);
         around(win)
     } else if what == "tip" {
         let mut tip = ui::tip::Tip::new(scale, (sw, sh));
         let text = ["Claude", "File manager", "Microsoft Edge", "Spotify", "Task Manager", "Outlook", "Discord", "Telegram"][(at.max(1) as usize - 1) % 8];
         let along = if side == Side::Bottom { (r.0 + r.2) / 2 } else { (r.1 + r.3) / 2 };
         tip.show(&mut gfx, text, ui::tip::Place::button(side, r, along, scale), 0, 250, None);
-        let (win, _) = tip.frame(&mut gfx, t);
-        blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
+        let (win, _, alpha) = tip.frame(&mut gfx, t);
+        blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), alpha);
         around(win)
     } else {
         let content: Box<dyn ui::panel::Content> = if what == "quick" || what == "wifi" {
@@ -712,8 +712,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             let mut tip = ui::tip::Tip::new(scale, (sw, sh));
             let place = ui::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * scale).round() as i32 };
             tip.show(&mut gfx, &text, place, 0, 0, None);
-            let (win, _) = tip.frame(&mut gfx, 5000);
-            blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
+            let (win, _, alpha) = tip.frame(&mut gfx, 5000);
+            blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), alpha);
         }
         if whole { (0, 0, sw, sh) } else { around(popup.rect()) }
     };
@@ -735,12 +735,12 @@ type Hi = windows::Win32::UI::WindowsAndMessaging::HICON;
 
 const DEMO_EXES: [&str; 3] = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Windows\explorer.exe", r"C:\Windows\System32\notepad.exe"];
 
-fn demo_icon(icon: &dyn Fn(&str) -> Hi, i: usize) -> Hi {
+pub(crate) fn demo_icon(icon: &dyn Fn(&str) -> Hi, i: usize) -> Hi {
     let ic = icon(DEMO_EXES[i % 3]);
     if ic.0.is_null() { icon(r"C:\Windows\System32\notepad.exe") } else { ic }
 }
 
-fn demo_jump(side: Side, n_wins: usize, recent: bool, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui::panel::Content> {
+pub(crate) fn demo_jump(side: Side, n_wins: usize, recent: bool, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui::panel::Content> {
     use ui::jump::{Act, Data, JumpPanel, Recent, Win};
     let titles = ["Lemxy/WinRust \u{b7} GitHub", "heydamir/unslop \u{b7} GitHub", "New Tab"];
     let wins: Vec<Win> = (0..n_wins.min(3)).map(|i| Win { hwnd: i as isize + 1, title: titles[i].into(), active: i == 0 }).collect();
@@ -782,7 +782,7 @@ fn demo_preview(n_wins: usize, icon: &dyn Fn(&str) -> Hi, at: i32) -> Box<dyn ui
     Box::new(PreviewPanel::new(cards, demo_icon(icon, 0), ui::gfx::Rgba::hex(color), false, |_| {}))
 }
 
-fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
+pub(crate) fn demo_taskview(scale: f32, screen: (i32, i32), n_wins: usize, n_desks: usize, icon: &dyn Fn(&str) -> Hi) -> Box<dyn ui::panel::Content> {
     use std::rc::Rc;
     use ui::taskview::{Desk, OwnedIcon, TaskView, WinCard};
     let fr = |l: f32, t: f32, w: f32, h: f32| ((l * scale) as i32, (t * scale) as i32, ((l + w) * scale) as i32, ((t + h) * scale) as i32);

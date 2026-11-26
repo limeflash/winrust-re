@@ -30,7 +30,7 @@ use windows::Win32::Foundation::{COLORREF, E_FAIL, HMODULE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device};
 use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDesktopDevice, IDCompositionSurface, IDCompositionTarget, IDCompositionVisual3};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIDevice3, IDXGIFactory1};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP,
@@ -70,7 +70,7 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, HICON, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOZORDER, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow,
-    WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{HSTRING, IUnknown, Interface, Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
@@ -360,6 +360,16 @@ impl Surface {
         }
     }
 
+    /// Whether what was painted into it is still there. A lost device takes a composed surface's pixels with it; whoever paints
+    /// a surface only when its look changes must paint it again then.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        match &self.comp {
+            Some(c) => current_dev().is_some_and(|d| d.epoch == c.epoch),
+            None => !self.composed && !self.dc.is_invalid(),
+        }
+    }
+
     /// Gives the memory back (a screen grab that has been blurred into a picture is not needed any more).
     pub fn free(&mut self) {
         self.gpu = None;
@@ -625,12 +635,20 @@ pub fn compose_windows() -> bool {
         return false;
     }
     COMPOSE.set(true);
+    if current_dev().is_some_and(|d| d.dcomp.is_none()) {
+        lose_device(); // made before composition was asked for: made again with the composition device
+    }
     let ok = dev().is_ok_and(|d| probe_target(&d));
     if !ok {
         COMPOSE.set(false);
         DEV.set(None);
     }
     ok
+}
+
+/// Surfaces made from now on are DIBs again (the self-test draws its reference with them).
+pub(crate) fn compose_off() {
+    COMPOSE.set(false);
 }
 
 /// Can a window of the kind we make take a DirectComposition target? Tried on a hidden 1x1 window.
@@ -652,6 +670,25 @@ pub fn window_ex() -> u32 {
     (if composing() { WS_EX_NOREDIRECTIONBITMAP } else { WS_EX_LAYERED }).0
 }
 
+/// The extended style of a window that must not catch the mouse at all (a shadow, a scrim, the tip, the toast). A composed
+/// window that is merely `WS_EX_TRANSPARENT` still takes the pointer from other processes' windows; layered too, and given a
+/// full opacity with [`through`], it does not (the same as the layered window it replaces).
+#[must_use]
+pub fn window_ex_through() -> u32 {
+    window_ex() | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0
+}
+
+/// Makes a window made with [`window_ex_through`] live: once it is composed, a layered window shows nothing until it has its
+/// attributes (and a layered window painted by `UpdateLayeredWindow` must not have them set, so the fallback is left alone).
+pub fn through(hwnd: HWND) {
+    if composing() {
+        // SAFETY: a window of ours.
+        unsafe {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        }
+    }
+}
+
 fn make_target(dev: &Dev, hwnd: HWND) -> Result<Tgt> {
     let dc = dev.dcomp.as_ref().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
     // SAFETY: a target on our own window and a visual that is its root.
@@ -660,6 +697,18 @@ fn make_target(dev: &Dev, hwnd: HWND) -> Result<Tgt> {
         let visual = dc.CreateVisual()?;
         target.SetRoot(&visual)?;
         Ok(Tgt { _target: target, visual: visual.cast()?, content: 0, opacity: 255, rect: (i32::MIN, 0, 0, 0) })
+    }
+}
+
+/// Gives back what the devices cache (the memory of panels that are closed): once a panel is gone.
+pub fn trim() {
+    let Some(d) = current_dev() else { return };
+    // SAFETY: plain calls on the devices.
+    unsafe {
+        d.d2d.ClearResources(0);
+        if let Ok(dxgi) = d.d3d.cast::<IDXGIDevice3>() {
+            dxgi.Trim();
+        }
     }
 }
 
@@ -754,6 +803,9 @@ struct Device {
     epoch: u32,
     /// The context that makes resources and draws DIB frames.
     ctx: ID2D1DeviceContext,
+    /// What `ctx` targets between DIB frames: an off-screen target made from a context takes its pixel format from the
+    /// context's target, so it must always have one.
+    idle: ID2D1Bitmap1,
     /// The context of the frame in progress: `ctx`, or the one a DirectComposition surface hands out.
     cur: ID2D1DeviceContext,
     /// Where the frame's origin is on its target (a DirectComposition surface sits somewhere inside a shared texture), DIPs.
@@ -829,7 +881,20 @@ impl Gfx {
                 ctx.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                 ctx.SetDpi(96.0 * self.scale, 96.0 * self.scale);
                 let brush = ctx.CreateSolidColorBrush(&Rgba::TRANSPARENT.d2d(), None)?;
-                Device { epoch: d.epoch, cur: ctx.clone(), ctx, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new() }
+                let idle = ctx.CreateBitmap(
+                    D2D_SIZE_U { width: 1, height: 1 },
+                    None,
+                    0,
+                    &D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                        ..Default::default()
+                    },
+                )?;
+                ctx.SetTarget(&idle);
+                Device { epoch: d.epoch, cur: ctx.clone(), ctx, idle, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new() }
             };
             self.dev = Some(dev);
         }
@@ -944,7 +1009,7 @@ impl Gfx {
         // DIB that holds `w * h` pixels.
         let end = unsafe {
             let end = ctx.EndDraw(None, None);
-            ctx.SetTarget(None::<&ID2D1Image>);
+            ctx.SetTarget(&self.dev.as_ref().expect("device was just made").idle);
             end.and_then(|()| {
                 gpu.copy.CopyFromBitmap(None, &gpu.target, None)?;
                 let m = gpu.copy.Map(D2D1_MAP_OPTIONS_READ)?;
