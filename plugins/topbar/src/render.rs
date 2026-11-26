@@ -122,6 +122,7 @@ pub(crate) unsafe fn render(args: &[String]) {
         press,
         gear: open == "gear",
         start: open == "start",
+        search: open == "search",
         qs: open == "qs",
         cal: open == "clock",
         lang: open == "lang",
@@ -181,21 +182,27 @@ fn demo_cells() -> Vec<ui::tray_popup::Cell> {
     DEMO.with_borrow(|d| d.iter().map(|c| ui::tray_popup::Cell { icon: c.icon, tip: c.tip.clone(), token: c.token }).collect())
 }
 
-/// `topbar --render-panel <file.png> tray|lang|tip [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>]
-/// [n=<icons>] [real] [at=<n>]`
+/// `topbar --render-panel <file.png> tray|lang|tip|start|search [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>]
+/// [hover=<n>] [n=<icons>] [real] [at=<n>] [q=<text>] [page=<n>] [pins=<n>]`
 ///
 /// Draws a popup panel through the same frame as the live one, next to the bar, on a backdrop with something to blur, and
 /// writes the area around it to a PNG. `t` is the time since the panel opened (default: at rest), `hover` the hovered item,
 /// `n` the number of tray icons, `real` the machine's own keyboard layouts instead of the three of the mockup, and for `tip`
-/// the element it hints at is `at` (an app button number, default 3).
+/// the element it hints at is `at` (an app button number, default 3). For `start` and `search`: `q` is what is typed, `page` the
+/// page of pinned apps, `pins` how many of the machine's apps stand for the pinned ones (the machine's own pins are whatever they
+/// are); the apps, the recent files and the account are the machine's.
 pub(crate) unsafe fn render_panel(args: &[String]) {
     use ui::panel::{Anchor, Popup};
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     let Some(file) = args.first() else { return };
     let what = args.get(1).map_or("tray", String::as_str).to_string();
     let (mut style, mut side, mut scale, mut t, mut hover, mut n_icons, mut real, mut at) = (Style::Classic, Side::Bottom, 1.0f32, 5000u64, None, 6usize, false, 3i32);
+    let (mut query, mut page, mut pins) = (String::new(), 0usize, 24usize);
     for a in args.iter().skip(2) {
         match a.split_once('=') {
+            Some(("q", v)) => query = v.to_string(),
+            Some(("page", v)) => page = v.parse().unwrap_or(0),
+            Some(("pins", v)) => pins = v.parse().unwrap_or(24),
             Some(("scale", v)) => scale = v.parse().unwrap_or(1.0),
             Some(("t", v)) => t = v.parse().unwrap_or(5000),
             Some(("hover", v)) => hover = v.parse().ok(),
@@ -237,7 +244,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         time: "03:57".into(),
         date: "11/26/2026".into(),
     };
-    let lit = barui::Live { now: 100_000, hot: if what == "tip" { at } else { NONE }, tray: what == "tray", lang: what == "lang", ..Default::default() };
+    let lit = barui::Live {
+        now: 100_000,
+        hot: if what == "tip" { at } else { NONE },
+        tray: what == "tray",
+        lang: what == "lang",
+        start: what == "start",
+        search: what == "search",
+        ..Default::default()
+    };
     bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
     bar.frame(&view, &lit);
     let p = bar.frame(&view, &barui::Live { now: 110_000, ..lit });
@@ -270,6 +285,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let key = match what.as_str() {
         "lang" => LANG,
         "tip" => at,
+        "start" => 0,
+        "search" => SEARCH,
         _ => TAPP,
     };
     let r = bar.screen_rect(key).unwrap_or((0, 0, 0, 0));
@@ -279,6 +296,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         let (x0, y0, x1, y1) = (b.0 - m, b.1 - m, b.0 + b.2 + m, b.1 + b.3 + m);
         (x0.min(anchor.bar.0).max(0), y0.min(anchor.bar.1).max(0), x1.max(anchor.bar.2).min(sw), y1.max(anchor.bar.3).min(sh))
     };
+    let whole = what == "search";
     let crop = if what == "tip" {
         let mut tip = ui::tip::Tip::new(scale, (sw, sh));
         let text = ["Claude", "File manager", "Microsoft Edge", "Spotify", "Task Manager", "Outlook", "Discord", "Telegram"][(at.max(1) as usize - 1) % 8];
@@ -288,7 +306,21 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
         around(win)
     } else {
-        let content: Box<dyn ui::panel::Content> = if what == "lang" {
+        let content: Box<dyn ui::panel::Content> = if what == "start" || what == "search" {
+            apps::load(); // the machine's apps, synchronously, with the icons of what is pinned
+            let recent = apps::recent(if what == "start" { 4 } else { 3 });
+            if what == "start" {
+                let items = if query.is_empty() { apps::all().into_iter().take(pins).collect() } else { apps::search(&query).into_iter().take(12).collect() };
+                Box::new(ui::start_panel::StartPanel::with_state(&query, page, items, recent, apps::user()))
+            } else {
+                let files = if query.chars().count() < 2 {
+                    Vec::new()
+                } else {
+                    winrust_common::search::ask_all(&query).into_iter().take(3).map(|p| (std::fs::metadata(&p).is_ok_and(|m| m.is_dir()), p)).map(|(d, p)| (p, d)).collect()
+                };
+                Box::new(ui::search_panel::SearchPanel::with_query(900.0, &query, files, recent))
+            }
+        } else if what == "lang" {
             let items = if real {
                 layout_rows()
             } else {
@@ -323,6 +355,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         popup.set_hover(hover);
         let shown = popup.frame(&mut gfx, t);
         let (panel, shade) = popup.surfaces();
+        if let Some((r, a)) = shown.scrim {
+            blend(&mut canvas, (sw, sh), popup.scrim_surface().pixels(), r.2, (r.0, r.1), a);
+        }
         blend(&mut canvas, (sw, sh), shade.pixels(), shown.shadow.2, (shown.shadow.0, shown.shadow.1), shown.shadow_alpha);
         blend(&mut canvas, (sw, sh), panel.pixels(), shown.win.2, (shown.win.0, shown.win.1), 255);
         if let Some((text, along, top)) = popup.tip() {
@@ -332,7 +367,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             let (win, _) = tip.frame(&mut gfx, 5000);
             blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), 255);
         }
-        around(popup.rect())
+        if whole { (0, 0, sw, sh) } else { around(popup.rect()) }
     };
     let (x0, y0, x1, y1) = crop;
     let (w, h) = (x1 - x0, y1 - y0);

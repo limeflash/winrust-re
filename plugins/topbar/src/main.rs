@@ -22,6 +22,7 @@ use winrust_common::style::{Side, Style, card, on_accent, pal, rgb, style, ui_fa
 mod clip;
 mod hist;
 mod fly;
+mod apps;
 mod quick;
 mod tray;
 mod status;
@@ -735,11 +736,6 @@ unsafe fn lnk_icon(lnk: &[u16], target: &str, px: i32) -> HICON {
     icon
 }
 
-/// Size app icons are drawn at (24 logical px, like the Windows 11 taskbar). Icons are loaded at exactly this size:
-/// a 32 px icon stretched by DrawIconEx comes out jagged.
-fn icon_px() -> i32 {
-    sc(24)
-}
 /// Size the bar's app icons are loaded at: the design draws them up to 40 dip, and 1.24 times that when they lift on hover.
 fn bar_icon_px() -> i32 {
     sc(64)
@@ -1626,7 +1622,8 @@ unsafe fn build_live() -> barui::Live {
         hot: HOT.get(),
         press: if now.saturating_sub(pt) < 220 { pk } else { NONE },
         gear: menu_at(GEAR),
-        start: fly::is_open(fly::Kind::Start),
+        start: ui::panel::is_open(ui::panel::Id::Start),
+        search: ui::panel::is_open(ui::panel::Id::Search),
         qs: fly::is_open(fly::Kind::Quick) || fly::is_open(fly::Kind::Wifi),
         cal: fly::is_open(fly::Kind::Cal),
         lang: ui::panel::is_open(ui::panel::Id::Lang),
@@ -1711,7 +1708,7 @@ unsafe fn close_window(w: HWND) {
 unsafe fn msix_app_id(lnk: &str) -> Option<String> {
     let (family, _) = msix_family(&lnk_target(&wide(lnk)))?;
     let prefix = format!("{family}!").to_lowercase();
-    fly::apps_folder().into_iter().map(|a| a.1).find(|id| id.to_lowercase().starts_with(&prefix))
+    apps::apps_folder().into_iter().map(|a| a.1).find(|id| id.to_lowercase().starts_with(&prefix))
 }
 
 /// Starts a Store app by its app id. false = it did not start (the caller falls back to explorer).
@@ -1831,7 +1828,7 @@ unsafe fn app_menu(h: i32) {
         }
     }
     if !launch.is_empty() {
-        let s = fly::start_pinned(&launch);
+        let s = apps::start_pinned(&launch);
         items.push((fly::MItem::new(if s { t!("Убрать из Пуска", "Remove from Start", ja: "スタートから削除", pt: "Remover do Iniciar", zh: "从开始菜单移除") } else { t!("Добавить в Пуск", "Add to Start", ja: "スタートに追加", pt: "Adicionar ao Iniciar", zh: "添加到开始菜单") }), A::Start));
     }
     if !wins.is_empty() {
@@ -1869,7 +1866,7 @@ unsafe fn app_menu(h: i32) {
                     }
                 }
             }
-            Some(A::Start) => fly::start_toggle(&launch),
+            Some(A::Start) => apps::start_toggle(&launch),
             Some(A::Close) => wins.iter().for_each(|&w| close_window(w)),
             Some(A::Kill) => {
                 let mut pids: Vec<u32> = wins
@@ -2008,16 +2005,10 @@ unsafe fn on_drop(hwnd: HWND, hd: HDROP) {
     let h = hit(pt.x, pt.y);
     press(if h == NONE { 0 } else { h });
     if h == 0 {
-        let added: Vec<&String> = files.iter().filter(|f| fly::start_pin(f)).collect();
-        let name = |p: &str| std::path::Path::new(p).file_stem().unwrap_or_default().to_string_lossy().to_string();
-        if !fly::is_open(fly::Kind::Start) {
-            fly::toggle(fly::Kind::Start);
+        apps::pin_dropped(&files);
+        if !ui::panel::is_open(ui::panel::Id::Start) {
+            start_toggle();
         }
-        fly::note(&match added.len() {
-            0 => "Already in Start".to_string(),
-            1 => format!("Added to Start: {}", name(added[0])),
-            n => format!("Added {n} items to Start"),
-        });
     } else {
         files.iter().for_each(|f| pin_exe(f, ""));
         refresh_buttons();
@@ -2055,16 +2046,23 @@ unsafe extern "system" fn find_launcher(h: HWND, lp: LPARAM) -> i32 {
     1
 }
 
-/// Asks the running rs-launcher to show itself by sending the message its Alt+Space hotkey produces.
-/// Faking the key presses did not reliably reach it from this (elevated) process. false = it is not running.
-unsafe fn open_launcher() -> bool {
-    let mut h: HWND = null_mut();
-    EnumWindows(Some(find_launcher), &mut h as *mut _ as LPARAM);
-    if h.is_null() {
-        return false;
-    }
-    PostMessageW(h, WM_HOTKEY, 1, (MOD_ALT | MOD_NOREPEAT) as isize | ((VK_SPACE as isize) << 16));
-    true
+/// The Start button and the Win key: opens the Start menu, or closes it when it is open.
+pub(crate) unsafe fn start_toggle() {
+    ui::panel::toggle(ui::panel::Id::Start, || {
+        let a = anchor(0)?;
+        apps::pinned_load(); // the search box (rs-launcher) can add to this list from another process
+        thread::spawn(apps::load); // apps installed since the last open show up
+        Some((Box::new(ui::start_panel::StartPanel::new()), a))
+    });
+}
+
+/// The search button.
+pub(crate) unsafe fn search_toggle() {
+    ui::panel::toggle(ui::panel::Id::Search, || {
+        let a = anchor(SEARCH)?;
+        let screen_h = GetSystemMetrics(SM_CYSCREEN) as f32 / SCALE.get();
+        Some((Box::new(ui::search_panel::SearchPanel::new(screen_h)), a))
+    });
 }
 
 /// Right click on Start: the Win+X menu (Explorer's own is gone with the bar).
@@ -2108,7 +2106,7 @@ unsafe fn start_menu() {
             "!desktop" => winrust_common::desktop::toggle(),
             "!taskview" => keys(&[VK_LWIN, VK_TAB]), // virtual desktops (#83)
             "!lock" => quiet(Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"])),
-            "!sleep" => fly::sleep_now(),
+            "!sleep" => apps::sleep(),
             "!restart" => quiet(Command::new("shutdown").args(["/r", "/t", "0"])),
             "!shutdown" => quiet(Command::new("shutdown").args(["/s", "/t", "0"])),
             _ => open(&wide(to)),
@@ -2276,16 +2274,7 @@ unsafe fn tile_windows() {
 
 unsafe fn click(h: i32, left: bool, mid: bool) {
     match h {
-        SEARCH if left => {
-            // our search (rs-launcher listens for Alt+Space); without it the Start panel's own search
-            if std::env::var_os("ProgramFiles").is_some_and(|p| PathBuf::from(p).join(r"rs-search\rs-launcher.exe").is_file()) {
-                if !open_launcher() {
-                    keys(&[VK_MENU, VK_SPACE]);
-                }
-            } else {
-                fly::toggle(fly::Kind::Start);
-            }
-        }
+        SEARCH if left => search_toggle(),
         // virtual desktops (#83). Task View lives in explorer's shell: without it Win+Tab does nothing (#120), so the button
         // opens our window grid instead (the Alt+Tab one: click a card, arrows + Enter, Esc or the button again closes)
         TASKVIEW if left && !find_other("Shell_TrayWnd").is_null() => keys(&[VK_LWIN, VK_TAB]),
@@ -2337,7 +2326,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 ti.into_iter().for_each(|ti| tray_click(ti, left));
             }
         }
-        0 if left => fly::toggle_click(fly::Kind::Start),
+        0 if left => start_toggle(),
         0 => start_menu(),
         1.. => {
             let (wins, lnk) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default());
@@ -2459,7 +2448,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             InvalidateRect(hwnd, null(), 0); // the label shows the new language right away
         }
         WM_TIMER if wp == 4 => redraw(hwnd), // next animation frame
-        WIN_START => fly::toggle(fly::Kind::Start),
+        WIN_START => {
+            ui::panel::forget_deact(); // a Win press right after Start closed (by losing the focus) must open it again
+            start_toggle();
+        }
         ALT_TAB => alt_tab(wp == 1),
         WIN_NUM => win_num(wp),
         WIN_X => start_menu(),
@@ -2644,7 +2636,9 @@ fn main() {
         SHOWN.set(std::fs::read_to_string(appdata_file("topbar-tray.txt")).ok().map(|s| s.lines().map(str::to_string).collect()));
         load_pins();
         fly::init(GetModuleHandleW(null()));
-        thread::spawn(fly::load_apps);
+        apps::pinned_load();
+        apps::set_icon_px(bar_icon_px());
+        thread::spawn(apps::load);
         thread::spawn(winrust_common::mem::auto_loop); // standby purge when memory runs short, switched on from the task manager's Speed page
         let hi = GetModuleHandleW(null());
         let class = wide("topbar");

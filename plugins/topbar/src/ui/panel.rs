@@ -20,19 +20,24 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_SHIFT};
+use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, WM_ACTIVATE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, GetForegroundWindow, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MSGFLT_ALLOW,
+    PostMessageW, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos,
+    ShowWindow, WM_ACTIVATE, WM_CHAR, WM_DROPFILES, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use winrust_common::style::{self, Anim, Side};
 
-use super::anim::{self, CubicBezier, POP, Transition};
+use super::anim::{self, CubicBezier, EASE, POP, Transition};
 use super::gfx::{Canvas, Gfx, Picture, Rect, Rgba, Surface, Xf};
 
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
@@ -95,13 +100,17 @@ pub struct Anchor {
 }
 
 /// How the panel's box lines up with its button along the bar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Along {
     Center,
     /// Right (or bottom) edges together.
     End,
     /// Left (or top) edges together.
     Start,
+    /// The middle of the screen above a bottom bar, the bottom of the screen beside a side bar: the Start menu.
+    Screen,
+    /// Centred on the screen, this many DIPs from its top edge whatever the bar does: the search box.
+    Top(f32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +147,19 @@ pub struct Look {
     pub ring_out: Rgba,
     /// `inset 0 0 0 1px` inside it.
     pub ring_in: Rgba,
+    /// `inset 0 1px 0 <c>`: the lit top edge (Start).
+    pub top_light: Rgba,
     pub shadow: Shadow,
+    /// A dimmed screen under the panel (the search box).
+    pub scrim: Option<Scrim>,
+}
+
+/// The sheet behind a panel that dims the screen, in its own window below the panel: its colour and how fast it comes and goes.
+#[derive(Clone, Copy, Debug)]
+pub struct Scrim {
+    pub color: Rgba,
+    pub fade_in: u32,
+    pub fade_out: u32,
 }
 
 impl Look {
@@ -152,8 +173,21 @@ impl Look {
             saturate: 1.6,
             ring_out: Rgba::css(0, 0, 0, 0.5),
             ring_in: Rgba::white(0.1),
+            top_light: Rgba::TRANSPARENT,
             shadow,
+            scrim: None,
         }
+    }
+
+    /// Adds `inset 0 1px 0 rgba(255,255,255,a)`.
+    #[must_use]
+    pub const fn lit_top(self, a: f32) -> Self {
+        Self { top_light: Rgba::white(a), ..self }
+    }
+
+    #[must_use]
+    pub const fn dimming(self, scrim: Scrim) -> Self {
+        Self { scrim: Some(scrim), ..self }
     }
 
     /// The dense panel: `rgba(27,28,34,.94)`, blur 30 (quick settings, calendar, tray, keyboard layout).
@@ -166,7 +200,9 @@ impl Look {
             saturate: 1.0,
             ring_out: Rgba::css(0, 0, 0, 0.55),
             ring_in: Rgba::white(0.09),
+            top_light: Rgba::TRANSPARENT,
             shadow,
+            scrim: None,
         }
     }
 }
@@ -331,6 +367,13 @@ impl Cx {
     }
 }
 
+/// Modifier keys held with a key.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub shift: bool,
+}
+
 /// What a frame hands to a content while it draws.
 pub struct Frame<'a> {
     pub now: u64,
@@ -420,6 +463,38 @@ pub trait Content {
     fn place(&self) -> Place {
         Place::default()
     }
+    /// Where the bar button is, in the box's own DIPs, once the box has been placed (before `entry` and `exit` are asked:
+    /// the reveal grows from the button, wherever the button is).
+    fn placed(&mut self, _button: Rect, _side: Side) {}
+    /// The box's height now, when it is less than what `size` said (a list that grows and shrinks): the window keeps the
+    /// largest size, the glass and the rings follow this.
+    fn extent(&self) -> Option<f32> {
+        None
+    }
+    /// The panel has a text field: Space is a letter, not a click, and characters go to `text`.
+    fn typing(&self) -> bool {
+        false
+    }
+    /// A typed character; backspace is `\u{8}`, Ctrl+Backspace `\u{7f}`, Ctrl+A `\u{1}`.
+    fn text(&mut self, _ch: char, _cx: &mut Cx) {}
+    /// Esc: true if the content used it (cleared its field), false to close the panel.
+    fn escape(&mut self) -> bool {
+        false
+    }
+    /// Enter on the hovered item (`None` when nothing is under the pointer or the keys).
+    fn enter(&mut self, hover: Option<i32>, _mods: Mods, cx: &mut Cx) {
+        if let Some(id) = hover {
+            self.click(id, Button::Left, cx);
+        }
+    }
+    /// The wheel turned over the panel at a point of the box (`up`: away from the user).
+    fn wheel(&mut self, _x: f32, _y: f32, _up: bool) {}
+    /// Files dropped on the panel.
+    fn files(&mut self, _paths: Vec<String>, _cx: &mut Cx) {}
+    /// The panel stays open when a file drag that began in another window takes the focus.
+    fn keeps_open_on_drag(&self) -> bool {
+        false
+    }
     /// The box in DIPs; asked once, before the panel is shown.
     fn size(&mut self, g: &mut Gfx) -> (f32, f32);
     /// Draws the inside of the box (the glass, the tint and the rings are already there).
@@ -454,6 +529,10 @@ pub struct Shown {
     pub win: (i32, i32, i32, i32),
     pub shadow: (i32, i32, i32, i32),
     pub shadow_alpha: u8,
+    /// How many times the shadow was painted anew (its window must be presented again).
+    pub shadow_gen: u32,
+    /// The scrim's rectangle (the screen) and opacity.
+    pub scrim: Option<((i32, i32, i32, i32), u8)>,
     /// Another frame is needed.
     pub busy: bool,
     /// The exit has finished: the windows can go.
@@ -491,7 +570,11 @@ pub struct Popup {
     glass: Option<(Picture, i32, i32)>,
     surf: Surface,
     shade: Surface,
-    shade_done: bool,
+    shade_h: f32,
+    shade_gen: u32,
+    scrim: Surface,
+    scrim_done: bool,
+    screen: (i32, i32),
     last: Shown,
 }
 
@@ -533,11 +616,14 @@ impl Popup {
         grab: &mut dyn FnMut(i32, i32, i32, i32) -> Option<Vec<u32>>,
     ) -> Self {
         let s = g.scale();
-        let (look, entry, exit, place) = (content.look(), content.entry(), content.exit(), content.place());
+        let (look, place) = (content.look(), content.place());
         let (w, h) = content.size(g);
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
         let size = (bw as f32 / s, bh as f32 / s);
         let at = place_box(&anchor, (bw, bh), place, s);
+        let b = anchor.button;
+        content.placed(Rect::new((b.0 - at.0) as f32 / s, (b.1 - at.1) as f32 / s, (b.2 - b.0) as f32 / s, (b.3 - b.1) as f32 / s), anchor.side);
+        let (entry, exit) = (content.entry(), content.exit());
         // the room the motion needs around the box
         let origin = |o: Origin| match o {
             Origin::Frac(fx, fy) => (fx * size.0, fy * size.1),
@@ -556,7 +642,12 @@ impl Popup {
         // what the glass blurs: the panel window and the blur's reach beyond it
         let reach_px = (look.blur * 3.0 * s).ceil() as i32;
         let cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
-        let cap = backdrop(cr, anchor.screen, grab).map(|px| (px, cr));
+        let mut cap = backdrop(cr, anchor.screen, grab).map(|px| (px, cr));
+        // the scrim lies over the screen under the box: what the glass blurs is the dimmed screen, as in a browser
+        if let (Some(sc), Some((px, _))) = (look.scrim, cap.as_mut()) {
+            let ch = |p: u32, shift: u32, c: f32| (((p >> shift) & 255) as f32 * (1.0 - sc.color.a) + c * 255.0 * sc.color.a).round() as u32;
+            px.iter_mut().for_each(|p| *p = 0xff00_0000 | ch(*p, 16, sc.color.r) << 16 | ch(*p, 8, sc.color.g) << 8 | ch(*p, 0, sc.color.b));
+        }
         g.forget_icons();
         Self {
             id: content.id(),
@@ -581,7 +672,11 @@ impl Popup {
             glass: None,
             surf: Surface::new(),
             shade: Surface::new(),
-            shade_done: false,
+            shade_h: -1.0,
+            shade_gen: 0,
+            scrim: Surface::new(),
+            scrim_done: false,
+            screen: anchor.screen,
             last: Shown::default(),
         }
     }
@@ -615,6 +710,21 @@ impl Popup {
     #[must_use]
     pub const fn last(&self) -> &Shown {
         &self.last
+    }
+
+    #[must_use]
+    pub const fn scrim_surface(&self) -> &Surface {
+        &self.scrim
+    }
+
+    #[must_use]
+    pub const fn has_scrim(&self) -> bool {
+        self.look.scrim.is_some()
+    }
+
+    #[must_use]
+    pub fn keeps_open_on_drag(&self) -> bool {
+        self.content.keeps_open_on_drag()
     }
 
     fn local(&self, x: i32, y: i32) -> (f32, f32) {
@@ -668,7 +778,7 @@ impl Popup {
     }
 
     /// A key went down; Esc closes, arrows move the hover, Enter and Space click it.
-    pub fn key(&mut self, vk: u32) -> Cx {
+    pub fn key(&mut self, vk: u32, mods: Mods) -> Cx {
         let mut cx = Cx::default();
         if self.closing.is_some() {
             return cx;
@@ -683,8 +793,14 @@ impl Popup {
             _ => None,
         };
         match (vk, dir) {
-            (VK_ESCAPE, _) => cx.close(),
-            (VK_RETURN | VK_SPACE, _) => {
+            (VK_ESCAPE, _) => {
+                if !self.content.escape() {
+                    cx.close();
+                }
+            }
+            (VK_RETURN, _) => self.content.enter(self.hover, mods, &mut cx),
+            (VK_SPACE, _) if self.content.typing() => {}
+            (VK_SPACE, _) => {
                 if let Some(id) = self.hover {
                     self.content.click(id, Button::Left, &mut cx);
                 }
@@ -695,6 +811,32 @@ impl Popup {
                 }
             }
             _ => {}
+        }
+        cx
+    }
+
+    /// A typed character.
+    pub fn text(&mut self, ch: char) -> Cx {
+        let mut cx = Cx::default();
+        if self.closing.is_none() && (ch >= ' ' || matches!(ch, '\u{1}' | '\u{8}')) {
+            self.content.text(ch, &mut cx);
+        }
+        cx
+    }
+
+    /// The wheel turned with the pointer at a client point.
+    pub fn wheel(&mut self, x: i32, y: i32, up: bool) {
+        if self.closing.is_none() {
+            let (lx, ly) = self.local(x, y);
+            self.content.wheel(lx, ly, up);
+        }
+    }
+
+    /// Files were dropped on the window.
+    pub fn files(&mut self, paths: Vec<String>) -> Cx {
+        let mut cx = Cx::default();
+        if self.closing.is_none() {
+            self.content.files(paths, &mut cx);
         }
         cx
     }
@@ -772,7 +914,8 @@ impl Popup {
     pub fn frame(&mut self, g: &mut Gfx, now: u64) -> Shown {
         self.mo.mode = Some(style::anim());
         let (pose, open) = self.pose(now);
-        let (w, h) = self.size;
+        let (w, full_h) = self.size;
+        let h = self.content.extent().map_or(full_h, |e| e.min(full_h));
         let m = self.m;
         let s = self.scale;
         let (o_in, o_out) = (self.origin(self.entry.origin), self.origin(self.exit.origin));
@@ -782,9 +925,10 @@ impl Popup {
         let leaving = self.closing.map_or(0, |(tc, _)| now.saturating_sub(tc).max(1));
         let (win, hover, press) = (self.win, self.hover, self.press);
 
-        // the shadow is painted once, at rest; its opacity follows the panel's
-        if !self.shade_done {
-            self.shade_done = true;
+        // the shadow is painted once, at rest (again when the box changes its height); its opacity follows the panel's
+        if (self.shade_h - h).abs() > 0.01 {
+            self.shade_h = h;
+            self.shade_gen += 1;
             let (sw, sh) = (self.sh.2, self.sh.3);
             let pad = (self.at.0 - self.sh.0) as f32 / s;
             let r = Rect::new(pad, pad, w, h);
@@ -794,6 +938,24 @@ impl Popup {
                 c.erase(r, look.radius);
             });
         }
+
+        // the sheet that dims the screen: painted once, its opacity comes and goes with the panel
+        let scrim = self.look.scrim.map(|sc| {
+            if !self.scrim_done {
+                self.scrim_done = true;
+                let (sw, sh) = (self.screen.0, self.screen.1);
+                let _ = g.paint(&mut self.scrim, sw, sh, |c| c.fill(Rect::new(0.0, 0.0, sw as f32 / s, sh as f32 / s), 0.0, sc.color));
+            }
+            let fade = |ms: u32, t: u64| {
+                let (dur, _) = anim::timing(style::anim(), ms, 0);
+                if dur == 0 { 1.0 } else { EASE.ease((t as f32 / dur as f32).clamp(0.0, 1.0)) }
+            };
+            let k = match self.closing {
+                None => fade(sc.fade_in, age),
+                Some((tc, _)) => fade(sc.fade_in, tc.saturating_sub(self.t0)) * (1.0 - fade(sc.fade_out, now.saturating_sub(tc))),
+            };
+            ((0, 0, self.screen.0, self.screen.1), (255.0 * k).round() as u8)
+        });
 
         let Self { content, mo, cap, glass, surf, .. } = self;
         let _ = g.paint(surf, win.2, win.3, |c| {
@@ -814,6 +976,7 @@ impl Popup {
                             let tint = if glass.is_some() { look.tint } else { look.tint.alpha(look.tint.a.max(0.97)) };
                             c.fill(Rect::new(0.0, 0.0, w, h), look.radius, tint);
                             c.ring(Rect::new(0.0, 0.0, w, h), look.radius, 1.0, look.ring_in);
+                            c.inset_edge(Rect::new(0.0, 0.0, w, h), look.radius, 1.0, look.top_light);
                             content.draw(c, &mut f);
                         });
                     });
@@ -826,6 +989,8 @@ impl Popup {
             win: self.win,
             shadow: self.sh,
             shadow_alpha: (255.0 * shadow_k.clamp(0.0, 1.0)).round() as u8,
+            shadow_gen: self.shade_gen,
+            scrim,
             busy: self.busy(now),
             done: self.finished(now),
         };
@@ -855,10 +1020,24 @@ fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
     let (l, t, r, b) = a.button;
     let edge = (8.0 * s).round() as i32;
     let along = |lo: i32, hi: i32, len: i32| match p.along {
-        Along::Center => (lo + hi) / 2 - len / 2,
+        Along::Center | Along::Screen | Along::Top(_) => (lo + hi) / 2 - len / 2,
         Along::Start => lo,
         Along::End => hi - len,
     };
+    let middle = (a.screen.0 - w) / 2;
+    match p.along {
+        // the screen's own places: the Start menu's middle (or bottom corner) and the search box's top
+        Along::Top(top) => return (middle.max(edge), (top * s).round() as i32),
+        Along::Screen => {
+            let bottom = (a.screen.1 - gap - h).max(edge);
+            return match a.side {
+                Side::Bottom => (middle.clamp(edge, (a.screen.0 - edge - w).max(edge)), a.bar.1 - gap - h),
+                Side::Left => (a.bar.2 + gap, bottom),
+                Side::Right => (a.bar.0 - gap - w, bottom),
+            };
+        }
+        _ => {}
+    }
     match a.side {
         Side::Bottom => ((along(l, r, w)).clamp(edge, (a.screen.0 - edge - w).max(edge)), a.bar.1 - gap - h),
         Side::Left => (a.bar.2 + gap, along(t, b, h).clamp(edge, (a.screen.1 - edge - h).max(edge))),
@@ -875,13 +1054,33 @@ struct Host {
     grab: Surface,
     panel: HWND,
     shadow: HWND,
+    scrim: HWND,
     bar: HWND,
     notify: fn(),
     scale: f32,
     /// A panel closed by losing the focus, and when: its own button must not open it again at once.
     deact: Option<(Id, u64)>,
     timer: bool,
-    shown: (i32, i32, i32, i32, u8),
+    shown: (i32, i32, i32, i32, u8, u32),
+    scrim_shown: u8,
+}
+
+/// The panel window, for the threads that ask for a repaint (a search that finished, an icon that arrived).
+static PANEL: AtomicIsize = AtomicIsize::new(0);
+
+/// The open panel's window, null when there is none (a menu that must belong to it).
+#[must_use]
+pub fn hwnd() -> HWND {
+    PANEL.load(Relaxed) as HWND
+}
+
+/// Asks for a frame of the open panel; may be called from any thread.
+pub fn refresh() {
+    let h = hwnd();
+    if !h.is_null() {
+        // SAFETY: posting to a window of ours; a window that is gone just drops the message.
+        unsafe { PostMessageW(h, WM_USER, 0, 0) };
+    }
 }
 
 thread_local! {
@@ -907,10 +1106,12 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
     let Ok(gfx) = Gfx::new(scale) else { return false };
     let name: Vec<u16> = "topbar_panel\0".encode_utf16().collect();
     let shade: Vec<u16> = "topbar_panel_shadow\0".encode_utf16().collect();
+    let sheet: Vec<u16> = "topbar_panel_scrim\0".encode_utf16().collect();
     // SAFETY: class and window creation with live, NUL-terminated names.
-    let (panel, shadow) = unsafe {
+    let (panel, shadow, scrim) = unsafe {
         register_class(hi, &name, Some(proc), true);
         register_class(hi, &shade, Some(DefWindowProcW), false);
+        register_class(hi, &sheet, Some(DefWindowProcW), false);
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
         let panel = CreateWindowExW(ex, name.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null());
         let shadow = CreateWindowExW(
@@ -927,12 +1128,46 @@ pub fn init(hi: HINSTANCE, scale: f32, bar: HWND, notify: fn()) -> bool {
             hi,
             std::ptr::null(),
         );
-        (panel, shadow)
+        let scrim = CreateWindowExW(
+            ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            sheet.as_ptr(),
+            std::ptr::null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hi,
+            std::ptr::null(),
+        );
+        // files dragged from a normal-rights window onto an elevated panel (the Start menu pins what is dropped on it)
+        DragAcceptFiles(panel, 1);
+        for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, 0x4A /* WM_COPYDATA */] {
+            ChangeWindowMessageFilterEx(panel, m, MSGFLT_ALLOW, std::ptr::null_mut());
+        }
+        (panel, shadow, scrim)
     };
-    if panel.is_null() || shadow.is_null() {
+    if panel.is_null() || shadow.is_null() || scrim.is_null() {
         return false;
     }
-    HOST.set(Some(Host { gfx, popup: None, grab: Surface::new(), panel, shadow, bar, notify, scale, deact: None, timer: false, shown: (0, 0, 0, 0, 0) }));
+    PANEL.store(panel as isize, Relaxed);
+    HOST.set(Some(Host {
+        gfx,
+        popup: None,
+        grab: Surface::new(),
+        panel,
+        shadow,
+        scrim,
+        bar,
+        notify,
+        scale,
+        deact: None,
+        timer: false,
+        shown: (0, 0, 0, 0, 0, 0),
+        scrim_shown: 0,
+    }));
     true
 }
 
@@ -964,16 +1199,25 @@ pub fn open(content: Box<dyn Content>, anchor: Anchor) {
         let Host { gfx, grab, .. } = h;
         let mut grabber = |x, y, w, ht| if grab.grab(x, y, w, ht) { Some(grab.pixels().to_vec()) } else { None };
         let p = Popup::new(gfx, content, anchor, t, &mut grabber);
+        let dims = p.has_scrim();
         h.popup = Some(p);
-        h.shown = (0, 0, 0, 0, 0);
+        h.shown = (0, 0, 0, 0, 0, 0);
+        h.scrim_shown = 0;
         h.frame(t);
-        // SAFETY: z-order and focus of our own windows: shadow under the panel, the bar above both.
+        // SAFETY: z-order and focus of our own windows: shadow under the panel, the bar above both (under the scrim, which
+        // dims it with the rest of the screen).
         unsafe {
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            if dims {
+                SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                SetWindowPos(h.scrim, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+            }
             SetWindowPos(h.shadow, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
             SetWindowPos(h.panel, HWND_TOPMOST, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
             SetWindowPos(h.shadow, h.panel, 0, 0, 0, 0, flags);
-            SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            if !dims {
+                SetWindowPos(h.bar, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
             winrust_common::fg::force(h.panel); // WM_ACTIVATE tells us when the user clicks elsewhere, and Esc needs the focus
         }
         (h.notify)();
@@ -997,6 +1241,11 @@ pub fn toggle(id: Id, build: impl FnOnce() -> Option<(Box<dyn Content>, Anchor)>
             }
         }
     }
+}
+
+/// Forgets that a panel was just closed by losing the focus (a key, not a click on the button, asks to open it).
+pub fn forget_deact() {
+    with(|h| h.deact = None);
 }
 
 /// Closes the open panel with its exit animation.
@@ -1033,10 +1282,16 @@ impl Host {
         let shown = p.frame(&mut self.gfx, t);
         let (win, sh) = (shown.win, shown.shadow);
         let s = whwnd(self.shadow);
-        let key = (sh.0, sh.1, sh.2, sh.3, shown.shadow_alpha);
+        let key = (sh.0, sh.1, sh.2, sh.3, shown.shadow_alpha, shown.shadow_gen);
         if key != self.shown {
             self.shown = key;
             let _ = p.surfaces().1.present(s, sh.0, sh.1, shown.shadow_alpha);
+        }
+        if let Some((r, a)) = shown.scrim
+            && a != self.scrim_shown
+        {
+            self.scrim_shown = a;
+            let _ = p.scrim_surface().present(whwnd(self.scrim), r.0, r.1, a);
         }
         let _ = p.surfaces().0.present(whwnd(self.panel), win.0, win.1, 255);
         let done = shown.done;
@@ -1068,11 +1323,27 @@ impl Host {
         unsafe {
             ShowWindow(self.panel, SW_HIDE);
             ShowWindow(self.shadow, SW_HIDE);
+            ShowWindow(self.scrim, SW_HIDE);
         }
         if had {
             (self.notify)();
         }
     }
+}
+
+/// The focus went elsewhere: the panel closes, and its own button's click must not open it again.
+fn lost_focus() {
+    with(|h| {
+        if let Some(id) = h.popup.as_ref().filter(|p| !p.is_closing()).map(Popup::id) {
+            h.deact = Some((id, now()));
+        }
+    });
+    close();
+}
+
+fn kill_timer(hwnd: HWND, id: usize) {
+    // SAFETY: a timer of our own window.
+    unsafe { KillTimer(hwnd, id) };
 }
 
 fn apply(cx: Cx) {
@@ -1117,7 +1388,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         0x0202 | 0x0205 | 0x0208 => _ = with(|h| h.popup.as_mut().map(Popup::release)), // WM_xBUTTONUP
         WM_KEYDOWN => {
-            let cx = with(|h| h.popup.as_mut().map(|p| p.key(wp as u32))).flatten();
+            // SAFETY: reading the keyboard state.
+            let mods = unsafe { Mods { ctrl: GetKeyState(VK_CONTROL as i32) < 0, shift: GetKeyState(VK_SHIFT as i32) < 0 } };
+            let cx = with(|h| h.popup.as_mut().map(|p| p.key(wp as u32, mods))).flatten();
             if let Some(cx) = cx {
                 with(|h| {
                     h.sync_tip();
@@ -1126,15 +1399,70 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 apply(cx);
             }
         }
-        // the focus went elsewhere: the panel goes (a click on its own button then must not bring it back)
-        WM_ACTIVATE if wp & 0xffff == 0 => {
-            with(|h| {
-                if let Some(id) = h.popup.as_ref().filter(|p| !p.is_closing()).map(Popup::id) {
-                    h.deact = Some((id, now()));
-                }
-            });
-            close();
+        WM_CHAR => {
+            let cx = char::from_u32(wp as u32).and_then(|ch| with(|h| h.popup.as_mut().map(|p| p.text(ch))).flatten());
+            if let Some(cx) = cx {
+                with(|h| h.frame(now()));
+                apply(cx);
+            }
         }
+        WM_MOUSEWHEEL => {
+            let mut pt = POINT { x: lp as i16 as i32, y: (lp >> 16) as i16 as i32 };
+            // SAFETY: the point is a local; the window is ours.
+            unsafe { ScreenToClient(hwnd, &mut pt) };
+            let up = (wp >> 16) as i16 > 0;
+            with(|h| {
+                if let Some(p) = h.popup.as_mut() {
+                    p.wheel(pt.x, pt.y, up);
+                }
+                h.frame(now());
+            });
+        }
+        WM_DROPFILES => {
+            let hd = wp as HDROP;
+            // SAFETY: `hd` is the drop handle this message carries; it is released once.
+            let paths: Vec<String> = unsafe {
+                let n = DragQueryFileW(hd, u32::MAX, std::ptr::null_mut(), 0);
+                let list = (0..n)
+                    .map(|i| {
+                        let len = DragQueryFileW(hd, i, std::ptr::null_mut(), 0) as usize;
+                        let mut b = vec![0u16; len + 1];
+                        DragQueryFileW(hd, i, b.as_mut_ptr(), b.len() as u32);
+                        String::from_utf16_lossy(&b[..len])
+                    })
+                    .collect();
+                DragFinish(hd);
+                list
+            };
+            kill_timer(hwnd, 6);
+            let cx = with(|h| h.popup.as_mut().map(|p| p.files(paths))).flatten();
+            if let Some(cx) = cx {
+                with(|h| h.frame(now()));
+                apply(cx);
+            }
+            winrust_common::fg::force(hwnd); // active again, so a later click elsewhere closes it as usual
+        }
+        // the focus went elsewhere: the panel goes (a click on its own button then must not bring it back). A file drag that
+        // began in another window deactivates the panel with the button still down: the Start menu waits for the drop.
+        WM_ACTIVATE if wp & 0xffff == 0 => {
+            let wait = with(|h| h.popup.as_ref().is_some_and(|p| !p.is_closing() && p.keeps_open_on_drag())).unwrap_or(false);
+            // SAFETY: reading the button state; a timer on our own window.
+            if wait && unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0 {
+                unsafe { SetTimer(hwnd, 6, 150, None) };
+            } else {
+                lost_focus();
+            }
+        }
+        WM_TIMER if wp == 6 => {
+            // SAFETY: reading the button state and the foreground window.
+            if unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } >= 0 {
+                kill_timer(hwnd, 6);
+                if unsafe { GetForegroundWindow() } != hwnd {
+                    lost_focus();
+                }
+            }
+        }
+        WM_USER => _ = with(|h| h.frame(now())),
         WM_TIMER => _ = with(|h| h.frame(now())),
         _ => {
             // SAFETY: the default procedure of our own window.
@@ -1192,5 +1520,30 @@ mod tests {
         p.close(500);
         assert!(p.is_closing());
         assert!(p.frame(&mut g, 600).done, "the tray has no exit animation");
+    }
+
+    #[test]
+    fn start_stands_in_the_middle_of_the_screen_and_search_hangs_from_its_top_over_a_scrim() {
+        use crate::ui::{search_panel::SearchPanel, start_panel::StartPanel};
+        // SAFETY: COM for WIC on this test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).unwrap();
+        let anchor = Anchor { side: Side::Bottom, button: (552, 852, 594, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
+
+        let mut start = Popup::new(&mut g, Box::new(StartPanel::with_state("", 0, Vec::new(), Vec::new(), ("A".into(), String::new()))), anchor, 0, &mut grab);
+        assert_eq!(start.rect(), (396, 846 - 12 - 569, 648, 569)); // centred on the screen, 12 above the bar, whatever the button's place
+        let shown = start.frame(&mut g, 5000);
+        assert!(shown.scrim.is_none() && !shown.busy, "Start dims nothing and has settled");
+
+        let mut search = Popup::new(&mut g, Box::new(SearchPanel::with_query(900.0, "", Vec::new(), Vec::new())), anchor, 0, &mut grab);
+        let (x, y, w, _) = search.rect();
+        assert_eq!((x, y, w), (400, 150, 640));
+        let shown = search.frame(&mut g, 5000);
+        assert_eq!(shown.scrim.map(|s| (s.0, s.1)), Some(((0, 0, 1440, 900), 255)), "the whole screen is dimmed once it has come in");
+        search.close(5000);
+        let mid = search.frame(&mut g, 5090);
+        assert!(mid.scrim.is_some_and(|s| s.1 > 0 && s.1 < 255) && !mid.done, "the scrim fades with the box");
+        assert!(search.frame(&mut g, 5200).done);
     }
 }

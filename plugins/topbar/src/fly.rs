@@ -1,9 +1,7 @@
-// Own flyouts instead of the stock Windows ones: Start (search + all apps + power), Wi-Fi, volume, battery
+// Own flyouts instead of the stock Windows ones: Wi-Fi, volume, battery
 // (+ brightness), calendar. One popup window; what it shows depends on `Kind`.
 use super::*;
-use std::sync::Mutex;
 use std::{
-    collections::HashMap,
     sync::atomic::{AtomicI32, Ordering::Relaxed},
 };
 
@@ -12,7 +10,6 @@ pub enum Kind {
     Quick,
     Wifi,
     Cal,
-    Start,
     Menu, // right-click menu of the bar
 }
 
@@ -32,17 +29,7 @@ enum Act {
     CalPrev,
     CalNext,
     CalToday,
-    App(usize), // index into the filtered list
-    Power(u8),  // 0 lock, 1 sleep, 2 restart, 3 shut down
     Media(u8),  // quick settings' player: 0 previous, 1 play / pause, 2 next
-    Keyboard,   // the on-screen keyboard button in the Start search field
-}
-
-/// The touch keyboard (TabTip), else the classic on-screen keyboard. Windows opens it by itself only for the Explorer shell.
-fn touch_keyboard() {
-    let tip = std::env::var_os("CommonProgramFiles").map(|p| std::path::PathBuf::from(p).join(r"microsoft shared\ink\TabTip.exe"));
-    let exe = tip.filter(|p| p.is_file()).unwrap_or_else(|| "osk.exe".into());
-    let _ = std::process::Command::new(exe).spawn();
 }
 
 struct Net {
@@ -89,10 +76,8 @@ fn phy_name(t: i32) -> &'static str {
     }
 }
 
-static APPS: Mutex<Vec<(String, Vec<u16>)>> = Mutex::new(Vec::new()); // Start menu shortcuts: (name, .lnk path)
 pub static PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // `--preview`: stays open without focus
 static BRIGHT: AtomicI32 = AtomicI32::new(-1); // -1 = no controllable display (desktop PC)
-const ROWS: usize = 11;
 
 thread_local! {
     static FLY: Cell<Option<Kind>> = const { Cell::new(None) };
@@ -105,11 +90,6 @@ thread_local! {
     static NOTE: RefCell<String> = const { RefCell::new(String::new()) };
     static CONNECTING: RefCell<Option<(String, u64)>> = const { RefCell::new(None) }; // the network being joined and since when: its row animates
     static CTX: RefCell<Option<(String, i32, i32, u64)>> = const { RefCell::new(None) }; // Wi-Fi right-click menu: network (by name: the list reorders), x, y (px), opened at
-    static QUERY: RefCell<String> = const { RefCell::new(String::new()) };
-    static SCROLL: Cell<usize> = const { Cell::new(0) };
-    static SELALL: Cell<bool> = const { Cell::new(false) }; // Ctrl+A in the search: the next key replaces the query
-    static ICONS: RefCell<HashMap<Vec<u16>, HICON>> = RefCell::new(HashMap::new()); // by path: the app list is reloaded and reordered
-    static SEL: Cell<usize> = const { Cell::new(0) }; // Start: the row Enter opens (arrow keys move it)
     static OVER: Cell<Option<Act>> = const { Cell::new(None) };
     static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider
     static MENU_X: Cell<i32> = const { Cell::new(0) };
@@ -117,7 +97,6 @@ thread_local! {
     static CONFIRM: Cell<i32> = const { Cell::new(-1) };
     static FIN: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // where the open flyout rests
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started opening
-    static JUST: RefCell<(String, u64)> = const { RefCell::new((String::new(), 0)) }; // the app pinned last and when: its row pulses
     static GHOST: Cell<(HWND, u64, (i32, i32))> = const { Cell::new((null_mut(), 0, (0, 0))) }; // the closing flyout: window, start, position
 }
 
@@ -160,159 +139,6 @@ fn weekday_initials() -> [&'static str; 7] {
     ]
 }
 
-// ---------- data ----------
-
-/// Background: collects the Start menu shortcuts once.
-pub fn load_apps() {
-    fn walk(dir: &std::path::Path, depth: u8, out: &mut Vec<(String, Vec<u16>)>) {
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() && depth < 4 {
-                walk(&p, depth + 1, out);
-            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
-                let name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                if !name.to_lowercase().contains("uninstall") {
-                    out.push((name, wide(&p.to_string_lossy())));
-                }
-            }
-        }
-    }
-    let mut v = Vec::new();
-    for (var, sub) in [("ProgramData", r"Microsoft\Windows\Start Menu\Programs"), ("APPDATA", r"Microsoft\Windows\Start Menu\Programs")] {
-        if let Some(b) = std::env::var_os(var) {
-            walk(&PathBuf::from(b).join(sub), 0, &mut v);
-        }
-    }
-    // Store apps (Settings, Calculator, Terminal, Photos...) have no .lnk: the shell's Apps folder lists them
-    let have: std::collections::HashSet<String> = v.iter().map(|a| a.0.to_lowercase()).collect();
-    for (name, id) in apps_folder() {
-        let ok = id.contains('!') || id.to_lowercase().ends_with(".exe") || id.starts_with("Microsoft.Windows."); // apps, not docs / web links
-        if ok && !have.contains(&name.to_lowercase()) && !name.to_lowercase().contains("uninstall") {
-            v.push((name, wide(&format!(r"shell:AppsFolder\{id}"))));
-        }
-    }
-    v.sort_by_key(|a| a.0.to_lowercase());
-    v.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
-    *APPS.lock().unwrap() = v;
-}
-
-/// (display name, app id) of everything in the shell's Apps folder (what the Windows Start menu lists).
-pub fn apps_folder() -> Vec<(String, String)> {
-    use windows::Win32::{
-        System::Com::CoTaskMemFree,
-        UI::Shell::{BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING},
-    };
-    let mut out = vec![];
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // this runs on its own thread
-        let Ok(folder) = SHGetKnownFolderItem::<IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None) else { return out };
-        let Ok(en) = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return out };
-        loop {
-            let mut items = [None];
-            let mut got = 0u32;
-            if en.Next(&mut items, Some(&mut got)).is_err() || got == 0 {
-                break;
-            }
-            let Some(it) = items[0].take() else { break };
-            let name = |k: SIGDN| {
-                it.GetDisplayName(k).ok().map(|p| {
-                    let s = p.to_string().unwrap_or_default();
-                    CoTaskMemFree(Some(p.0 as *const _));
-                    s
-                })
-            };
-            if let (Some(n), Some(id)) = (name(SIGDN_NORMALDISPLAY), name(SIGDN_PARENTRELATIVEPARSING)) {
-                out.push((n, id));
-            }
-        }
-    }
-    out
-}
-
-const EN_KEYS: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-const RU_KEYS: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
-
-/// The same keys typed in the other layout: "сркщьу" -> "chrome", "ntktuhfv" -> "телеграм".
-fn flip_layout(q: &str) -> String {
-    let (en, ru): (Vec<char>, Vec<char>) = (EN_KEYS.chars().collect(), RU_KEYS.chars().collect());
-    q.chars().map(|c| en.iter().position(|&x| x == c).map(|i| ru[i]).or_else(|| ru.iter().position(|&x| x == c).map(|i| en[i])).unwrap_or(c)).collect()
-}
-
-/// How well an app name matches the query (both lower-case): 0 the name starts with it, 1 a word does, 2 the word
-/// initials do ("vsc" = Visual Studio Code), 3 it is somewhere inside; None = no match.
-fn score(name: &str, q: &str) -> Option<u8> {
-    if q.is_empty() {
-        return None;
-    }
-    let words: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
-    if name.starts_with(q) {
-        Some(0)
-    } else if words.iter().any(|w| w.starts_with(q)) {
-        Some(1)
-    } else if q.chars().count() >= 2 && initials.starts_with(q) {
-        Some(2)
-    } else if name.contains(q) {
-        Some(3)
-    } else {
-        None
-    }
-}
-
-// ---------- apps pinned to the Start panel (empty at first; added from right-click menus) ----------
-
-static PINNED: Mutex<Vec<String>> = Mutex::new(Vec::new()); // paths of .lnk / .exe files, in the order they were added
-
-fn pin_file() -> PathBuf {
-    appdata_file("topbar-start.txt")
-}
-
-fn pinned_load() {
-    *PINNED.lock().unwrap() = std::fs::read_to_string(pin_file()).map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default();
-}
-
-fn wstr(w: &[u16]) -> String {
-    String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())])
-}
-
-pub fn start_pinned(path: &str) -> bool {
-    PINNED.lock().unwrap().iter().any(|p| p.eq_ignore_ascii_case(path))
-}
-
-/// Files dropped on the open Start panel are added to it; the panel stays open and the new row pulses.
-unsafe fn on_files(hw: HWND, hd: HDROP) {
-    let n = DragQueryFileW(hd, u32::MAX, null_mut(), 0);
-    let mut added = vec![];
-    for i in 0..n {
-        let len = DragQueryFileW(hd, i, null_mut(), 0) as usize;
-        let mut b = vec![0u16; len + 1];
-        DragQueryFileW(hd, i, b.as_mut_ptr(), b.len() as u32);
-        let path = String::from_utf16_lossy(&b[..len]);
-        if start_pin(&path) {
-            added.push(std::path::Path::new(&path).file_stem().unwrap_or_default().to_string_lossy().to_string());
-        }
-    }
-    DragFinish(hd);
-    note(&match added.len() {
-        0 => t!("Уже в Пуске", "Already in Start", ja: "すでにスタートにあります", pt: "Já está no Iniciar", zh: "已在开始菜单中").to_string(),
-        1 => format!("Added to Start: {}", added[0]),
-        n => format!("Added {n} items to Start"),
-    });
-    KillTimer(hw, 6);
-    InvalidateRect(hw, null(), 0);
-    force_fg(hw); // active again, so a later click elsewhere closes it as usual
-}
-
-/// Adds the app to the Start panel unless it is already there (a drop on the Start button). true = it was added.
-pub fn start_pin(path: &str) -> bool {
-    if start_pinned(path) {
-        return false;
-    }
-    start_toggle(path);
-    JUST.set((path.to_string(), unsafe { now_ms() }));
-    true
-}
-
 pub fn is_open(k: Kind) -> bool {
     FLY.get() == Some(k)
 }
@@ -324,96 +150,6 @@ pub fn menu_at() -> Option<i32> {
 
 pub fn any_open() -> bool {
     FLY.get().is_some()
-}
-
-/// Short status line shown at the bottom of the open panel (Start: "Added to Start: ...").
-pub fn note(s: &str) {
-    NOTE.set(s.to_string());
-}
-
-/// Adds the app to the Start panel, or removes it when it is already there.
-pub fn start_toggle(path: &str) {
-    let mut p = PINNED.lock().unwrap();
-    match p.iter().position(|x| x.eq_ignore_ascii_case(path)) {
-        Some(i) => drop(p.remove(i)),
-        None => p.push(path.to_string()),
-    }
-    let _ = std::fs::write(pin_file(), p.join("\n"));
-}
-
-static EXE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Programs that have no Start menu shortcut (a loose loliland.exe): asks rust-search for .exe files matching what is typed
-/// and adds them to the app list, where the normal ranking picks them up. Debounced; the panel repaints when they arrive.
-fn find_loose_exes(hw: HWND) {
-    let q = QUERY.with_borrow(|q| q.trim().to_string());
-    let gen_ = EXE_GEN.fetch_add(1, Relaxed) + 1;
-    let rs = PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default()).join(r"rs-search\rs.exe");
-    if q.chars().count() < 2 || !rs.is_file() {
-        return;
-    }
-    let hw = hw as isize;
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if EXE_GEN.load(Relaxed) != gen_ {
-            return; // typed on: a newer search is coming
-        }
-        // straight to the service's pipe: no rs.exe process per query (and no full disk scan when the service is down)
-        let found = winrust_common::search::ask_all(&q);
-        let mut apps = APPS.lock().unwrap();
-        let mut added = false;
-        for line in found.iter().filter(|l| l.to_lowercase().ends_with(".exe")).take(12) {
-            let w = wide(line);
-            if apps.iter().any(|a| a.1 == w) {
-                continue;
-            }
-            let name = std::path::Path::new(line).file_stem().unwrap_or_default().to_string_lossy().to_string();
-            apps.push((name, w));
-            added = true;
-        }
-        drop(apps);
-        if added {
-            unsafe { InvalidateRect(hw as HWND, null(), 0) };
-        }
-    });
-}
-
-fn filtered() -> Vec<usize> {
-    let q = QUERY.with_borrow(|q| q.to_lowercase());
-    let mut apps = APPS.lock().unwrap();
-    if q.is_empty() {
-        let pinned = PINNED.lock().unwrap();
-        // nothing pinned yet: every app, A to Z, like Windows' "All apps" (an empty Start read as "no apps found", #72)
-        if pinned.is_empty() {
-            return (0..apps.len()).collect();
-        }
-        // nothing typed: only what the user pinned (an app that is not a Start menu shortcut joins the list on demand)
-        return pinned
-            .iter()
-            .map(|p| {
-                let w = wide(p);
-                apps.iter().position(|a| a.1 == w).unwrap_or_else(|| {
-                    let stem = std::path::Path::new(p).file_stem().unwrap_or_default().to_string_lossy().to_string();
-                    let name: String = stem.chars().take(1).flat_map(char::to_uppercase).chain(stem.chars().skip(1)).collect();
-                    apps.push((name, w));
-                    apps.len() - 1
-                })
-            })
-            .collect();
-    }
-    // typed in the wrong layout: those matches come after the direct ones
-    let fq = flip_layout(&q);
-    let mut v: Vec<(u8, u32, usize)> = apps
-        .iter()
-        .enumerate()
-        .filter_map(|(i, a)| {
-            let n = a.0.to_lowercase();
-            let s = score(&n, &q).or_else(|| score(&n, &fq).map(|s| s + 4))?;
-            Some((s, u32::MAX - uses(&n), i))
-        })
-        .collect();
-    v.sort_unstable(); // best match, then most launched, then alphabetical (the list is sorted by name)
-    v.into_iter().map(|x| x.2).collect()
 }
 
 /// The built-in panel through the video driver (`\\.\LCD`, what Windows' own slider talks to): needs no admin rights and no
@@ -633,7 +369,6 @@ fn size(k: Kind) -> (i32, i32) {
         Kind::Quick => (360, 252 + 84 + MEDIA_H + 44 * sliders()),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
-        Kind::Start => (560, 640),
         Kind::Menu => (MW, menu_rows().1),
     }
 }
@@ -747,14 +482,6 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             let heads: Vec<bool> = MITEMS.with_borrow(|m| m.iter().map(|it| it.head).collect());
             menu_rows().0.into_iter().enumerate().filter(|(i, _)| !heads[*i]).map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect()
         }
-        Kind::Start => {
-            let f = filtered();
-            let s = SCROLL.get();
-            let mut v: Vec<_> = (0..ROWS).filter(|i| s + i < f.len()).map(|i| (r(12, 76 + 40 * i as i32, w - 12, 76 + 40 * (i as i32 + 1)), Act::App(s + i))).collect();
-            v.extend((0..4u8).map(|i| (r(w - 16 - 4 * 44 + 44 * i as i32, h - 52, w - 16 - 4 * 44 + 44 * (i as i32 + 1) - 4, h - 12), Act::Power(i))));
-            v.push((r(w - 58, 24, w - 26, 52), Act::Keyboard)); // inside the search field, at its right end
-            v
-        }
     }
 }
 
@@ -765,7 +492,6 @@ fn act_at(k: Kind, x: i32, y: i32) -> Option<(RECT, Act)> {
 // ---------- open / close ----------
 
 pub fn init(hi: HINSTANCE) {
-    pinned_load();
     unsafe {
         let class = wide("topbar_fly");
         let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: class.as_ptr(), ..zeroed() };
@@ -963,10 +689,6 @@ pub fn toggle(k: Kind) {
     unsafe {
         HV.with_borrow_mut(|m| m.retain(|k, _| *k < 1_000_000)); // flyout keys are >= 1_000_000: no stale glow from the last panel
         CTX.set(None);
-        QUERY.set(String::new());
-        SELALL.set(false);
-        SCROLL.set(0);
-        SEL.set(0);
         PASS.set(None);
         NOTE.set(String::new());
         CONFIRM.set(-1);
@@ -984,16 +706,11 @@ pub fn toggle(k: Kind) {
                 read_nets();
                 crate::quick::refresh();
             }
-            Kind::Start => {
-                pinned_load(); // the search card (rs-launcher) can add to this list from another process
-                std::thread::spawn(load_apps); // apps installed since the last open show up (the panel repaints every second)
-            }
             _ => {}
         }
         let (w, h) = (sc(size(k).0), sc(size(k).1));
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let x = if vert() { side_x(w) } else { match k {
-            Kind::Start => (sw - w) / 2,
             Kind::Menu => MENU_X.get().min(sw - w - sc(8)).max(sc(8)),
             _ => sw - w - sc(8),
         } };
@@ -1001,13 +718,6 @@ pub fn toggle(k: Kind) {
         let fy = if vert() && k == Kind::Menu { (MENU_X.get() - h / 2).clamp(sc(8), GetSystemMetrics(SM_CYSCREEN) - h - sc(8)) } else { pop_y(h) }; // above the bar (below it at the top of the screen)
         let hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, class.as_ptr(), null(), WS_POPUP, x, fy + sc(14), w, h, null_mut(), null_mut(), GetModuleHandleW(null()), null());
         SetLayeredWindowAttributes(hw, 0, 0, LWA_ALPHA); // starts invisible, anim_step fades it in
-        if k == Kind::Start {
-            // accept file drops (an app dragged onto the panel is added to Start); the bar may be elevated, so lift UIPI for them
-            DragAcceptFiles(hw, 1);
-            for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, WM_COPYDATA] {
-                ChangeWindowMessageFilterEx(hw, m, MSGFLT_ALLOW, null_mut());
-            }
-        }
         FIN.set((x, fy));
         T0.set(now_ms());
         SetWindowRgn(hw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(16), rr(16)), 1);
@@ -1043,56 +753,6 @@ unsafe fn wifi_radio_wlan(on: bool) {
         let s = WLAN_PHY_RADIO_STATE { dwPhyIndex: 0, dot11SoftwareRadioState: if on { dot11_radio_state_on } else { dot11_radio_state_off }, dot11HardwareRadioState: dot11_radio_state_on };
         WlanSetInterface(h, g, wlan_intf_opcode_radio_state, size_of::<WLAN_PHY_RADIO_STATE>() as u32, &s as *const _ as *const _, null());
     });
-}
-
-/// Starts the i-th app of the filtered Start list and counts the launch (search ranks by it). false = no such row.
-unsafe fn launch(i: usize) -> bool {
-    let Some(app) = filtered().get(i).and_then(|&ai| APPS.lock().unwrap().get(ai).cloned()) else { return false };
-    if wstr(&app.1).starts_with("shell:") {
-        bump_name(&app.0); // open() counts only .lnk files
-    }
-    open(&app.1);
-    true
-}
-
-/// Right-click menu of a Start app: open, open as administrator, show the shortcut's folder.
-unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
-    let Some(lnk) = filtered().get(i).and_then(|&ai| APPS.lock().unwrap().get(ai).map(|a| a.1.clone())) else { return };
-    let m = CreatePopupMenu();
-    let path = wstr(&lnk);
-    let file = !path.starts_with("shell:"); // Store apps have no file to run elevated or to show in a folder
-    let pin_label = if start_pinned(&path) { t!("Убрать из Пуска", "Remove from Start", ja: "スタートから削除", pt: "Remover do Iniciar", zh: "从开始菜单移除") } else { t!("Добавить в Пуск", "Add to Start", ja: "スタートに追加", pt: "Adicionar ao Iniciar", zh: "添加到开始菜单") };
-    let menu = [
-        (1, t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开")),
-        (2, t!("Запуск от имени администратора", "Run as administrator", ja: "管理者として実行", pt: "Executar como administrador", zh: "以管理员身份运行")),
-        (3, t!("Расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置")),
-        (4, pin_label),
-    ];
-    for (id, label) in menu {
-        if file || id == 1 || id == 4 {
-            AppendMenuW(m, MF_STRING, id, wide(label).as_ptr());
-        }
-    }
-    let mut pt = POINT { x, y };
-    ClientToScreen(hw, &mut pt);
-    let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hw, null());
-    DestroyMenu(m);
-    match cmd {
-        1 => _ = launch(i),
-        2 => {
-            ShellExecuteW(null_mut(), wide("runas").as_ptr(), lnk.as_ptr(), null(), null(), SW_SHOWNORMAL);
-        }
-        3 => {
-            let p = String::from_utf16_lossy(&lnk[..lnk.len().saturating_sub(1)]);
-            winrust_common::reveal(&p);
-        }
-        4 => {
-            start_toggle(&path);
-            return; // stay open, the list just changed
-        }
-        _ => return,
-    }
-    close();
 }
 
 unsafe fn run_act(a: Act, rect: RECT, x: i32) {
@@ -1176,7 +836,6 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
             open(&wide(u));
             close();
         }
-        Act::Keyboard => touch_keyboard(), // the panel stays open: the keys go to its search field
         Act::CalPrev | Act::CalNext => {
             let (mut y, mut m) = CAL.get();
             m += if a == Act::CalNext { 1 } else { -1 };
@@ -1226,55 +885,6 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
                 _ => {}
             }
         }
-        Act::App(i) => {
-            if launch(i) {
-                close();
-            }
-        }
-        Act::Power(p) => {
-            if p >= 2 && CONFIRM.get() != p as i32 {
-                CONFIRM.set(p as i32); // first click only arms it
-                return;
-            }
-            close();
-            match p {
-                0 => {
-                    let _ = Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"]).creation_flags(NO_WINDOW).spawn();
-                }
-                1 => {
-                    // not `rundll32 powrprof.dll,SetSuspendState`: rundll32 passes garbage arguments and the PC hibernates
-                    // instead of sleeping whenever hibernation is on. On its own thread: the call returns only after wake-up.
-                    std::thread::spawn(|| sleep_now());
-                }
-                2 => {
-                    let _ = Command::new("shutdown").args(["/r", "/t", "0"]).creation_flags(NO_WINDOW).spawn();
-                }
-                _ => {
-                    let _ = Command::new("shutdown").args(["/s", "/t", "0"]).creation_flags(NO_WINDOW).spawn();
-                }
-            }
-        }
-    }
-}
-
-/// Sleep (S3 / modern standby), never hibernate. SetSuspendState needs the shutdown privilege switched on in our token.
-pub fn sleep_now() {
-    use windows_sys::Win32::{
-        Security::{AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES},
-        System::{Power::SetSuspendState, Threading::{GetCurrentProcess, OpenProcessToken}},
-    };
-    unsafe {
-        let mut tok = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut tok) != 0 {
-            let mut tp: TOKEN_PRIVILEGES = zeroed();
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            if LookupPrivilegeValueW(null(), wide("SeShutdownPrivilege").as_ptr(), &mut tp.Privileges[0].Luid) != 0 {
-                AdjustTokenPrivileges(tok, 0, &tp, 0, null_mut(), null_mut());
-            }
-            CloseHandle(tok);
-        }
-        SetSuspendState(false, false, false);
     }
 }
 
@@ -1721,89 +1331,6 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 }
             });
         }
-        Kind::Start => {
-            surface(dc, r(20, 20, w - 20, 56), card, sc(36));
-            SelectObject(dc, f_glyph);
-            text(dc, "\u{E721}", r(28, 20, 56, 56), pal().dim, DT_CENTER);
-            SelectObject(dc, f_txt);
-            let q = QUERY.with_borrow(|q| q.clone());
-            if q.is_empty() {
-                text(dc, t!("Введите для поиска", "Type to search apps", ja: "アプリを検索", pt: "Digite para pesquisar apps", zh: "输入以搜索应用"), r(64, 20, w - 64, 56), pal().dim, DT_LEFT);
-            } else {
-                text(dc, &q, r(64, 20, w - 64, 56), if SELALL.get() { pal().accent } else { pal().text }, DT_LEFT);
-            }
-            if let Some((kr, ka)) = rects(k).into_iter().find(|(_, a)| *a == Act::Keyboard) {
-                g(ka, kr, card, mix(card, pal().text, 0.1), sc(14));
-                SelectObject(dc, f_glyph);
-                text(dc, "\u{E765}", kr, if hot(ka) { pal().text } else { pal().dim }, DT_CENTER); // keyboard
-                SelectObject(dc, f_txt);
-            }
-            let f = filtered();
-            if f.is_empty() {
-                if q.is_empty() {
-                    text(dc, t!("Здесь пока пусто", "Nothing here yet", ja: "まだ何もありません", pt: "Nada aqui ainda", zh: "这里还什么都没有"), r(24, 76, w - 24, 106), pal().text, DT_LEFT);
-                    text(dc, t!("Перетащите приложение или файл на кнопку «Пуск», чтобы добавить", "Drag an app or file onto the Start button to add it", ja: "スタート ボタンにアプリやファイルをドラッグして追加します", pt: "Arraste um app ou arquivo para o botão Iniciar para adicionar", zh: "把应用或文件拖到“开始”按钮即可添加"), r(24, 106, w - 24, 134), pal().dim, DT_LEFT);
-                    text(dc, t!("Или найдите приложение и добавьте его из меню по правой кнопке", "Or search an app and right-click it → Add to Start", ja: "またはアプリを検索し、右クリックして「スタートに追加」を選びます", pt: "Ou pesquise um app e use o menu do botão direito → Adicionar ao Iniciar", zh: "或者搜索应用，右键点击 → 添加到开始菜单"), r(24, 134, w - 24, 162), pal().dim, DT_LEFT);
-                } else {
-                    text(dc, t!("Приложения не найдены", "No apps found", ja: "アプリが見つかりません", pt: "Nenhum app encontrado", zh: "未找到应用"), r(24, 76, w - 24, 116), pal().dim, DT_LEFT);
-                }
-            }
-            let rs = rects(k);
-            let apps = APPS.lock().unwrap();
-            for (rc, a) in &rs {
-                match *a {
-                    Act::App(i) => {
-                        // the list is reloaded on a background thread: an index from a moment ago may be gone
-                        let Some(app) = f.get(i).and_then(|&ai| apps.get(ai)) else { continue };
-                        // the row that was just pinned pulses in the accent colour for a moment
-                        let pulse = JUST.with_borrow(|j| {
-                            let age = now_ms().saturating_sub(j.1) as f32 / 1200.0;
-                            if age < 1.0 && !j.0.is_empty() && app.1 == wide(&j.0) { (1.0 - age) * (1.0 - age) } else { 0.0 }
-                        });
-                        let sel = i == SEL.get(); // what Enter opens
-                        if pulse > 0.0 || sel {
-                            BUSY.set(BUSY.get() || pulse > 0.0);
-                            fill(dc, *rc, mix(if sel { mix(pal().bg, pal().accent, 0.14) } else { pal().bg }, pal().accent, 0.45 * pulse), sc(8));
-                        }
-                        g(*a, *rc, if sel { mix(pal().bg, pal().accent, 0.14) } else { pal().bg }, if sel { mix(pal().hover, pal().accent, 0.18) } else { pal().hover }, sc(8));
-                        if sel {
-                            fill(dc, RECT { left: rc.left, top: rc.top + sc(10), right: rc.left + sc(3), bottom: rc.bottom - sc(10) }, pal().accent, sc(3));
-                        }
-                        let ic = ICONS.with_borrow_mut(|m| {
-                            *m.entry(app.1.clone()).or_insert_with(|| {
-                                let t = lnk_target(&app.1);
-                                lnk_icon(&app.1, &t, icon_px())
-                            })
-                        });
-                        if !ic.is_null() {
-                            DrawIconEx(dc, rc.left + sc(13), (rc.top + rc.bottom - icon_px()) / 2, ic, icon_px(), icon_px(), 0, null_mut(), DI_NORMAL); // at its loaded size: no stretching
-                        }
-                        let store = wstr(&app.1).starts_with("shell:");
-                        text(dc, &app.0, RECT { left: rc.left + sc(52), top: rc.top, right: rc.right - sc(110), bottom: rc.bottom }, pal().text, DT_LEFT);
-                        SelectObject(dc, f_small);
-                        let kind = if sel && !q.is_empty() { "Enter ↵" } else if store { t!("Приложение", "App", ja: "アプリ", pt: "App", zh: "应用") } else { "" };
-                        text(dc, kind, RECT { left: rc.right - sc(110), top: rc.top, right: rc.right - sc(14), bottom: rc.bottom }, pal().dim, DT_RIGHT);
-                        SelectObject(dc, f_txt);
-                    }
-                    Act::Power(p) => {
-                        let armed = CONFIRM.get() == p as i32;
-                        glow(dc, rc.top * 4096 + rc.left + 1_000_000, armed || hot(*a), *rc, pal().bg, if armed { BAD } else { pal().hover }, sc(8));
-                        SelectObject(dc, f_glyph);
-                        text(dc, ["\u{E72E}", "\u{E708}", "\u{E777}", "\u{E7E8}"][p as usize], *rc, pal().text, DT_CENTER);
-                    }
-                    _ => {}
-                }
-            }
-            SelectObject(dc, f_small);
-            let note = NOTE.with_borrow(|n| n.clone());
-            let hint = match CONFIRM.get() {
-                2 => t!("Нажмите ещё раз для перезагрузки", "Click again to restart", ja: "もう一度クリックで再起動", pt: "Clique de novo para reiniciar", zh: "再次点击以重启").to_string(),
-                3 => t!("Нажмите ещё раз для выключения", "Click again to shut down", ja: "もう一度クリックでシャットダウン", pt: "Clique de novo para desligar", zh: "再次点击以关机").to_string(),
-                _ if !note.is_empty() => note,
-                _ => std::env::var("USERNAME").unwrap_or_default(),
-            };
-            text(dc, &hint, r(24, h - 52, w - 200, h - 12), pal().dim, DT_LEFT);
-        }
     }
 
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
@@ -1838,24 +1365,9 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_PAINT => paint(hw, k),
         WM_ERASEBKGND => return 1,
         WM_ACTIVATE if wp & 0xffff == 0 && !PREVIEW.load(Relaxed) => {
-            // A file drag that began elsewhere (desktop icon, folder window) deactivates this panel with the button still
-            // down: keep Start open so the drop can land on it, and close once the button is up (timer 6).
-            if k == Kind::Start && GetAsyncKeyState(VK_LBUTTON as i32) < 0 {
-                SetTimer(hw, 6, 150, None);
-            } else {
-                DEACT.set((Some(k), now_ms()));
-                close();
-            }
+            DEACT.set((Some(k), now_ms()));
+            close();
         }
-        WM_TIMER if wp == 6 => {
-            if GetAsyncKeyState(VK_LBUTTON as i32) >= 0 {
-                KillTimer(hw, 6);
-                if GetForegroundWindow() != hw {
-                    close();
-                }
-            }
-        }
-        WM_DROPFILES => on_files(hw, wp as HDROP),
         WM_TIMER if wp == 2 => {
             InvalidateRect(hw, null(), 0);
         }
@@ -1897,7 +1409,6 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         }
         WM_RBUTTONUP => {
             match (k, act_at(k, x, y)) {
-                (Kind::Start, Some((_, Act::App(i)))) => app_menu(hw, i, x, y),
                 (Kind::Wifi, Some((_, Act::Net(_) | Act::NetOff))) if PASS.with_borrow(|p| p.is_none()) => {
                     let i = if let Some((_, Act::Net(i))) = act_at(k, x, y) { i } else { NETS.with_borrow(|n| n.iter().position(|n| n.connected)).unwrap_or(0) };
                     if let Some(ssid) = NETS.with_borrow(|n| n.get(i).map(|n| n.ssid.clone())) {
@@ -1924,20 +1435,9 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             let up = (wp >> 16) as i16 > 0;
             match k {
                 Kind::Quick => add_volume(if up { 2 } else { -2 }),
-                Kind::Start => SCROLL.set(if up { SCROLL.get().saturating_sub(2) } else { (SCROLL.get() + 2).min(filtered().len().saturating_sub(ROWS)) }),
                 _ => {}
             }
             InvalidateRect(hw, null(), 0);
-        }
-        WM_KEYDOWN if k == Kind::Start && (wp == VK_DOWN as usize || wp == VK_UP as usize) => {
-            // arrows move the row Enter opens; the list scrolls to keep it in view
-            let n = filtered().len();
-            if n > 0 {
-                let s = if wp == VK_DOWN as usize { (SEL.get() + 1).min(n - 1) } else { SEL.get().saturating_sub(1) };
-                SEL.set(s);
-                SCROLL.set(SCROLL.get().min(s).max((s + 1).saturating_sub(ROWS)));
-                InvalidateRect(hw, null(), 0);
-            }
         }
         WM_CHAR => {
             let c = wp as u32;
@@ -1946,10 +1446,6 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                     CTX.set(None);
                 } else if PASS.with_borrow(|p| p.is_some()) {
                     PASS.set(None);
-                } else if k == Kind::Start && QUERY.with_borrow(|q| !q.is_empty()) {
-                    QUERY.set(String::new()); // Esc clears the search first, the next one closes
-                    SCROLL.set(0);
-                    SEL.set(0);
                 } else {
                     close();
                     return 0;
@@ -1967,31 +1463,6 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                         p.push(ch);
                     }
                 }
-            } else if k == Kind::Start {
-                if c == 13 {
-                    if launch(SEL.get()) {
-                        close();
-                        return 0;
-                    }
-                } else {
-                    QUERY.with_borrow_mut(|q| {
-                        let all = SELALL.replace(false);
-                        if c == 1 {
-                            SELALL.set(!q.is_empty()); // Ctrl+A
-                        } else if c == 127 {
-                            // Ctrl+Backspace: the last word
-                            if all { q.clear() } else { let t = q.trim_end().len(); q.truncate(q[..t].rfind(' ').map_or(0, |i| i + 1)); }
-                        } else if c == 8 {
-                            if all { q.clear() } else { q.pop(); }
-                        } else if let Some(ch) = char::from_u32(c).filter(|_| c >= 32) {
-                            if all { q.clear() }
-                            q.push(ch);
-                        }
-                    });
-                    SCROLL.set(0);
-                    SEL.set(0);
-                    find_loose_exes(hw);
-                }
             }
             InvalidateRect(hw, null(), 0);
         }
@@ -2002,49 +1473,31 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 #[cfg(test)]
 mod tests {
-    use super::{flip_layout, score, init, is_open, toggle, close_now, Kind, FLY, FH, GetModuleHandleW, SetProcessDPIAware, null, null_mut, DestroyWindow, IsWindow};
+    use super::{init, is_open, toggle, close_now, Kind, FLY, FH, GetModuleHandleW, SetProcessDPIAware, null, null_mut, DestroyWindow, IsWindow};
 
-    #[test]
-    fn layout_flip_both_ways() {
-        assert_eq!(flip_layout("сркщьу"), "chrome");
-        assert_eq!(flip_layout("ntktuhfv"), "телеграм");
-        assert_eq!(flip_layout("vs code"), "мы сщву");
-    }
-
-    /// The Win button always opens Start: a press right after a close is not dropped, and a state left saying "open" with no
+    /// A bar button always opens its panel: a press right after a close is not dropped, and a state left saying "open" with no
     /// window behind it (CreateWindowExW failed) does not turn the button into a close-only no-op.
     #[test]
-    fn win_button_always_opens_start() {
+    fn a_button_always_opens_its_panel() {
         unsafe {
             SetProcessDPIAware();
             init(GetModuleHandleW(null()));
-            toggle(Kind::Start);
-            assert!(is_open(Kind::Start), "the first press opens Start");
-            toggle(Kind::Start);
-            assert!(!is_open(Kind::Start), "the second press closes it");
-            toggle(Kind::Start);
-            assert!(is_open(Kind::Start), "a press right after the close opens it again");
+            toggle(Kind::Cal);
+            assert!(is_open(Kind::Cal), "the first press opens the panel");
+            toggle(Kind::Cal);
+            assert!(!is_open(Kind::Cal), "the second press closes it");
+            toggle(Kind::Cal);
+            assert!(is_open(Kind::Cal), "a press right after the close opens it again");
             let live = FH.get();
             assert!(!live.is_null() && IsWindow(live) != 0);
             DestroyWindow(live);
             close_now();
             // the window is gone but the state still says "open" (what a failed creation or a kill behind our back leaves)
-            FLY.set(Some(Kind::Start));
+            FLY.set(Some(Kind::Cal));
             FH.set(null_mut());
-            toggle(Kind::Start);
-            assert!(is_open(Kind::Start) && IsWindow(FH.get()) != 0, "the press opens a real panel");
+            toggle(Kind::Cal);
+            assert!(is_open(Kind::Cal) && IsWindow(FH.get()) != 0, "the press opens a real panel");
             close_now();
         }
-    }
-
-    #[test]
-    fn ranking() {
-        assert_eq!(score("visual studio code", "vis"), Some(0));
-        assert_eq!(score("visual studio code", "cod"), Some(1));
-        assert_eq!(score("visual studio code", "vsc"), Some(2));
-        assert_eq!(score("calculator", "cul"), Some(3));
-        assert_eq!(score("calculator", "xyz"), None);
-        assert_eq!(score("calculator", ""), None);
-        assert_eq!(score("v", "v"), Some(0)); // one-letter initials do not count, the prefix does
     }
 }
