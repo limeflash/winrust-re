@@ -512,7 +512,7 @@ impl SettingsPanel {
         let tile = Row { check: self.tiled, ..Row::new(TILE_ICON, t!("Разложить окна плиткой", "Tile the windows", ja: "ウィンドウを並べて表示", pt: "Lado a lado", zh: "平铺窗口")) };
         y = Self::row(b, TILE, y, tile);
         b.stage = 8;
-        b.text(Rect::new(18.0, y + 14.0, 340.0, 15.0), "WinRust", LABEL, Tone::Dim);
+        b.text(Rect::new(18.0, y + 14.0, 340.0, 15.0), "WinRust:RE", LABEL, Tone::Dim);
         y += 35.0;
         b.stage = 9;
         y = Self::row(b, GO_ADV, y, Row::new(SLIDERS, t!("Расширенные настройки", "Advanced settings")).chevron()) + 1.0;
@@ -602,7 +602,7 @@ impl SettingsPanel {
     }
 
     fn lang_page(&self, b: &mut B, m: Measure<'_>) -> f32 {
-        let mut y = self.head(b, m, t!("Язык", "Language", ja: "言語", pt: "Idioma", zh: "语言"), t!("Язык всех программ WinRust", "The language of every WinRust program", ja: "すべての WinRust プログラムの言語", pt: "O idioma de todos os programas da WinRust", zh: "所有 WinRust 程序的语言"));
+        let mut y = self.head(b, m, t!("Язык", "Language", ja: "言語", pt: "Idioma", zh: "语言"), t!("Язык всех программ WinRust:RE", "The language of every WinRust:RE program", ja: "すべての WinRust:RE プログラムの言語", pt: "O idioma de todos os programas da WinRust:RE", zh: "所有 WinRust:RE 程序的语言"));
         let cur = lang();
         for (i, (l, code)) in [(Lang::En, "EN"), (Lang::Ru, "RU"), (Lang::Ja, "JA"), (Lang::Pt, "PT"), (Lang::Zh, "ZH")].into_iter().enumerate() {
             b.put(LANG + i as i32, Rect::new(PAD, y, CW, 44.0), K::LangRow { code, name: l.name(), on: l == cur });
@@ -682,12 +682,12 @@ impl SettingsPanel {
         };
         group(b, y, t!("Оболочка", "Shell"));
         y += 31.0;
-        y = sw(b, m, y, 0, t!("WinRust вместо Проводника как оболочка", "WinRust replaces Explorer as the shell"), t!("Применится после повторного входа", "Applies after you sign in again"), Some(s.shell));
+        y = sw(b, m, y, 0, t!("WinRust:RE вместо Проводника как оболочка", "WinRust:RE replaces Explorer as the shell"), t!("Применится после повторного входа", "Applies after you sign in again"), Some(s.shell));
         y = sw(b, m, y, 0, t!("Диспетчер задач остаётся в трее при закрытии", "Task Manager stays in the tray when closed"), "", s.tray);
         group(b, y, t!("Клавиши", "Keys"));
         y += 31.0;
-        y = sw(b, m, y, ALT_SPACE, t!("Alt+Space — поиск WinRust", "Alt+Space opens WinRust search"), "", Some(s.search_key));
-        y = sw(b, m, y, 0, t!("Ctrl+Shift+Esc — Диспетчер задач WinRust", "Ctrl+Shift+Esc opens WinRust Task Manager"), "", Some(s.taskmgr_key));
+        y = sw(b, m, y, ALT_SPACE, t!("Alt+Space — поиск WinRust:RE", "Alt+Space opens WinRust:RE search"), "", Some(s.search_key));
+        y = sw(b, m, y, 0, t!("Ctrl+Shift+Esc — Диспетчер задач WinRust:RE", "Ctrl+Shift+Esc opens WinRust:RE Task Manager"), "", Some(s.taskmgr_key));
         y = sw(b, m, y, 0, t!("Win+V — история буфера обмена", "Win+V clipboard history"), t!("Текст, хранится в памяти. Когда Проводник не оболочка", "Text, kept in memory. When Explorer is not the shell"), Some(s.clipboard));
         group(b, y, "Windows");
         y += 31.0;
@@ -836,7 +836,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
             c.fill(tile, 12.0, d.accent.fade(0.2));
             c.icon(icons::GEAR, (tile.cx(), tile.cy()), 20.0, 1.8, d.accent, 0.0);
             c.text(t!("Настройки панели", "Bar settings", ja: "バーの設定", pt: "Configurações da barra", zh: "任务栏设置"), Rect::new(r.x + 60.0, r.y + 10.0, 300.0, 19.0), Font::new(15.0, 600), INK, Align::Start);
-            c.text(t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs", ja: "バーと WinRust プログラムの外観", pt: "Aparência da barra e dos programas da WinRust", zh: "任务栏与 WinRust 程序的外观"), Rect::new(r.x + 60.0, r.y + 31.0, 300.0, 15.0), SMALL, DIM, Align::Start);
+            c.text(t!("Вид панели и программ WinRust:RE", "Look of the bar and the WinRust:RE programs", ja: "バーと WinRust:RE プログラムの外観", pt: "Aparência da barra e dos programas da WinRust:RE", zh: "任务栏与 WinRust:RE 程序的外观"), Rect::new(r.x + 60.0, r.y + 31.0, 300.0, 15.0), SMALL, DIM, Align::Start);
         }
         K::Text { s, font, ink, align } => c.text(s, r, *font, ink.rgba(d.accent), *align),
         K::Rule(col) => c.fill(r, 0.0, *col),
@@ -1199,7 +1199,7 @@ fn draw_hero(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, when: &str, d: &Dc<
         c.fill(Rect::new(lx + sx * k, ly + sy * k, 9.0 * k, 9.0 * k), 2.2 * k, d.accent.fade(if i == 0 { 1.0 } else { 0.7 }));
     }
     c.icon("M14.5 4.5h3.2a3.2 3.2 0 0 1 0 6.4h-3.2zM14.5 10.9l5.4 9.6M14.5 4.5v16", (logo.cx(), logo.cy()), 32.0, 2.2, INK, 0.0);
-    c.text("WinRust", Rect::new(r.x + 88.0, r.y + 26.5, 150.0, 15.0), SMALL, SOFT, Align::Start);
+    c.text("WinRust:RE", Rect::new(r.x + 88.0, r.y + 26.5, 150.0, 15.0), SMALL, SOFT, Align::Start);
     c.text(&d.version, Rect::new(r.x + 88.0, r.y + 45.5, 150.0, 24.0), Font::new(24.0, 600).tracking(-0.02).tabular(), INK, Align::Start);
     // the status chip
     let busy = matches!(d.upd, Upd::Busy(_));

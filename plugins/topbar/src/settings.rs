@@ -135,7 +135,7 @@ fn act(a: Act) {
             Act::AltSpace(on) => {
                 set_alt_space(on);
                 say(if on {
-                    t!("Alt+Space открывает поиск WinRust", "Alt+Space opens WinRust search", ja: "Alt+Space で WinRust 検索を開きます", pt: "Alt+Space abre a busca do WinRust", zh: "Alt+Space 打开 WinRust 搜索")
+                    t!("Alt+Space открывает поиск WinRust:RE", "Alt+Space opens WinRust:RE search", ja: "Alt+Space で WinRust:RE 検索を開きます", pt: "Alt+Space abre a busca do WinRust:RE", zh: "Alt+Space 打开 WinRust:RE 搜索")
                 } else {
                     t!("Alt+Space оставлен программам", "Alt+Space is left to other programs", ja: "Alt+Space は他のプログラムに任せます", pt: "Alt+Space fica para outros programas", zh: "Alt+Space 交给其他程序")
                 });
