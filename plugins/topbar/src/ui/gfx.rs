@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1ColorMatrix, CLSID_D2D1GaussianBlur, CLSID_D2D1Shadow, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_PROPERTIES,
     D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND,
+    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND, D2D1_COMBINE_MODE_EXCLUDE,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
@@ -29,7 +29,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE, DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC,
-    DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWriteCreateFactory, IDWriteFactory, IDWriteFactory6,
+    DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWriteCreateFactory, IDWriteFactory, IDWriteFactory6,
     IDWriteFontCollection2, IDWriteFontSetBuilder1, IDWriteTextFormat, IDWriteTextLayout1,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -839,6 +839,51 @@ impl Canvas<'_> {
         let (rt, b) = (self.rt(), self.brush(c));
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe { rt.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &lay, &b, D2D1_DRAW_TEXT_OPTIONS_NONE) };
+    }
+
+    /// Like [`Canvas::text`], but a line wider than `r` ends in an ellipsis (CSS `text-overflow: ellipsis`).
+    pub fn text_fit(&mut self, s: &str, r: Rect, f: Font, c: Rgba, align: Align) {
+        if c.a <= 0.0 {
+            return;
+        }
+        let Some(lay) = self.g.layout(s, f, r.w, r.h, align) else { return };
+        // SAFETY: the sign is made for a live format and handed to a live layout.
+        unsafe {
+            if let Some(fmt) = self.g.format(f)
+                && let Ok(sign) = self.g.dwrite.CreateEllipsisTrimmingSign(&fmt)
+            {
+                let t = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+                let _ = lay.SetTrimming(&t, &sign);
+            }
+        }
+        let (rt, b) = (self.rt(), self.brush(c));
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe { rt.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &lay, &b, D2D1_DRAW_TEXT_OPTIONS_NONE) };
+    }
+
+    /// CSS `box-shadow: inset 0 <dy>px 0 <c>` on a rounded rectangle: the strip of the box that a copy of itself moved by `dy`
+    /// leaves uncovered (`dy > 0` lights the top edge, `dy < 0` the bottom one), following the corners.
+    pub fn inset_edge(&mut self, r: Rect, radius: f32, dy: f32, c: Rgba) {
+        if c.a <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let rounded = |r: Rect| D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+        let (rt, b) = (self.rt(), self.brush(c));
+        let f = &self.g.factory;
+        // SAFETY: plain geometry work on the factory; the result is filled inside BeginDraw/EndDraw.
+        unsafe {
+            let strip = (|| -> Result<ID2D1PathGeometry> {
+                let (a, moved) = (f.CreateRoundedRectangleGeometry(&rounded(r))?, f.CreateRoundedRectangleGeometry(&rounded(r.shift(0.0, dy)))?);
+                let path = f.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                a.CombineWithGeometry(&moved, D2D1_COMBINE_MODE_EXCLUDE, None, 0.1, &sink)?;
+                sink.Close()?;
+                path.cast()
+            })();
+            if let Ok(path) = strip {
+                rt.FillGeometry(&path, &b, None);
+            }
+        }
     }
 
     fn bitmap_of(&mut self, icon: HICON) -> Option<ID2D1Bitmap> {

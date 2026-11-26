@@ -920,7 +920,7 @@ impl Content for QuickPanel {
         }
     }
 
-    fn wheel(&mut self, up: bool) {
+    fn wheel(&mut self, _x: f32, _y: f32, up: bool) {
         if self.page == Page::Main
             && let Some((v, _)) = self.st.vol
         {
@@ -957,7 +957,10 @@ impl Content for QuickPanel {
     }
 
     fn text(&mut self, c: char, _cx: &mut Cx) {
-        if let Some((_, text)) = self.pass.as_mut() {
+        // Backspace, Enter and Esc come through `key`; the editing characters of the shared text hook mean nothing to a password
+        if !c.is_control()
+            && let Some((_, text)) = self.pass.as_mut()
+        {
             text.push(c);
         }
     }

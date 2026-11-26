@@ -8,6 +8,8 @@ pub mod icons;
 pub mod lang_popup;
 pub mod panel;
 pub mod quick_popup;
+pub mod search_panel;
+pub mod start_panel;
 pub mod svg;
 pub mod tip;
 pub mod tray_popup;

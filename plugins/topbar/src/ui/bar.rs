@@ -134,6 +134,7 @@ pub struct Live {
     pub press: i32,
     pub gear: bool,
     pub start: bool,
+    pub search: bool,
     pub qs: bool,
     pub cal: bool,
     pub lang: bool,
@@ -720,6 +721,7 @@ impl Bar {
             let (open, open_a) = match it.kind {
                 Kind::Gear => (live.gear, 0.11),
                 Kind::Start => (live.start, 0.11),
+                Kind::Search => (live.search, 0.11),
                 Kind::Chevron => (live.tray, 0.13),
                 Kind::Lang => (live.lang, 0.13),
                 Kind::Qs => (live.qs, 0.13),
