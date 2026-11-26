@@ -138,6 +138,9 @@ impl StartPanel {
         };
         self.page = self.page.min(self.pages() - 1);
         self.sel = self.sel.min(self.items.len().saturating_sub(1));
+        // every page's icons start loading now, this page first: paging must never wait for the shell
+        let from = self.page * PER_PAGE;
+        apps::warm_icons(self.items[from.min(self.items.len())..].iter().chain(&self.items[..from.min(self.items.len())]).map(|a| a.path.clone()));
     }
 
     fn pages(&self) -> usize {
@@ -268,7 +271,10 @@ impl StartPanel {
                 let lift = f.tween(id, 1, -3.0 * f32::from(f.hover == Some(id)), 250, SPRING);
                 let k = f.tween(id, 2, if f.press == Some(id) { 0.94 } else { 1.0 }, 250, SPRING);
                 let (cx, top) = (r.cx(), r.y + 15.8);
-                c.transformed(cx, top + 24.0, k, 0.0, lift, |c| c.hicon(apps::icon(&app.path), Rect::new(cx - 22.0, top + 2.0, 44.0, 44.0), 1.0));
+                // an icon still loading is left out for a moment (warm_icons was asked for it in `update`)
+                if let Some(ic) = apps::icon_ready(&app.path) {
+                    c.transformed(cx, top + 24.0, k, 0.0, lift, |c| c.hicon(ic, Rect::new(cx - 22.0, top + 2.0, 44.0, 44.0), 1.0));
+                }
                 c.text_fit(&app.name, Rect::new(r.x + 4.0, top + 58.0, r.w - 8.0, 14.4), Font::new(12.0, 400), INK, Align::Center);
             }
         });

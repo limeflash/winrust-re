@@ -677,7 +677,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 }).collect()
             } else { apps::recent(if what == "start" { usize::MAX } else { 3 }) };
             if what == "start" {
-                let items = if query.is_empty() { apps::all().into_iter().take(pins).collect() } else { apps::search(&query).into_iter().take(12).collect() };
+                let items: Vec<apps::App> = if query.is_empty() { apps::all().into_iter().take(pins).collect() } else { apps::search(&query).into_iter().take(12).collect() };
+                items.iter().for_each(|a| { apps::icon(&a.path); }); // one frame is drawn: the icons the live panel loads behind it must be in
                 let panel = ui::start_panel::StartPanel::with_state(&query, page, items, recent, apps::user());
                 let filter = args.iter().find_map(|a| a.strip_prefix("filter=")).and_then(|v| v.parse().ok()).unwrap_or(0);
                 Box::new(if args.iter().any(|a| a == "recent") { panel.with_recent_view(filter) } else { panel })

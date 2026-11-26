@@ -72,8 +72,11 @@ pub fn load() {
     *APPS.lock().unwrap() = v;
     GEN.fetch_add(1, Rlx);
     ui::panel::refresh(); // a panel that opened before the list was ready fills in
-    for app in pinned() {
-        icon(&app.path); // the grid is drawn the moment the menu opens: its icons should be there
+    // the grid is drawn the moment the menu opens: its first page's icons should be there (all apps' when nothing is pinned)
+    let first = pinned();
+    let first = if first.is_empty() { all().into_iter().take(12).collect() } else { first };
+    for app in first {
+        icon(&app.path);
     }
     avatar();
 }
@@ -285,8 +288,79 @@ pub fn icon(path: &[u16]) -> windows::Win32::UI::WindowsAndMessaging::HICON {
     }
     // SAFETY: shell calls on this thread; the icon is kept for the life of the process.
     let ic = unsafe { lnk_icon(path, &lnk_target(path), ICON_PX.load(Rlx)) };
-    ICONS.lock().unwrap().get_or_insert_with(HashMap::new).insert(path.to_vec(), ic as usize);
-    wicon(ic)
+    wicon(keep_icon(path.to_vec(), ic))
+}
+
+/// Puts a loaded icon in the cache, or keeps the one another thread put there meanwhile (and frees this one).
+fn keep_icon(path: Vec<u16>, ic: HICON) -> HICON {
+    let mut m = ICONS.lock().unwrap();
+    let kept = *m.get_or_insert_with(HashMap::new).entry(path).or_insert(ic as usize) as HICON;
+    if kept != ic && !ic.is_null() {
+        // SAFETY: our own icon, never handed out.
+        unsafe { DestroyIcon(ic) };
+    }
+    kept
+}
+
+static ICON_QUEUE: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new()); // paths the icon thread loads next, in order
+static ICON_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The app's icon if it is loaded already. A panel that pages through many apps draws with this and hands the rest to
+/// [`warm_icons`]: one icon through the shell takes milliseconds, and the twelve of a page loaded in the first frame of its
+/// slide stalled the slide.
+pub fn icon_ready(path: &[u16]) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    ICONS.lock().unwrap().as_ref().and_then(|m| m.get(path)).map(|&h| wicon(h as HICON))
+}
+
+/// Loads the icons of `paths` that are not loaded yet, in this order, on a thread of its own; the open panel repaints as they
+/// come in.
+pub fn warm_icons(paths: impl IntoIterator<Item = Vec<u16>>) {
+    let mut q = ICON_QUEUE.lock().unwrap();
+    {
+        let have = ICONS.lock().unwrap();
+        for p in paths {
+            if !have.as_ref().is_some_and(|m| m.contains_key(&p)) && !q.contains(&p) {
+                q.push(p);
+            }
+        }
+    }
+    // decided under the queue's lock: the thread only gives up while holding it, so no path is left behind
+    if q.is_empty() || ICON_THREAD.swap(true, Rlx) {
+        return;
+    }
+    drop(q);
+    std::thread::spawn(|| {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+        // SAFETY: COM for the shell's icon calls on this thread, ended when it is done.
+        let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+        let mut n = 0u32;
+        loop {
+            let next = {
+                let mut q = ICON_QUEUE.lock().unwrap();
+                if q.is_empty() {
+                    ICON_THREAD.store(false, Rlx);
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            };
+            let Some(p) = next else { break };
+            if icon_ready(&p).is_none() {
+                // SAFETY: shell calls on this thread (COM is up); the icon is kept for the life of the process.
+                let ic = unsafe { lnk_icon(&p, &lnk_target(&p), ICON_PX.load(Rlx)) };
+                keep_icon(p, ic);
+                n += 1;
+                if n % 6 == 0 {
+                    ui::panel::refresh(); // half a page at a time: icons appear while the rest load
+                }
+            }
+        }
+        ui::panel::refresh();
+        if com {
+            // SAFETY: pairs the CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    });
 }
 
 /// A shell image of a file: its thumbnail when available, else its icon. Size in device pixels of what came back.
