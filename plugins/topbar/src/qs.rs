@@ -299,18 +299,64 @@ unsafe fn wifi_radio_wlan(on: bool) {
 
 // ---------- the host of the panel ----------
 
+/// The sound devices of the last read and a count of the reads. A read takes 8-13 ms (endpoint and topology calls): on the
+/// bar's thread it dropped frames of whatever was moving (the sound list sliding open), so it is made on a thread of its own
+/// and the panel takes the result on its next frame.
+static AUDIO: std::sync::Mutex<Option<(u32, qp::Audio)>> = std::sync::Mutex::new(None);
+static AUDIO_READING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reads the sound devices again, behind the panel (one read at a time; the open panel repaints when it is in).
+pub(crate) fn read_audio_soon() {
+    if AUDIO_READING.swap(true, Relaxed) {
+        return;
+    }
+    std::thread::spawn(|| {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+        // SAFETY: COM for the audio endpoints on this thread, ended when the read is done.
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let a = crate::audio::read();
+        {
+            let mut g = AUDIO.lock().unwrap_or_else(|e| e.into_inner());
+            let n = g.as_ref().map_or(0, |x| x.0) + 1;
+            *g = Some((n, a));
+        }
+        AUDIO_READING.store(false, Relaxed);
+        ui::panel::refresh();
+        if com {
+            // SAFETY: pairs the CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    });
+}
+
 /// The machine's data and actions for the quick settings panel.
 pub(crate) struct Live {
     last: u64,
-    /// The sound devices, read again every few seconds the panel is open (a read takes some milliseconds) and at once after
-    /// one is chosen; and when it was read.
+    /// The sound devices as the panel shows them, which read they came from, and when the next read was asked for.
     audio: Rc<qp::Audio>,
+    audio_read: u32,
     audio_at: u64,
 }
 
 impl Live {
     unsafe fn new() -> Self {
-        Self { last: now_ms(), audio: Rc::new(crate::audio::read()), audio_at: now_ms() }
+        // the devices of the last read (the bar reads them once at start), and a fresh read behind them; only a panel opened
+        // before that first read is in waits for one here
+        let last = AUDIO.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(n, a)| (*n, a.clone()));
+        let (n, a) = last.unwrap_or_else(|| (0, crate::audio::read()));
+        read_audio_soon();
+        Self { last: now_ms(), audio: Rc::new(a), audio_read: n, audio_at: now_ms() }
+    }
+
+    /// Takes a read that finished since the last frame.
+    fn take_audio(&mut self) {
+        let g = AUDIO.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((n, a)) = g.as_ref()
+            && *n != self.audio_read
+        {
+            self.audio_read = *n;
+            self.audio = Rc::new(a.clone());
+        }
     }
 }
 
@@ -321,6 +367,7 @@ fn onoff(b: Option<bool>) -> String {
 
 impl qp::Host for Live {
     fn tick(&mut self, wifi_page: bool) {
+        self.take_audio();
         // SAFETY: reads on the bar's thread; the reads and the clock are what the old flyout did every second.
         unsafe {
             let now = now_ms();
@@ -333,7 +380,7 @@ impl qp::Host for Live {
             } else {
                 crate::quick::refresh();
                 if now.saturating_sub(self.audio_at) >= 3000 {
-                    self.audio = Rc::new(crate::audio::read());
+                    read_audio_soon();
                     self.audio_at = now;
                 }
             }
@@ -432,7 +479,7 @@ impl qp::Host for Live {
                     EP.set(None);
                     read_volume();
                 }
-                self.audio = Rc::new(crate::audio::read());
+                read_audio_soon(); // the tick of mark moves to the new device when the read is in, a frame or two later
                 self.audio_at = now_ms();
             }
         }

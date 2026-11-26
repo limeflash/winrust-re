@@ -2596,6 +2596,7 @@ fn main() {
         apps::pinned_load();
         apps::set_icon_px(bar_icon_px());
         thread::spawn(apps::load);
+        qs::read_audio_soon(); // quick settings opens with the sound devices already read
         thread::spawn(winrust_common::mem::auto_loop); // standby purge when memory runs short, switched on from the task manager's Speed page
         let hi = GetModuleHandleW(null());
         let class = wide("topbar");

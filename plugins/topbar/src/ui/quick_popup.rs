@@ -171,7 +171,7 @@ pub struct Device {
 }
 
 /// The active playback and recording devices.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Audio {
     pub outputs: Vec<Device>,
     pub inputs: Vec<Device>,
