@@ -501,14 +501,14 @@ impl Gfx {
 
     /// Width of `s` in DIPs (no frame needed: the bar lays itself out before it paints).
     pub fn measure(&mut self, s: &str, f: Font) -> f32 {
-        let Some(lay) = self.layout(s, f, 4096.0, f.size * 2.0, Align::Start) else { return 0.0 };
+        let Some(lay) = self.layout(s, f, 4096.0, f.size * 2.0, Align::Start, false) else { return 0.0 };
         let mut m = DWRITE_TEXT_METRICS::default();
         // SAFETY: `lay` is live; `m` is a local out-param.
         unsafe { lay.GetMetrics(&mut m).map_or(0.0, |()| m.widthIncludingTrailingWhitespace) }
     }
 
     /// Lays out one line of text; `None` if the font could not be made.
-    fn layout(&mut self, s: &str, f: Font, w: f32, h: f32, align: Align) -> Option<IDWriteTextLayout1> {
+    fn layout(&mut self, s: &str, f: Font, w: f32, h: f32, align: Align, trim: bool) -> Option<IDWriteTextLayout1> {
         let fmt = self.format(f)?;
         let wide: Vec<u16> = s.encode_utf16().collect();
         // SAFETY: plain DirectWrite layout creation.
@@ -519,6 +519,12 @@ impl Gfx {
                 Align::End => DWRITE_TEXT_ALIGNMENT(1),
                 Align::Center => DWRITE_TEXT_ALIGNMENT(2),
             });
+            if trim {
+                // what does not fit ends in an ellipsis (`text-overflow: ellipsis`)
+                let sign = self.dwrite.CreateEllipsisTrimmingSign(&fmt).ok();
+                let t = windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING { granularity: windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_CHARACTER, ..Default::default() };
+                let _ = lay.SetTrimming(&t, sign.as_ref());
+            }
             let lay = lay.cast::<IDWriteTextLayout1>().ok()?;
             let all = DWRITE_TEXT_RANGE { startPosition: 0, length: wide.len() as u32 };
             if f.tracking != 0.0 {
@@ -811,10 +817,19 @@ impl Canvas<'_> {
 
     /// One line of text, vertically centred in `r`.
     pub fn text(&mut self, s: &str, r: Rect, f: Font, c: Rgba, align: Align) {
+        self.draw_text(s, r, f, c, align, false);
+    }
+
+    /// Like [`Canvas::text`], and what does not fit in `r` ends in an ellipsis.
+    pub fn text_fit(&mut self, s: &str, r: Rect, f: Font, c: Rgba, align: Align) {
+        self.draw_text(s, r, f, c, align, true);
+    }
+
+    fn draw_text(&mut self, s: &str, r: Rect, f: Font, c: Rgba, align: Align, trim: bool) {
         if c.a <= 0.0 {
             return;
         }
-        let Some(lay) = self.g.layout(s, f, r.w, r.h, align) else { return };
+        let Some(lay) = self.g.layout(s, f, r.w, r.h, align, trim) else { return };
         let (rt, b) = (self.rt(), self.brush(c));
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe { rt.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &lay, &b, D2D1_DRAW_TEXT_OPTIONS_NONE) };
@@ -1083,6 +1098,31 @@ impl Canvas<'_> {
             bctx.DrawImage(&out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
             bctx.EndDraw(None, None).ok()?;
             Some(Picture { bmp: baked.GetBitmap().ok()?, w: size.width, h: size.height })
+        }
+    }
+
+    /// An image file (JPEG, PNG, ...) scaled to cover `w` × `h` DIPs, as a picture to draw with [`Canvas::picture`]; it is
+    /// centred, so what sticks out of the box is cut by the caller (`CSS object-fit: cover`). `None` if it cannot be read.
+    pub fn image(&mut self, path: &str, w: f32, h: f32) -> Option<Picture> {
+        use windows::Win32::Graphics::Imaging::{WICBitmapInterpolationModeFant, WICDecodeMetadataCacheOnDemand};
+        let (rt, s) = (self.rt(), self.g.scale);
+        // SAFETY: WIC decodes and scales into a bitmap that the converter hands to D2D; every object is local to this call.
+        unsafe {
+            let dec = self.g.wic.CreateDecoderFromFilename(&HSTRING::from(path), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
+            let frame = dec.GetFrame(0).ok()?;
+            let (mut iw, mut ih) = (0u32, 0u32);
+            frame.GetSize(&mut iw, &mut ih).ok()?;
+            if iw == 0 || ih == 0 {
+                return None;
+            }
+            let k = ((w * s) / iw as f32).max((h * s) / ih as f32);
+            let (pw, ph) = (((iw as f32 * k).ceil() as u32).max(1), ((ih as f32 * k).ceil() as u32).max(1));
+            let scaler = self.g.wic.CreateBitmapScaler().ok()?;
+            scaler.Initialize(&frame, pw, ph, WICBitmapInterpolationModeFant).ok()?;
+            let conv = self.g.wic.CreateFormatConverter().ok()?;
+            conv.Initialize(&scaler, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut).ok()?;
+            let bmp = rt.CreateBitmapFromWicBitmap(&conv, None).ok()?;
+            Some(Picture { bmp, w: pw as f32 / s, h: ph as f32 / s })
         }
     }
 

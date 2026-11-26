@@ -29,11 +29,14 @@ mod run;
 mod shot;
 mod lang;
 mod settings;
-mod thumbs;
+mod menus;
+mod recent;
 mod ui;
+mod vdesk;
+mod wins;
 mod render;
 use ui::bar::{self as barui, keys::*};
-use {tray::*, status::*, run::*, shot::*, lang::*, settings::*};
+use {tray::*, status::*, run::*, shot::*, lang::*, settings::*, wins::*};
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
@@ -104,10 +107,6 @@ unsafe fn side_x(w: i32) -> i32 {
 /// Screen y of a popup of height `h` above the bar (beside a side bar: standing 12 dip above the screen's bottom).
 unsafe fn pop_y(h: i32) -> i32 {
     if vert() { GetSystemMetrics(SM_CYSCREEN) - dp(12.0) - h } else { bar_top() - dp(12.0) - h }
-}
-/// How far the hide animation has pushed the bar out of its place, in px.
-fn bar_off() -> i32 {
-    UI.with_borrow(|u| u.as_ref().map_or(0, |b| b.placement().slide))
 }
 /// False once the bar has slid away completely.
 fn bar_visible() -> bool {
@@ -206,8 +205,6 @@ fn lnk_uses(lnk: &std::path::Path) -> u32 {
 thread_local! {
     static HOST: Cell<HWND> = const { Cell::new(null_mut()) };
     static SKIP: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // windows their app took off the taskbar (ITaskbarList::DeleteTab)
-    static SWWND: Cell<HWND> = const { Cell::new(null_mut()) }; // the Alt+Tab switcher
-    static SW: RefCell<(Vec<HWND>, usize)> = const { RefCell::new((Vec::new(), 0)) }; // its windows (z-order) and selection
     static PINS: RefCell<Vec<Pin>> = const { RefCell::new(Vec::new()) };
     static BTNS: RefCell<Vec<Btn>> = const { RefCell::new(Vec::new()) }; // [0] is always Start (pin None, no wins)
     static TAPPS: RefCell<Vec<TIcon>> = const { RefCell::new(Vec::new()) };
@@ -232,6 +229,7 @@ thread_local! {
     static EXP_TRAY: Cell<HWND> = const { Cell::new(null_mut()) }; // explorer's taskbar we registered with
     static FLASH: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // windows asking for attention (FlashWindowEx) until activated (#129)
     static APP_FG: Cell<HWND> = const { Cell::new(null_mut()) }; // last foreground window that is not ours: the language button acts on it
+    static JL_KEY: Cell<Option<i32>> = const { Cell::new(None) }; // the app button whose jump list was opened last
     static LANG_TRY: Cell<(u32, usize, usize)> = const { Cell::new((0, 0, 0)) }; // (thread, layout before, layout asked for) of the last switch, checked by timer 7
 }
 
@@ -342,150 +340,11 @@ fn panel_changed() {
 
 /// A popup (a panel of the new frame, or an old flyout) is open: hints stay away and the bar stays put.
 fn popup_open() -> bool {
-    fly::any_open() || ui::panel::any_open()
+    // the previews over an app button are not in the way of the hints and of the next preview
+    fly::any_open() || (ui::panel::any_open() && !ui::panel::is_open(ui::panel::Id::Preview))
 }
 
-// ---------- Alt+Tab switcher: a grid of the open windows with live previews, most recently used first (#92) ----------
-
-thread_local! {
-    static SW_MON: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) }; // the monitor it is shown on
-    static SW_CARDS: RefCell<(Vec<RECT>, Vec<isize>)> = const { RefCell::new((Vec::new(), Vec::new())) }; // card rects, DWM previews
-    // where the pointer was when the switcher opened: a window appearing under a still pointer gets a WM_MOUSEMOVE,
-    // which must not pick the card under it (#183, #116); None once the pointer really moved
-    static SW_PT: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
-}
-
-unsafe fn cursor() -> (i32, i32) {
-    let mut p: POINT = zeroed();
-    GetCursorPos(&mut p);
-    (p.x, p.y)
-}
-
-unsafe fn alt_tab(back: bool) {
-    let sw = SWWND.get();
-    if IsWindowVisible(sw) == 0 {
-        let mut v: Vec<HWND> = Vec::new();
-        EnumWindows(Some(collect), &mut v as *mut _ as LPARAM); // z-order: the active window first, then the one before it
-        // per monitor: only the windows on the active window's monitor (when there is another one to switch to), shown on that monitor
-        let mut mon = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
-        if i18n::style::alttab_per_monitor() && !v.is_empty() {
-            let of = |w: HWND| MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
-            let m0 = of(v[0]);
-            let mut mi: MONITORINFO = zeroed();
-            mi.cbSize = size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(m0, &mut mi) != 0 {
-                let same: Vec<HWND> = v.iter().copied().filter(|&w| of(w) == m0).collect();
-                if same.len() > 1 {
-                    v = same;
-                    mon = mi.rcMonitor;
-                }
-            }
-        }
-        let n = v.len();
-        if n == 0 {
-            return SWITCHING.store(false, Relaxed);
-        }
-        SW.set((v, if n == 1 { 0 } else if back { n - 1 } else { 1 }));
-        SW_MON.set(mon);
-        SW_PT.set(Some(cursor()));
-        sw_layout(sw);
-    } else {
-        SW.with_borrow_mut(|(v, i)| *i = if back { (*i + v.len() - 1) % v.len() } else { (*i + 1) % v.len() });
-    }
-    InvalidateRect(sw, null(), 0);
-}
-
-/// Sizes the switcher for its windows (centered on its monitor) and puts the live previews on the cards.
-unsafe fn sw_layout(sw: HWND) {
-    let mon = SW_MON.get();
-    let (scr, sch) = (mon.right - mon.left, mon.bottom - mon.top);
-    let pad = sc(thumbs::GAP) + sc(4);
-    let wins = SW.with_borrow(|(v, _)| v.clone());
-    let (mut rects, tw, th) = thumbs::grid(wins.len(), scr * 9 / 10 - 2 * pad, sch * 8 / 10 - 2 * pad, sc(thumbs::CARD_W), sc(thumbs::CARD_H), sc(thumbs::GAP));
-    rects.iter_mut().for_each(|r| *r = RECT { left: r.left + pad, top: r.top + pad, right: r.right + pad, bottom: r.bottom + pad });
-    let (w, h) = (tw + 2 * pad, th + 2 * pad);
-    SW_CARDS.with_borrow_mut(|(_, ids)| thumbs::unregister(sw, ids));
-    SetWindowRgn(sw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(18), rr(18)), 1);
-    SetWindowPos(sw, HWND_TOPMOST, mon.left + (scr - w) / 2, mon.top + (sch - h) / 2, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    let ids = thumbs::register(sw, &wins, &rects);
-    SW_CARDS.set((rects, ids));
-}
-
-/// Delete (or a click on ×) in the switcher: closes the selected window and takes it off the list.
-unsafe fn alt_close() {
-    let w = SW.with_borrow_mut(|(v, i)| {
-        let w = v.get(*i).copied();
-        if w.is_some() {
-            v.remove(*i);
-            *i = (*i).min(v.len().saturating_sub(1));
-        }
-        w
-    });
-    if let Some(w) = w {
-        PostMessageW(w, WM_CLOSE, 0, 0);
-    }
-    if SW.with_borrow(|(v, _)| v.is_empty()) {
-        alt_done(true);
-        SWITCHING.store(false, Relaxed);
-    } else {
-        sw_layout(SWWND.get());
-        InvalidateRect(SWWND.get(), null(), 0);
-    }
-}
-
-/// Alt released: switch to the selected window (restored if minimized). Esc: just close.
-unsafe fn alt_done(cancel: bool) {
-    ShowWindow(SWWND.get(), SW_HIDE);
-    SW_CARDS.with_borrow_mut(|(r, ids)| {
-        thumbs::unregister(SWWND.get(), ids);
-        r.clear();
-    });
-    let (v, i) = SW.take();
-    if let Some(&w) = v.get(i).filter(|_| !cancel) {
-        if IsIconic(w) != 0 {
-            ShowWindow(w, SW_RESTORE);
-        }
-        force_fg(w);
-    }
-}
-
-unsafe extern "system" fn sw_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let (x, y) = ((lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
-    let at = || SW_CARDS.with_borrow(|(r, _)| thumbs::card_at(r, x, y));
-    match msg {
-        WM_PAINT => SW.with_borrow(|(v, sel)| SW_CARDS.with_borrow(|(r, ids)| thumbs::paint(hwnd, v, r, ids, Some(*sel)))),
-        WM_MOUSEACTIVATE => return MA_NOACTIVATE as isize,
-        // the pointer picks a card, a click switches to it, a middle click or × closes it, the wheel steps through
-        WM_MOUSEMOVE => {
-            if SW_PT.get().is_some_and(|p| p == cursor()) {
-                return 0;
-            }
-            SW_PT.set(None);
-            if let Some(k) = at() {
-                if SW.with_borrow_mut(|(_, i)| std::mem::replace(i, k)) != k {
-                    InvalidateRect(hwnd, null(), 0);
-                }
-            }
-        }
-        WM_LBUTTONUP | WM_MBUTTONUP => {
-            let Some(k) = at() else { return 0 };
-            SW.with_borrow_mut(|(_, i)| *i = k);
-            let c = SW_CARDS.with_borrow(|(r, _)| thumbs::close_rect(&r[k]));
-            if msg == WM_MBUTTONUP || (x >= c.left && x < c.right && y >= c.top && y < c.bottom) {
-                alt_close();
-            } else {
-                SWITCHING.store(false, Relaxed);
-                if GetAsyncKeyState(VK_MENU as i32) < 0 {
-                    keys(&[0xE8]); // Alt is still down: its release must not open the menu bar of the app we switch to
-                }
-                alt_done(false);
-            }
-        }
-        WM_MOUSEWHEEL => alt_tab((wp >> 16) as i16 > 0),
-        _ => return DefWindowProcW(hwnd, msg, wp, lp),
-    }
-    0
-}
+// (the Alt+Tab switcher, the previews over an app button and Task view are in wins.rs)
 
 unsafe fn hide_tip(bar: HWND) {
     KillTimer(bar, 2);
@@ -1317,7 +1176,7 @@ unsafe fn fs_update(hwnd: HWND) {
             fly::close_now();
             ui::panel::close_now();
             hide_tip(hwnd);
-            thumbs::hide_preview();
+            hide_preview();
         }
         redraw(hwnd);
     }
@@ -1631,6 +1490,8 @@ unsafe fn build_live() -> barui::Live {
         cal: fly::is_open(fly::Kind::Cal),
         lang: ui::panel::is_open(ui::panel::Id::Lang),
         tray: ui::panel::is_open(ui::panel::Id::Tray),
+        task: ui::panel::is_open(ui::panel::Id::Task),
+        jump: if ui::panel::is_open(ui::panel::Id::Jump) { JL_KEY.get() } else { None },
         hidden: FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)),
     }
 }
@@ -1778,100 +1639,126 @@ fn windows_ru(n: usize) -> String {
     format!("{n} {w}")
 }
 
-/// Right-click menu of an app button, like the Windows 11 jump list: the app on top, its windows (when there are several),
-/// open / pin / Start, then close and end process in red.
-unsafe fn app_menu(h: i32) {
+/// Right click on an app button: its jump list (`ui::jump`). The app on top, its windows, its recent files when Windows keeps
+/// a list for it, then open / pin / move / Start, and below close and end process in red.
+unsafe fn jump_list(h: i32) {
+    use ui::jump::{Act, Data, JumpPanel, Pick, Recent, Win};
     #[derive(Clone, Copy)]
     enum A {
-        Win(HWND),
         Open,
         Pin,
         Left,
         Right,
         Start,
-        Close,
-        Kill,
     }
+    if ui::panel::is_open(ui::panel::Id::Jump) && JL_KEY.get() == Some(h) {
+        return ui::panel::close(); // the same button again
+    }
+    let Some(anchor) = anchor(h) else { return };
     let (wins, pin, bicon) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin, b.icon)).unwrap_or((vec![], None, null_mut())));
     let exe = wins.first().map(|&w| exe_of(w)).unwrap_or_default();
     let (lnk, picon) = pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| (wstr_of(&x.lnk), x.icon)))).unwrap_or_default();
     let launch = if lnk.is_empty() { exe.clone() } else { lnk.clone() };
     let stem = std::path::Path::new(&launch).file_stem().unwrap_or_default().to_string_lossy().to_string();
     let name: String = stem.chars().take(1).flat_map(char::to_uppercase).chain(stem.chars().skip(1)).collect();
-    let sub = match (wins.len(), pin.is_some()) {
+    let meta = match (wins.len(), pin.is_some()) {
         (0, _) => t!("Закреплено · не запущено", "Pinned · not running", ja: "固定済み · 未起動", pt: "Fixado · não está em execução", zh: "已固定 · 未运行").to_string(),
         (n, true) => tf!("Закреплено · {}", "Pinned · {}", ja: "固定済み · {}", pt: "Fixado · {}", zh: "已固定 · {}", windows_ru(n)),
         (n, false) => tf!("Запущено · {}", "Running · {}", ja: "実行中 · {}", pt: "Em execução · {}", zh: "运行中 · {}", windows_ru(n)),
     };
     let icon = if picon.is_null() { bicon } else { picon };
-    let mut items: Vec<(fly::MItem, A)> = Vec::new();
-    if wins.len() > 1 {
-        for &w in wins.iter().take(6) {
-            let mut b = [0u16; 256];
-            let n = GetWindowTextW(w, b.as_mut_ptr(), 256).max(0) as usize;
-            items.push((fly::MItem { icon: icon_of(w), ..fly::MItem::new(String::from_utf16_lossy(&b[..n])) }, A::Win(w)));
-        }
-    }
+    let fg = GetForegroundWindow();
+    let rows: Vec<Win> = wins.iter().take(6).map(|&w| Win { hwnd: w as isize, title: window_title(w), active: w == fg }).collect();
+
+    let mut acts: Vec<Act> = Vec::new();
+    let mut what: Vec<A> = Vec::new();
+    let mut add = |a: A, icon: &'static str, label: &str| {
+        acts.push(Act { icon, label: label.to_string() });
+        what.push(a);
+    };
     if !launch.is_empty() {
-        let it = fly::MItem::new(if wins.is_empty() { t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开") } else { t!("Новое окно", "New window", ja: "新しいウィンドウ", pt: "Nova janela", zh: "新建窗口") });
-        items.push((if items.is_empty() { it } else { it.sep() }, A::Open));
+        add(A::Open, "M4 5h16v14H4zM12 9v6M9 12h6", if wins.is_empty() { t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开") } else { t!("Новое окно", "New window", ja: "新しいウィンドウ", pt: "Nova janela", zh: "新建窗口") });
     }
     if pin.is_some() {
-        items.push((fly::MItem::new(t!("Открепить от панели", "Unpin from the bar", ja: "バーから固定を外す", pt: "Desafixar da barra", zh: "从任务栏取消固定")), A::Pin));
+        add(A::Pin, "M12 17v5M9 4h6l-1 5 3 3v2H7v-2l3-3zM3 3l18 18", t!("Открепить от панели", "Unpin from the bar", ja: "バーから固定を外す", pt: "Desafixar da barra", zh: "从任务栏取消固定"));
     } else if !exe.is_empty() {
-        items.push((fly::MItem::new(t!("Закрепить на панели", "Pin to the bar", ja: "バーに固定する", pt: "Fixar na barra", zh: "固定到任务栏")), A::Pin));
+        add(A::Pin, "M12 17v5M9 4h6l-1 5 3 3v2H7v-2l3-3z", t!("Закрепить на панели", "Pin to the bar", ja: "バーに固定する", pt: "Fixar na barra", zh: "固定到任务栏"));
     }
     if let Some(p) = pin.filter(|_| !lnk.is_empty()) {
         let n = PINS.with_borrow(|p| p.len());
         if p > 0 {
-            items.push((fly::MItem::new(if vert() { t!("Выше", "Move up", ja: "上へ移動", pt: "Mover para cima", zh: "上移") } else { t!("Сдвинуть влево", "Move left", ja: "左へ移動", pt: "Mover para a esquerda", zh: "左移") }), A::Left));
+            add(A::Left, if vert() { "M6 15l6-6 6 6" } else { "M15 6l-6 6 6 6" }, if vert() { t!("Выше", "Move up", ja: "上へ移動", pt: "Mover para cima", zh: "上移") } else { t!("Сдвинуть влево", "Move left", ja: "左へ移動", pt: "Mover para a esquerda", zh: "左移") });
         }
         if p + 1 < n {
-            items.push((fly::MItem::new(if vert() { t!("Ниже", "Move down", ja: "下へ移動", pt: "Mover para baixo", zh: "下移") } else { t!("Сдвинуть вправо", "Move right", ja: "右へ移動", pt: "Mover para a direita", zh: "右移") }), A::Right));
+            add(A::Right, if vert() { "M6 9l6 6 6-6" } else { "M9 6l6 6-6 6" }, if vert() { t!("Ниже", "Move down", ja: "下へ移動", pt: "Mover para baixo", zh: "下移") } else { t!("Сдвинуть вправо", "Move right", ja: "右へ移動", pt: "Mover para a direita", zh: "右移") });
         }
     }
     if !launch.is_empty() {
         let s = fly::start_pinned(&launch);
-        items.push((fly::MItem::new(if s { t!("Убрать из Пуска", "Remove from Start", ja: "スタートから削除", pt: "Remover do Iniciar", zh: "从开始菜单移除") } else { t!("Добавить в Пуск", "Add to Start", ja: "スタートに追加", pt: "Adicionar ao Iniciar", zh: "添加到开始菜单") }), A::Start));
+        add(
+            A::Start,
+            if s { "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM14 16.5h6" } else { "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM17 14v6M14 17h6" },
+            if s { t!("Убрать из Пуска", "Remove from Start", ja: "スタートから削除", pt: "Remover do Iniciar", zh: "从开始菜单移除") } else { t!("Добавить в Пуск", "Add to Start", ja: "スタートに追加", pt: "Adicionar ao Iniciar", zh: "添加到开始菜单") },
+        );
     }
-    if !wins.is_empty() {
-        items.push((fly::MItem::new(if wins.len() > 1 { t!("Закрыть все окна", "Close all windows", ja: "すべてのウィンドウを閉じる", pt: "Fechar todas as janelas", zh: "关闭所有窗口") } else { t!("Закрыть окно", "Close window", ja: "ウィンドウを閉じる", pt: "Fechar janela", zh: "关闭窗口") }).hint("Alt+F4").sep(), A::Close));
-        items.push((fly::MItem::new(t!("Завершить процесс", "End process", ja: "プロセスを終了", pt: "Finalizar processo", zh: "结束进程")).danger(), A::Kill));
-    }
-    let acts: Vec<A> = items.iter().map(|x| x.1).collect();
-    let items = items.into_iter().map(|x| x.0).collect();
+
+    // the app's own recent files, if Windows keeps a list for it: by its AppUserModelID (the window's, else the shortcut's),
+    // else by the exe path. An app without a list shows no block.
+    let aumid = wins.first().map(|&w| win_aumid(w)).filter(|a| !a.is_empty()).or_else(|| (!lnk.is_empty()).then(|| lnk_aumid(&wide(&lnk))).filter(|a| !a.is_empty()));
+    let docs = aumid.map(|id| recent::recent(&id, 5)).filter(|d| !d.is_empty()).or_else(|| (!exe.is_empty()).then(|| recent::recent(&exe, 5))).unwrap_or_default();
+    let recent_rows: Vec<Recent> = docs.iter().map(|d| Recent { name: d.name.clone(), folder: d.folder }).collect();
+    let paths: Vec<String> = docs.into_iter().map(|d| d.path).collect();
+
+    let running = !wins.is_empty();
+    let data = Data {
+        icon: wicon(icon),
+        name,
+        meta,
+        running,
+        wins: rows,
+        recent: recent_rows,
+        acts,
+        close: running.then(|| if wins.len() > 1 { t!("Закрыть все окна", "Close all windows", ja: "すべてのウィンドウを閉じる", pt: "Fechar todas as janelas", zh: "关闭所有窗口") } else { t!("Закрыть окно", "Close window", ja: "ウィンドウを閉じる", pt: "Fechar janela", zh: "关闭窗口") }.to_string()),
+        kill: running.then(|| t!("Завершить процесс", "End process", ja: "プロセスを終了", pt: "Finalizar processo", zh: "结束进程").to_string()),
+    };
     let first_pid = wins.first().map_or(0, |&w| { let mut pid = 0; GetWindowThreadProcessId(w, &mut pid); pid });
-    fly::menu(tip_cx(h), Some((icon, "", name, sub)), items, move |i| {
-        match acts.get(i).copied() {
-            Some(A::Win(w)) => {
+    let pick = move |p: Pick| unsafe {
+        match p {
+            Pick::Window(w) => {
+                let w = w as HWND;
                 if IsIconic(w) != 0 {
                     ShowWindow(w, SW_RESTORE);
                 }
                 force_fg(w);
             }
-            Some(A::Open) => open(&wide(&launch)),
-            Some(A::Pin) => {
-                // by path, not by the index seen when the menu opened: PINS may have changed meanwhile
-                match PINS.with_borrow(|p| p.iter().position(|x| !lnk.is_empty() && wstr_of(&x.lnk) == lnk)) {
-                    Some(p) => unpin(p),
-                    None if lnk.is_empty() => pin_exe(&exe, &proc_args(first_pid)),
-                    None => {}
+            Pick::CloseWindow(w) => close_window(w as HWND),
+            Pick::Recent(i) => paths.get(i).iter().for_each(|p| open(&wide(p))),
+            Pick::Act(i) => match what.get(i).copied() {
+                Some(A::Open) => open(&wide(&launch)),
+                Some(A::Pin) => {
+                    // by path, not by the index seen when the menu opened: PINS may have changed meanwhile
+                    match PINS.with_borrow(|p| p.iter().position(|x| !lnk.is_empty() && wstr_of(&x.lnk) == lnk)) {
+                        Some(p) => unpin(p),
+                        None if lnk.is_empty() => pin_exe(&exe, &proc_args(first_pid)),
+                        None => {}
+                    }
+                    refresh_buttons(); // the buttons hold indices into PINS: a stale one would index past the end on the next paint
                 }
-                refresh_buttons(); // the buttons hold indices into PINS: a stale one would index past the end on the next paint
-            }
-            Some(a @ (A::Left | A::Right)) => {
-                // by path again; the new order is saved and load_pins takes it
-                if let Some(p) = PINS.with_borrow(|p| p.iter().position(|x| wstr_of(&x.lnk) == lnk)) {
-                    let to = if matches!(a, A::Left) { p.wrapping_sub(1) } else { p + 1 };
-                    if PINS.with_borrow_mut(|v| (to < v.len()).then(|| v.swap(p, to))).is_some() {
-                        save_pin_order();
-                        refresh_buttons();
+                Some(a @ (A::Left | A::Right)) => {
+                    // by path again; the new order is saved and load_pins takes it
+                    if let Some(p) = PINS.with_borrow(|p| p.iter().position(|x| wstr_of(&x.lnk) == lnk)) {
+                        let to = if matches!(a, A::Left) { p.wrapping_sub(1) } else { p + 1 };
+                        if PINS.with_borrow_mut(|v| (to < v.len()).then(|| v.swap(p, to))).is_some() {
+                            save_pin_order();
+                            refresh_buttons();
+                        }
                     }
                 }
-            }
-            Some(A::Start) => fly::start_toggle(&launch),
-            Some(A::Close) => wins.iter().for_each(|&w| close_window(w)),
-            Some(A::Kill) => {
+                Some(A::Start) => fly::start_toggle(&launch),
+                None => {}
+            },
+            Pick::CloseAll => wins.iter().for_each(|&w| close_window(w)),
+            Pick::Kill => {
                 let mut pids: Vec<u32> = wins
                     .iter()
                     .map(|&w| {
@@ -1892,10 +1779,11 @@ unsafe fn app_menu(h: i32) {
                     }
                 }
             }
-            None => {}
         }
         InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
-    });
+    };
+    JL_KEY.set(Some(h));
+    ui::panel::open(Box::new(JumpPanel::new(data, anchor.side, pick)), anchor);
 }
 
 fn pin_dir() -> PathBuf {
@@ -2067,53 +1955,11 @@ unsafe fn open_launcher() -> bool {
     true
 }
 
-/// Right click on Start: the Win+X menu (Explorer's own is gone with the bar).
+/// Right click on Start, and Win+X: the power-user menu (Explorer's own is gone with the bar).
 unsafe fn start_menu() {
-    // (label in ru/en/ja/pt/zh, target); "!" targets are actions of ours, the rest goes through `open`
-    let tools: [(&str, &str, &str, &str, &str, &str); 15] = [
-        ("Приложения и возможности", "Apps and Features", "アプリと機能", "Aplicativos e Recursos", "应用和功能", "ms-settings:appsfeatures"),
-        ("Электропитание", "Power Options", "電源オプション", "Opções de Energia", "电源选项", "powercfg.cpl"),
-        ("Просмотр событий", "Event Viewer", "イベント ビューアー", "Visualizador de Eventos", "事件查看器", "eventvwr.msc"),
-        ("Система", "System", "システム", "Sistema", "系统", "ms-settings:about"),
-        ("Диспетчер устройств", "Device Manager", "デバイス マネージャー", "Gerenciador de Dispositivos", "设备管理器", "devmgmt.msc"),
-        ("Сетевые подключения", "Network Connections", "ネットワーク接続", "Conexões de Rede", "网络连接", "ms-settings:network"),
-        ("Управление дисками", "Disk Management", "ディスクの管理", "Gerenciamento de Disco", "磁盘管理", "diskmgmt.msc"),
-        ("Управление компьютером", "Computer Management", "コンピューターの管理", "Gerenciamento do Computador", "计算机管理", "compmgmt.msc"),
-        ("Терминал", "Terminal", "ターミナル", "Terminal", "终端", "!term"),
-        ("Диспетчер задач", "Task Manager", "タスク マネージャー", "Gerenciador de Tarefas", "任务管理器", "taskmgr.exe"),
-        ("Параметры", "Settings", "設定", "Configurações", "设置", "ms-settings:"),
-        ("Проводник", "File Explorer", "エクスプローラー", "Explorador de Arquivos", "文件资源管理器", "shell:MyComputerFolder"),
-        ("Выполнить", "Run", "ファイル名を指定して実行", "Executar", "运行", "!run"),
-        ("Рабочий стол", "Desktop", "デスクトップ", "Área de Trabalho", "桌面", "!desktop"),
-        ("Представление задач", "Task View", "タスク ビュー", "Visão de Tarefas", "任务视图", "!taskview"),
-    ];
-    let power = [("Блокировка", "Lock", "ロック", "Bloquear", "锁定", "!lock"), ("Сон", "Sleep", "スリープ", "Suspender", "睡眠", "!sleep"), ("Перезагрузка", "Restart", "再起動", "Reiniciar", "重启", "!restart"), ("Завершение работы", "Shut down", "シャットダウン", "Desligar", "关机", "!shutdown")];
-    let mut items = Vec::new();
-    let mut targets = Vec::new();
-    for (i, (ru, en, ja, pt, zh, to)) in tools.iter().chain(power.iter()).enumerate() {
-        let it = fly::MItem::new(t!(*ru, *en, ja: *ja, pt: *pt, zh: *zh));
-        items.push(if i == tools.len() { it.sep() } else { it });
-        targets.push(*to);
+    if let Some(a) = anchor(0) {
+        menus::bar_menu("winx", a);
     }
-    let head = (null_mut(), "\u{E700}", t!("Пуск", "Start", ja: "開始", pt: "Iniciar", zh: "启动").to_string(), String::new());
-    fly::menu(tip_cx(0), Some(head), items, move |i| {
-        let Some(&to) = targets.get(i) else { return };
-        let quiet = |c: &mut Command| { let _ = c.creation_flags(NO_WINDOW).spawn(); };
-        match to {
-            "!term" => {
-                let wt = std::env::var_os("LOCALAPPDATA").map(|b| PathBuf::from(b).join(r"Microsoft\WindowsApps\wt.exe")).filter(|p| p.is_file());
-                open(&wide(if wt.is_some() { "wt.exe" } else { "powershell.exe" }));
-            }
-            "!run" => run_box(),
-            "!desktop" => winrust_common::desktop::toggle(),
-            "!taskview" => keys(&[VK_LWIN, VK_TAB]), // virtual desktops (#83)
-            "!lock" => quiet(Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"])),
-            "!sleep" => fly::sleep_now(),
-            "!restart" => quiet(Command::new("shutdown").args(["/r", "/t", "0"])),
-            "!shutdown" => quiet(Command::new("shutdown").args(["/s", "/t", "0"])),
-            _ => open(&wide(to)),
-        }
-    });
 }
 
 /// Puts the open, not minimized windows side by side in the work area.
@@ -2286,18 +2132,8 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 fly::toggle(fly::Kind::Start);
             }
         }
-        // virtual desktops (#83). Task View lives in explorer's shell: without it Win+Tab does nothing (#120), so the button
-        // opens our window grid instead (the Alt+Tab one: click a card, arrows + Enter, Esc or the button again closes)
-        TASKVIEW if left && !find_other("Shell_TrayWnd").is_null() => keys(&[VK_LWIN, VK_TAB]),
-        TASKVIEW if left => {
-            if IsWindowVisible(SWWND.get()) != 0 {
-                SWITCHING.store(false, Relaxed);
-                alt_done(true);
-            } else {
-                SWITCHING.store(true, Relaxed);
-                alt_tab(false);
-            }
-        }
+        // Task view: our own (`ui::taskview`): the windows of the desktop live, the virtual desktops in a row (#83, #120)
+        TASKVIEW if left => taskview_toggle(),
         // left: the language picker; right: straight to the next one (Win+Space is explorer's, gone under rs-shell)
         LANG if left => lang_toggle(),
         LANG => next_lang(BAR.load(Relaxed) as HWND, false),
@@ -2306,18 +2142,9 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         CLOCK if left => fly::toggle_click(fly::Kind::Cal),
         CLOCK => {
             // right click: like Windows 11, a menu with the date and time and notification settings (#126)
-            let items = vec![
-                fly::MItem::new(t!("Настройка даты и времени", "Adjust date and time", ja: "日付と時刻を調整する", pt: "Ajustar data e hora")),
-                fly::MItem::new(t!("Параметры уведомлений", "Notification settings", ja: "通知の設定", pt: "Configurações de notificação")),
-            ];
-            fly::menu(tip_cx(CLOCK), None, items, |i| {
-                if i == 0 {
-                    // the classic applet opens at once with or without Explorer; the Settings page needs Explorer started first
-                    let _ = Command::new("control.exe").arg("timedate.cpl").creation_flags(NO_WINDOW).spawn();
-                } else {
-                    open(&wide("ms-settings:notifications"));
-                }
-            });
+            if let Some(a) = anchor(CLOCK) {
+                menus::bar_menu("clock", a);
+            }
         }
         SHOWDESK if left => winrust_common::desktop::toggle(),
         POW_R | POW_S if left => power_click(h),
@@ -2349,7 +2176,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 }),
                 (Some(&w), false) => close_window(w), // right / middle click
                 // several windows of one app: pick which one (the same list the right-click menu opens with)
-                (Some(_), true) if wins.len() > 1 => app_menu(h),
+                (Some(_), true) if wins.len() > 1 => jump_list(h),
                 (Some(&w), true) => {
                     // like the Windows taskbar: the active app's button minimizes it, a minimized one restores, any other raises
                     let fg = GetForegroundWindow();
@@ -2431,15 +2258,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == 2 => {
             KillTimer(hwnd, 2);
             let h = HOT.get();
-            if h != NONE && !popup_open() {
-                let cx = tip_cx(h);
+            if h != NONE && !popup_open() && !preview_for(h) {
                 // an app button with windows shows their live previews (#92), anything else its tip
-                if !thumbs::show_preview(h, cx) {
-                    thumbs::hide_preview();
+                if !preview_open(h, false, 0) {
+                    hide_preview();
                     key_tip(h, tip_text(h), 0, None);
                 }
             }
         }
+        WM_TIMER if wp == 9 => preview_tick(hwnd),
+        WM_TIMER if wp == 10 => reopen(hwnd),
+        WM_TIMER if wp == 11 => vdesk::step(hwnd),
         WM_TIMER if wp == 6 => hide_tip(hwnd), // the volume readout after a wheel turn
         WM_TIMER if wp == 3 => fs_update(hwnd),
         WM_TIMER if wp == 7 => {
@@ -2506,9 +2335,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if HOT.replace(h) != h {
                 hide_tip(hwnd);
                 if h != NONE {
-                    SetTimer(hwnd, 2, 450, None);
+                    let has_wins = h >= 1 && BTNS.with_borrow(|b| b.get(h as usize).is_some_and(|b| !b.wins.is_empty()));
+                    // the previews come after the mockup's .38 s, at once when others are open (`hvEnter`)
+                    SetTimer(hwnd, 2, if has_wins { 380 } else { 450 }, None);
+                    if ui::panel::is_open(ui::panel::Id::Preview) {
+                        if has_wins {
+                            if !preview_for(h) && !popup_open() && !preview_open(h, false, 0) {
+                                hide_preview();
+                            }
+                        } else if h >= 1 {
+                            hide_preview();
+                        }
+                    }
                     // the hint comes by itself after the mockup's .25 s; an app with windows shows previews instead
-                    if !popup_open() && !(h >= 1 && BTNS.with_borrow(|b| b.get(h as usize).is_some_and(|b| !b.wins.is_empty()))) {
+                    if !popup_open() && !has_wins {
                         key_tip(h, tip_text(h), 250, None);
                     }
                 }
@@ -2536,14 +2376,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (wx, wy, ..) = bar_win();
             let x = if vert() { py + wy } else { px + wx }; // screen position along the bar
             hide_tip(hwnd);
-            thumbs::hide_preview();
+            hide_preview();
             if h != NONE {
                 press(h);
             }
             if h == NONE && msg == WM_RBUTTONDOWN {
-                fly::context_menu(x); // right click on an empty spot
+                // right click on an empty spot
+                if let Some(a) = menus::anchor_at(x) {
+                    menus::bar_menu("ctx", a);
+                }
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
-                app_menu(h);
+                jump_list(h);
             } else {
                 click(h, msg == WM_LBUTTONDOWN, msg == WM_MBUTTONDOWN);
             }
@@ -2592,6 +2435,11 @@ fn main() {
         // `topbar --render-panel <file.png> tray|lang|tip ...`: one popup panel (or the hint over a button) next to the bar, into a PNG
         if let Some(i) = std::env::args().position(|a| a == "--render-panel") {
             render::render_panel(&std::env::args().skip(i + 1).collect::<Vec<_>>());
+            return;
+        }
+        // `topbar --render-thumbs <file.png>`: whether DWM thumbnails show in the windows the panels are made of (see render.rs)
+        if let Some(i) = std::env::args().position(|a| a == "--render-thumbs") {
+            render::render_thumbs(&std::env::args().skip(i + 1).collect::<Vec<_>>());
             return;
         }
         if std::env::args().any(|a| a == "--shot") {
@@ -2675,12 +2523,6 @@ fn main() {
         }
         ui::panel::init(hi, SCALE.get(), hwnd, panel_changed);
         ui::tip::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
-        let swc = wide("topbar_alttab");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(sw_proc), hInstance: hi, lpszClassName: swc.as_ptr(), ..zeroed() });
-        SWWND.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, swc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
-        let pvc = wide("topbar_preview");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(thumbs::pv_proc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: pvc.as_ptr(), ..zeroed() });
-        thumbs::PVWND.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, pvc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
         OLD_STATE.set(remember_taskbar_state());
         appbar_new(hwnd);
         // Without explorer nobody is the "taskman" window, so Windows treats minimized windows as loose icons and leaves

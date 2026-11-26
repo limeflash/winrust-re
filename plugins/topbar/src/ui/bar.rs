@@ -138,6 +138,10 @@ pub struct Live {
     pub cal: bool,
     pub lang: bool,
     pub tray: bool,
+    /// Task view is open.
+    pub task: bool,
+    /// The app button whose jump list is open (`.app.ctxa`).
+    pub jump: Option<i32>,
     /// The bar is slid away (auto-hide, a fullscreen window).
     pub hidden: bool,
 }
@@ -724,13 +728,14 @@ impl Bar {
                 Kind::Lang => (live.lang, 0.13),
                 Kind::Qs => (live.qs, 0.13),
                 Kind::Clock => (live.cal, 0.13),
+                Kind::TaskView => (live.task, 0.11),
                 _ => (false, 0.0),
             };
             match it.kind {
                 Kind::ShowDesk => {}
                 Kind::App => {
                     let a = &v.apps[it.idx];
-                    m.go(key, BG, if a.active { 0.11 } else { 0.0 }, now, 250, EASE);
+                    m.go(key, BG, if a.active || live.jump == Some(key) { 0.11 } else { 0.0 }, now, 250, EASE);
                     let pressed = hover && live.press == key;
                     let near = live.hot >= 1 && (live.hot - key).abs() == 1;
                     let (ty, zoom) = match (hover, pressed, near, vert) {

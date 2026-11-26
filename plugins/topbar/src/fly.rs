@@ -857,33 +857,6 @@ fn menu_rows() -> (Vec<(i32, i32)>, i32) {
     (rows, y + 6)
 }
 
-/// Right-click menu of an empty spot of the bar.
-pub fn context_menu(x: i32) {
-    let pu = crate::purge_installed();
-    let mut items = vec![
-        MItem::new(t!("Параметры Windows", "Windows Settings", ja: "Windows の設定", pt: "Configurações do Windows", zh: "Windows 设置")).hint("Win+I"),
-        MItem::new(t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização", zh: "个性化")),
-        MItem::new(t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器")).hint("Ctrl+Shift+Esc").sep(),
-        MItem::new(t!("Чистильщик диска", "Disk Cleaner", ja: "ディスク クリーナー", pt: "Limpador de Disco", zh: "磁盘清理")),
-        MItem::new(t!("Закрыть панель", "Close the bar", ja: "バーを閉じる", pt: "Fechar a barra", zh: "关闭任务栏")).danger().sep(),
-    ];
-    if pu {
-        items.insert(4, MItem::new(t!("Удалить мусор Windows (необратимо)", "Remove Windows junk (irreversible)", ja: "Windows の不要なものを削除 (元に戻せません)", pt: "Remover lixo do Windows (irreversível)", zh: "删除 Windows 垃圾文件（不可恢复）")).danger());
-    }
-    menu(x, None, items, move |i| unsafe {
-        let i = if pu && i == 4 { 99 } else { i };
-        match i {
-            0 => open(&wide("ms-settings:")),
-            1 => open(&wide("ms-settings:personalization")),
-            // with rtaskmgr-win32 installed this is our task manager; a full path because explorer.exe does not search PATH
-            2 => open(&wide(&format!(r"{}\System32\taskmgr.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())))),
-            3 => open_cleaner(),
-            99 => crate::open_purge(),
-            _ => _ = PostMessageW(FindWindowW(wide("topbar").as_ptr(), null()), WM_CLOSE, 0, 0), // quits the bar, brings the Windows taskbar back
-        }
-    });
-}
-
 /// Starts the fade-out of the open flyout (it stays as a ghost window until the fade ends).
 pub fn close() {
     let h = FH.replace(null_mut());
