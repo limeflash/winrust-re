@@ -585,10 +585,21 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Box::new(ui::cal_popup::CalPanel::new(demo_now, side).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
         } else if what == "start" || what == "search" {
             apps::load(); // the machine's apps, synchronously, with the icons of what is pinned
-            let recent = apps::recent(if what == "start" { 4 } else { 3 });
+            let recent = if what == "start" && args.iter().any(|a| a == "recent") {
+                let names = ["Project proposal.docx", "Meeting notes.pdf", "Budget.xlsx", "Design brief.docx", "Roadmap.pdf", "Readme.md", "Notes.txt", "Landscape.jpg", "Dashboard.png", "Photo.jpg", "Sketch.png", "Projects", "Documents"];
+                names.iter().enumerate().map(|(i, name)| apps::Recent {
+                    name: (*name).into(),
+                    path: if i >= 11 { if i == 11 { ".".into() } else { "plugins".into() } } else if i >= 7 { std::env::current_dir().unwrap_or_default().join("assets\\th.jpg").to_string_lossy().into_owned() } else { format!("C:\\Users\\Daniiar\\Documents\\{name}") },
+                    when: if i < 5 { "10:24" } else if i < 9 { "18:20" } else { "Monday" }.into(),
+                    day: if i < 5 { 0 } else if i < 9 { 1 } else { 2 },
+                    dir: i >= 11,
+                }).collect()
+            } else { apps::recent(if what == "start" { usize::MAX } else { 3 }) };
             if what == "start" {
                 let items = if query.is_empty() { apps::all().into_iter().take(pins).collect() } else { apps::search(&query).into_iter().take(12).collect() };
-                Box::new(ui::start_panel::StartPanel::with_state(&query, page, items, recent, apps::user()))
+                let panel = ui::start_panel::StartPanel::with_state(&query, page, items, recent, apps::user());
+                let filter = args.iter().find_map(|a| a.strip_prefix("filter=")).and_then(|v| v.parse().ok()).unwrap_or(0);
+                Box::new(if args.iter().any(|a| a == "recent") { panel.with_recent_view(filter) } else { panel })
             } else {
                 let files = if query.chars().count() < 2 {
                     Vec::new()
@@ -807,7 +818,35 @@ fn demo_switcher(scale: f32, screen: (i32, i32), n_wins: usize, per_monitor: boo
     let cards: Vec<WinCard> = (0..n_wins)
         .map(|i| WinCard { hwnd: i as isize + 1, title: titles[i % 4].into(), icon: Rc::new(OwnedIcon(demo_icon(icon, i + 1))), frame: frames[i % 4], minimized: i == 3 })
         .collect();
+    // A deterministic window image exercises the same snapshot drawing path as a captured window.
+    if let Some(icon) = demo_snapshot() { crate::snapshots::insert(4, Rc::new(OwnedIcon(icon)), 480, 270); }
     Box::new(Switcher::new(scale, (0, 0, screen.0, screen.1), cards, per_monitor, Switch { selected: || 1, point: |_| {}, pick: |_| {} }))
+}
+
+fn demo_snapshot() -> Option<Hi> {
+    // SAFETY: the bitmap and mask are local; CreateIconIndirect copies them into the returned icon.
+    unsafe {
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = 480;
+        info.bmiHeader.biHeight = -270;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let mut bits = null_mut();
+        let bmp = CreateDIBSection(null_mut(), &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if bmp.is_null() || bits.is_null() { return None; }
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, 480 * 270);
+        for y in 0..270 { for x in 0..480 {
+            let color = if y < 28 { 0x252933 } else if y < 43 { 0x343b49 } else if x < 90 { 0x202630 } else if (60..150).contains(&y) && (110..255).contains(&x) { 0x3c6290 } else if (164..175).contains(&y) || (189..195).contains(&y) { 0x555e70 } else { 0x181e28 };
+            pixels[y * 480 + x] = 0xff000000 | color;
+        } }
+        let mask = CreateBitmap(480, 270, 1, 1, null());
+        let icon = CreateIconIndirect(&ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: bmp });
+        if !mask.is_null() { DeleteObject(mask); }
+        DeleteObject(bmp);
+        (!icon.is_null()).then(|| wicon(icon))
+    }
 }
 
 fn demo_menu(kind: &str, side: Side, max_h: f32, sub_left: bool) -> Box<dyn ui::panel::Content> {

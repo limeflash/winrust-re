@@ -29,6 +29,7 @@ mod tray;
 mod status;
 mod run;
 mod shot;
+mod snapshots;
 mod lang;
 mod qs;
 mod settings;
@@ -1355,6 +1356,7 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
     if id != 0 || child != 0 || w.is_null() {
         return; // only whole windows (not carets, cursors, parts of controls)
     }
+    if ev == 0x0017 || ev == 0x8001 { snapshots::remove(w as isize); }
     let bar = BAR.load(Relaxed) as HWND;
     if bar.is_null() {
         return;
@@ -1370,6 +1372,7 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
         0x800C => !known() && top(), // title set: a window with no title had no button yet
         _ => top() || known(),       // created, shown, hidden, cloaked, uncloaked, minimized, restored
     };
+    if relevant && ev == 0x0016 { snapshots::capture(w); }
     if relevant && !WIN_DIRTY.replace(true) {
         SetTimer(bar, 8, 30, None);
     }

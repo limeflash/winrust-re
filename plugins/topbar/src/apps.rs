@@ -289,7 +289,7 @@ pub fn icon(path: &[u16]) -> windows::Win32::UI::WindowsAndMessaging::HICON {
     wicon(ic)
 }
 
-/// A shell image of a file: its thumbnail when it has one cached, else its icon. Size in device pixels of what came back.
+/// A shell image of a file: its thumbnail when available, else its icon. Size in device pixels of what came back.
 pub struct Image {
     pub icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     pub w: i32,
@@ -324,6 +324,8 @@ unsafe fn shell_image(path: &str, px: i32, thumb: bool) -> Option<(HICON, i32, i
     };
     let item = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(path).as_ptr()), None).ok()?;
     let f = item.cast::<IShellItemImageFactory>().ok()?;
+    // only a cached thumbnail: making one here would stall the frame that asked (search results, Start); the pictures that must
+    // show without a cache are decoded by the panel itself (`Canvas::image`)
     let flags = if thumb { SIIGBF_THUMBNAILONLY | SIIGBF_INCACHEONLY } else { SIIGBF_ICONONLY };
     let bmp = f.GetImage(SIZE { cx: px, cy: px }, flags).ok()?;
     let color = bmp.0 as HBITMAP;
@@ -371,18 +373,14 @@ pub struct Recent {
     pub path: String,
     /// "Today, 08:12", "Yesterday, 18:20" or the date.
     pub when: String,
+    pub day: usize,
+    /// A folder, looked up once here: drawing must not touch the disk (it can be a network share that went away).
+    pub dir: bool,
 }
 
 /// The files and folders the user opened last, newest first: the shortcuts of the shell's Recent folder, resolved.
 pub fn recent(n: usize) -> Vec<Recent> {
-    use windows::Win32::UI::Shell::{FOLDERID_Recent, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-    // SAFETY: the returned string is freed once.
-    let dir = unsafe {
-        let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Recent, KF_FLAG_DEFAULT, None) else { return Vec::new() };
-        let s = p.to_string().unwrap_or_default();
-        windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
-        PathBuf::from(s)
-    };
+    let Some(dir) = recent_dir() else { return Vec::new() };
     let mut lnks: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -392,7 +390,7 @@ pub fn recent(n: usize) -> Vec<Recent> {
         .collect();
     lnks.sort_by_key(|l| std::cmp::Reverse(l.0));
     let mut out: Vec<Recent> = Vec::new();
-    for (t, lnk) in lnks.into_iter().take(40) {
+    for (t, lnk) in lnks.into_iter().take(120) {
         let Some(target) = link_path(&lnk) else { continue };
         let tp = std::path::Path::new(&target);
         if !tp.exists() || out.iter().any(|r| r.path.eq_ignore_ascii_case(&target)) {
@@ -400,14 +398,46 @@ pub fn recent(n: usize) -> Vec<Recent> {
         }
         let name = tp.file_name().map_or_else(|| target.clone(), |n| n.to_string_lossy().to_string());
         let dir = tp.is_dir();
-        let when = when_label(t);
+        let (when, day) = when_label(t);
         let when = if dir { format!("{} · {when}", t!("Папка", "Folder", ja: "フォルダー", pt: "Pasta", zh: "文件夹")) } else { when };
-        out.push(Recent { name, path: target, when });
+        out.push(Recent { name, path: target, when, day, dir });
         if out.len() == n {
             break;
         }
     }
     out
+}
+
+fn recent_dir() -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_Recent, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    // SAFETY: the returned shell string is freed once.
+    unsafe {
+        let p = SHGetKnownFolderPath(&FOLDERID_Recent, KF_FLAG_DEFAULT, None).ok()?;
+        let s = p.to_string().unwrap_or_default();
+        windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
+        Some(PathBuf::from(s))
+    }
+}
+
+/// Remove all shortcuts to this target so a duplicate cannot reappear on the next refresh.
+pub fn remove_recent(target: &str) -> bool {
+    recent_dir().is_some_and(|dir| remove_recent_in(&dir, target))
+}
+
+fn remove_recent_in(dir: &std::path::Path, target: &str) -> bool {
+    remove_recent_with(dir, target, link_path)
+}
+
+fn remove_recent_with(dir: &std::path::Path, target: &str, resolve: impl Fn(&std::path::Path) -> Option<String>) -> bool {
+    let mut removed = false;
+    let mut failed = false;
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) && resolve(&path).is_some_and(|p| p.eq_ignore_ascii_case(target)) {
+            if std::fs::remove_file(path).is_ok() { removed = true; } else { failed = true; }
+        }
+    }
+    removed && !failed
 }
 
 /// What a shortcut points at, as written in it (not lower-cased).
@@ -425,7 +455,7 @@ fn link_path(lnk: &std::path::Path) -> Option<String> {
 }
 
 /// "Today, 08:12" / "Yesterday, 18:20" / "11/20/2026, 09:05" in the user's own format.
-fn when_label(t: std::time::SystemTime) -> String {
+fn when_label(t: std::time::SystemTime) -> (String, usize) {
     use windows_sys::Win32::{Foundation::FILETIME, System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime}};
     let secs = t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let ticks = (secs + 11_644_473_600) * 10_000_000;
@@ -448,8 +478,10 @@ fn when_label(t: std::time::SystemTime) -> String {
         let nt = GetTimeFormatW(0x0400, 2, &then, null(), tm.as_mut_ptr(), 20).max(1) as usize - 1; // TIME_NOSECONDS
         (String::from_utf16_lossy(&d[..nd]), String::from_utf16_lossy(&tm[..nt]))
     };
-    day_label(days_ago, &date, &time)
+    (day_label(days_ago, &date, &time), day_group(days_ago))
 }
+
+fn day_group(days_ago: i64) -> usize { if days_ago <= 0 { 0 } else if days_ago == 1 { 1 } else { 2 } }
 
 fn day_label(days_ago: i64, date: &str, time: &str) -> String {
     match days_ago {
@@ -673,5 +705,24 @@ mod tests {
         assert_eq!(day_number(3, 1, 2024) - day_number(2, 28, 2024), 2); // a leap year
         assert!(day_label(0, "d", "08:12").ends_with(", 08:12"));
         assert_eq!(day_label(5, "11/20/2026", "09:05"), "11/20/2026, 09:05");
+    }
+}
+#[cfg(test)]
+mod recent_group_tests {
+    use super::*;
+    #[test]
+    fn group_calendar_day_offsets() {
+        assert_eq!((day_group(-1), day_group(0), day_group(1), day_group(2), day_group(300)), (0, 0, 1, 2, 2));
+    }
+    #[test]
+    fn removing_duplicates_only_touches_matching_shortcuts() {
+        let dir = std::path::PathBuf::from("target").join(format!("topbar-recent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["one.lnk", "two.lnk", "other.lnk", "one.txt"] { std::fs::write(dir.join(name), b"test").unwrap(); }
+        let resolve = |p: &std::path::Path| Some(if p.file_name().unwrap() == "other.lnk" { "other" } else { "target" }.to_string());
+        assert!(remove_recent_with(&dir, "TARGET", resolve));
+        assert!(!dir.join("one.lnk").exists() && !dir.join("two.lnk").exists());
+        assert!(dir.join("other.lnk").exists() && dir.join("one.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
