@@ -76,7 +76,8 @@ fn default_name(n: usize) -> String {
 pub(crate) unsafe fn system_wallpaper() -> String {
     let mut b = [0u16; 520];
     SystemParametersInfoW(SPI_GETDESKWALLPAPER, 520, b.as_mut_ptr().cast(), 0);
-    wstr_of(&b)
+    let path = wstr_of(&b);
+    if path.is_empty() { reg_string(r"Control Panel\Desktop", "WallPaper") } else { path }
 }
 
 /// The desktops in order and the index of the current one. One unnamed desktop when Windows keeps no list.

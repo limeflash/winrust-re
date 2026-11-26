@@ -51,12 +51,24 @@ unsafe fn card_icon(w: HWND) -> HICON {
 
 unsafe fn win_cards(wins: &[HWND]) -> Vec<WinCard> {
     wins.iter()
-        .map(|&w| WinCard {
-            hwnd: w as isize,
-            title: window_title(w),
-            icon: Rc::new(OwnedIcon(wicon(card_icon(w)))),
-            frame: ui::live::frame_of(w as isize),
-            minimized: IsIconic(w) != 0,
+        .map(|&w| {
+            let iconic = IsIconic(w) != 0;
+            let mut frame = ui::live::frame_of(w as isize);
+            if iconic {
+                let mut placement: WINDOWPLACEMENT = zeroed();
+                placement.length = size_of::<WINDOWPLACEMENT>() as u32;
+                if GetWindowPlacement(w, &mut placement) != 0 {
+                    let r = placement.rcNormalPosition;
+                    if r.right > r.left && r.bottom > r.top { frame = (r.left, r.top, r.right, r.bottom); }
+                }
+            }
+            WinCard {
+                hwnd: w as isize,
+                title: window_title(w),
+                icon: Rc::new(OwnedIcon(wicon(card_icon(w)))),
+                frame,
+                minimized: iconic || !ui::live::drawable(BAR.load(Relaxed) as HWND, w),
+            }
         })
         .collect()
 }
@@ -179,7 +191,17 @@ unsafe fn taskview_content(calm: bool, skip: isize) -> Option<(Box<dyn panel::Co
     let mut v: Vec<HWND> = Vec::new();
     EnumWindows(Some(collect), &mut v as *mut _ as LPARAM); // z-order: the active window first
     v.retain(|&w| w as isize != skip); // (`collect` leaves out what DWM cloaks: the windows of the other desktops)
-    let mini = vdesk::miniatures(&desks, cur);
+    let mut mini = vdesk::miniatures(&desks, cur);
+    // Without Explorer there is only one desktop; use the same windows as the cards even when DWM's cloak state is unavailable.
+    if !EXPLORER_UP.load(Relaxed) && let Some(current) = mini.get_mut(cur) {
+        current.clear();
+        for &w in v.iter().rev().filter(|&&w| IsIconic(w) == 0) {
+            let (l, t, r, b) = ui::live::frame_of(w as isize);
+            let norm = |v: i32, span: i32| (v as f32 / span.max(1) as f32).clamp(0.0, 1.0);
+            let (x0, y0, x1, y1) = (norm(l, a.screen.0), norm(t, a.screen.1), norm(r, a.screen.0), norm(b, a.screen.1));
+            if x1 > x0 && y1 > y0 { current.push((x0, y0, x1 - x0, y1 - y0)); }
+        }
+    }
     let can_add = EXPLORER_UP.load(Relaxed) && desks.len() < 8;
     let list: Vec<Desk> = desks.iter().zip(mini).enumerate().map(|(i, (d, wins))| Desk { name: d.name.clone(), current: i == cur, wallpaper: d.wallpaper.clone(), wins }).collect();
     let tv = TaskView::new(SCALE.get(), a.screen, list, can_add, win_cards(&v), calm, move |p| {
