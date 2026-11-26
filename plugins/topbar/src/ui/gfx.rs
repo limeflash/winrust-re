@@ -1,10 +1,23 @@
-//! Direct2D + DirectWrite drawing into per-pixel-alpha layered windows.
+//! Direct2D + DirectWrite drawing, shown through DirectComposition (or, as a fallback, layered windows).
 //!
-//! Everything is drawn in DIPs (the design's CSS pixels): the render target's DPI is `96 * scale`, so the numbers from the
-//! Obsidian mockup are used as they are, and D2D scales strokes, text and blur. A [`Surface`] is one window's 32-bit
-//! premultiplied DIB; [`Surface::present`] hands it to `UpdateLayeredWindow`, so transparent pixels click through.
+//! Everything is drawn in DIPs (the design's CSS pixels): the context's DPI is `96 * scale`, so the numbers from the
+//! Obsidian mockup are used as they are, and D2D scales strokes, text and blur.
+//!
+//! One D3D11 device, one D2D device and one DirectComposition device serve the whole thread (the adapter the bar's monitor is
+//! plugged into; WARP if that fails). Every [`Gfx`] draws with a device context of its own on that device, so bitmaps and
+//! pictures are shared and the bar, the panels, the tip and the toast cost one device, not four.
+//!
+//! A [`Surface`] is one window's backing store, in one of two forms:
+//! * a DirectComposition surface ([`Surface::composed`], windows made with [`window_ex`]): D2D draws into it on the GPU,
+//!   [`Surface::present`] sets it as the window's visual with a whole-window opacity, and nothing is copied. Such a window has no
+//!   per-pixel hit test, so what must not catch the mouse is cut out of it with [`shape`] (a window region);
+//! * a 32-bit premultiplied DIB ([`Surface::new`]): the frame is drawn on the GPU, read back, and [`Surface::present`] hands it to
+//!   `UpdateLayeredWindow` (transparent pixels click through). `--render`, `--render-panel`, the screen grab behind a panel's
+//!   glass and the fallback without DirectComposition (`WINRUST_ULW=1`, or no DComp on this machine) use this form.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 thread_local! {
     static BENCH_END: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
@@ -13,7 +26,11 @@ thread_local! {
 pub(crate) fn bench_start() { BENCH_END.set(Some(std::time::Duration::ZERO)); }
 pub(crate) fn bench_end() -> std::time::Duration { BENCH_END.replace(None).unwrap_or_default() }
 
-use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, E_FAIL, HMODULE, HWND, POINT, SIZE};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device};
+use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDesktopDevice, IDCompositionSurface, IDCompositionTarget, IDCompositionVisual3};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP,
@@ -24,13 +41,14 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
     D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_MATRIX_5X4, ID2D1Geometry, ID2D1Image, D2D1_CAP_STYLE_ROUND, D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_INTERSECT,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4,
+    D2D1_ROUNDED_RECT, D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
     D2D1_SHADOW_PROP_COLOR, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_STROKE_TRANSFORM_TYPE_NORMAL, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-    D2D1CreateFactory, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, ID2D1Bitmap, ID2D1BitmapRenderTarget, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1Factory1, ID2D1PathGeometry, ID2D1RenderTarget,
-    ID2D1SolidColorBrush, ID2D1StrokeStyle1,
+    D2D1CreateFactory, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, ID2D1Bitmap, ID2D1Bitmap1, ID2D1BitmapRenderTarget, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1PathGeometry, ID2D1RenderTarget,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle1, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_MAP_OPTIONS_READ,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
@@ -39,17 +57,21 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWriteCreateFactory, IDWriteFactory, IDWriteFactory6,
     IDWriteFontCollection2, IDWriteFontSetBuilder1, IDWriteTextFormat, IDWriteTextLayout1,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CAPTUREBLT, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CAPTUREBLT, CombineRgn, CreateCompatibleDC,
+    CreateDIBSection, CreateRectRgn, CreateRoundRectRgn, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, HRGN,
+    MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, RGN_OR, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn,
 };
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapDitherTypeNone,
     WICBitmapPaletteTypeMedianCut,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::Win32::UI::WindowsAndMessaging::{HICON, ULW_ALPHA, UpdateLayeredWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, HICON, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOZORDER, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow,
+    WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+};
 use windows::core::{HSTRING, IUnknown, Interface, Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -214,7 +236,8 @@ const INTER_FAMILY: &str = "Inter Variable";
 /// Fallbacks when the system cannot load a variable font from memory (DirectWrite before Windows 10 1709).
 const FACES: [&str; 3] = ["Inter", "Segoe UI Variable Text", "Segoe UI"];
 
-/// A window's backing store: a top-down 32-bit premultiplied DIB selected into its own memory DC.
+/// A window's backing store: a DirectComposition surface ([`Surface::composed`]) or a top-down 32-bit premultiplied DIB
+/// selected into its own memory DC ([`Surface::new`]).
 pub struct Surface {
     dc: HDC,
     bmp: HBITMAP,
@@ -222,6 +245,28 @@ pub struct Surface {
     bits: *mut u32,
     w: i32,
     h: i32,
+    /// The GPU side of painting a DIB.
+    gpu: Option<Gpu>,
+    comp: Option<Comp>,
+    composed: bool,
+}
+
+/// What a DIB frame is drawn into on the GPU, and the CPU-readable copy it is read back through.
+struct Gpu {
+    target: ID2D1Bitmap1,
+    copy: ID2D1Bitmap1,
+    epoch: u32,
+    w: i32,
+    h: i32,
+}
+
+/// The DirectComposition surface of a window, and which window's visual shows it.
+struct Comp {
+    surf: IDCompositionSurface,
+    w: i32,
+    h: i32,
+    epoch: u32,
+    bound: Cell<Option<isize>>,
 }
 
 impl Surface {
@@ -234,13 +279,25 @@ impl Surface {
             bits: std::ptr::null_mut(),
             w: 0,
             h: 0,
+            gpu: None,
+            comp: None,
+            composed: false,
         }
+    }
+
+    /// The surface of a window made with [`window_ex`]: a DirectComposition surface while [`compose_windows`] has switched
+    /// composition on, the DIB of a layered window otherwise.
+    #[must_use]
+    pub fn composed() -> Self {
+        let mut s = Self::new();
+        s.composed = composing();
+        s
     }
 
     /// Size in device pixels.
     #[must_use]
-    pub const fn size(&self) -> (i32, i32) {
-        (self.w, self.h)
+    pub fn size(&self) -> (i32, i32) {
+        self.comp.as_ref().map_or((self.w, self.h), |c| (c.w, c.h))
     }
 
     fn ensure(&mut self, w: i32, h: i32) -> bool {
@@ -274,7 +331,8 @@ impl Surface {
         true
     }
 
-    /// The last frame's premultiplied BGRA pixels, row by row (empty before the first paint).
+    /// The last frame's premultiplied BGRA pixels, row by row (empty before the first paint, and for a composed surface:
+    /// those pixels live on the GPU).
     #[must_use]
     pub fn pixels(&self) -> &[u32] {
         if self.bits.is_null() {
@@ -302,7 +360,9 @@ impl Surface {
         }
     }
 
-    fn free(&mut self) {
+    /// Gives the memory back (a screen grab that has been blurred into a picture is not needed any more).
+    pub fn free(&mut self) {
+        self.gpu = None;
         if self.dc.is_invalid() {
             return;
         }
@@ -319,7 +379,11 @@ impl Surface {
     }
 
     /// Puts the last painted frame on screen at `(x, y)` (device pixels) with a whole-window opacity; false if Windows refused.
+    /// A composed surface also resizes the window to the frame; what reaches the screen is cut by the next [`commit`].
     pub fn present(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) -> bool {
+        if self.composed {
+            return self.present_comp(hwnd, x, y, alpha);
+        }
         if self.dc.is_invalid() {
             return false;
         }
@@ -340,6 +404,40 @@ impl Surface {
             .is_ok()
         }
     }
+
+    fn present_comp(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) -> bool {
+        let Some(c) = &self.comp else { return false };
+        let Some(dev) = current_dev().filter(|d| d.epoch == c.epoch) else { return false };
+        let key = hwnd.0 as isize;
+        let mut targets = dev.targets.borrow_mut();
+        let tgt = match targets.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => match make_target(&dev, hwnd) {
+                Ok(t) => v.insert(t),
+                Err(_) => return false,
+            },
+        };
+        let mut ok = true;
+        // SAFETY: calls on our own visual and window; the surface is alive for the whole call.
+        unsafe {
+            let id = c.surf.as_raw() as usize;
+            if tgt.content != id {
+                ok &= tgt.visual.SetContent(&c.surf).is_ok();
+                tgt.content = id;
+            }
+            if tgt.opacity != alpha {
+                ok &= tgt.visual.SetOpacity2(f32::from(alpha) / 255.0).is_ok();
+                tgt.opacity = alpha;
+            }
+            let rect = (x, y, c.w, c.h);
+            if tgt.rect != rect {
+                let _ = SetWindowPos(hwnd, None, x, y, c.w, c.h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW);
+                tgt.rect = rect;
+            }
+        }
+        c.bound.set(Some(key));
+        ok
+    }
 }
 
 impl Default for Surface {
@@ -354,10 +452,279 @@ impl Drop for Surface {
     }
 }
 
+impl Drop for Comp {
+    /// A surface that goes away takes itself off its window's visual (the next [`commit`] shows it), so a closed panel gives
+    /// its GPU memory back at once.
+    fn drop(&mut self) {
+        let Some(window) = self.bound.get() else { return };
+        let id = self.surf.as_raw() as usize;
+        let _ = DEV.try_with(|d| {
+            let Ok(d) = d.try_borrow() else { return };
+            let Some(dev) = d.as_ref().filter(|dev| dev.epoch == self.epoch) else { return };
+            let Ok(mut targets) = dev.targets.try_borrow_mut() else { return };
+            if let Some(t) = targets.get_mut(&window).filter(|t| t.content == id) {
+                // SAFETY: our own visual.
+                unsafe {
+                    let _ = t.visual.SetContent(None::<&IUnknown>);
+                }
+                t.content = 0;
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the devices of the thread
+
+/// What survives a lost device: factories, and what hangs on them.
+struct Shared {
+    factory: ID2D1Factory1,
+    dwrite: IDWriteFactory,
+    wic: IWICImagingFactory,
+    round: ID2D1StrokeStyle1,
+    /// The built-in Inter, when the system can use it.
+    inter: Option<(IDWriteFactory6, IDWriteFontCollection2)>,
+    face: &'static str,
+}
+
+/// The D3D11, D2D and DirectComposition devices; replaced as a whole when the GPU is lost.
+struct Dev {
+    epoch: u32,
+    d3d: ID3D11Device,
+    d2d: ID2D1Device,
+    dcomp: Option<IDCompositionDesktopDevice>,
+    targets: RefCell<HashMap<isize, Tgt>>,
+}
+
+/// What a window of ours shows through DirectComposition, and what was last told to it (calls with nothing new are skipped).
+struct Tgt {
+    _target: IDCompositionTarget,
+    visual: IDCompositionVisual3,
+    content: usize,
+    opacity: u8,
+    rect: (i32, i32, i32, i32),
+}
+
+thread_local! {
+    static SHARED: RefCell<Option<Rc<Shared>>> = const { RefCell::new(None) };
+    static DEV: RefCell<Option<Rc<Dev>>> = const { RefCell::new(None) };
+    static GEN: Cell<u32> = const { Cell::new(1) };
+    static COMPOSE: Cell<bool> = const { Cell::new(false) };
+    static SHAPES: RefCell<HashMap<isize, Option<Vec<Rgn>>>> = RefCell::new(HashMap::new());
+}
+
+fn shared() -> Result<Rc<Shared>> {
+    if let Some(s) = SHARED.with_borrow(Clone::clone) {
+        return Ok(s);
+    }
+    // SAFETY: factory creation has no preconditions beyond COM for WIC.
+    let s = unsafe {
+        let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+        let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+        let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let round = factory.CreateStrokeStyle(
+            &D2D1_STROKE_STYLE_PROPERTIES1 {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                miterLimit: 10.0,
+                dashStyle: D2D1_DASH_STYLE_SOLID,
+                dashOffset: 0.0,
+                transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL, // strokes scale with the icon, like SVG
+            },
+            None,
+        )?;
+        let (inter, face) = (inter(&dwrite), pick_face(&dwrite));
+        Rc::new(Shared { factory, dwrite, wic, round, inter, face })
+    };
+    SHARED.set(Some(s.clone()));
+    Ok(s)
+}
+
+fn current_dev() -> Option<Rc<Dev>> {
+    DEV.with_borrow(Clone::clone)
+}
+
+/// The device of this thread, made on first use.
+fn dev() -> Result<Rc<Dev>> {
+    if let Some(d) = current_dev() {
+        return Ok(d);
+    }
+    let sh = shared()?;
+    let d = Rc::new(create_dev(&sh.factory, composing())?);
+    DEV.set(Some(d.clone()));
+    Ok(d)
+}
+
+/// The adapter the primary monitor (where the bar lives) is plugged into: frames for it need no copy between adapters.
+fn primary_adapter() -> Option<IDXGIAdapter> {
+    // SAFETY: plain DXGI enumeration; every object is local.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            let mut o = 0;
+            while let Ok(out) = adapter.EnumOutputs(o) {
+                if out.GetDesc().is_ok_and(|d| d.Monitor == monitor) {
+                    return adapter.cast().ok();
+                }
+                o += 1;
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+fn create_dev(factory: &ID2D1Factory1, compose: bool) -> Result<Dev> {
+    let mut d3d = None;
+    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    // SAFETY: device creation with out-params that are locals; the first adapter that works wins, WARP is the last resort.
+    unsafe {
+        if let Some(a) = primary_adapter() {
+            let _ = D3D11CreateDevice(&a, D3D_DRIVER_TYPE_UNKNOWN, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None);
+        }
+        if d3d.is_none() {
+            let _ = D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None);
+        }
+        if d3d.is_none() {
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None)?;
+        }
+        let d3d = d3d.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+        let d2d = factory.CreateDevice(&d3d.cast::<IDXGIDevice>()?)?;
+        let dcomp = if compose { Some(DCompositionCreateDevice2::<_, IDCompositionDesktopDevice>(&d2d)?) } else { None };
+        let epoch = GEN.get();
+        Ok(Dev { epoch, d3d, d2d, dcomp, targets: RefCell::new(HashMap::new()) })
+    }
+}
+
+/// The GPU went away (or a test says so): every device-bound thing is rebuilt on its next frame.
+pub(crate) fn lose_device() {
+    GEN.set(GEN.get() + 1);
+    DEV.set(None);
+}
+
+/// A failure that means the device is gone and must be made anew.
+fn device_gone(e: &windows::core::Error) -> bool {
+    // DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, D2DERR_RECREATE_TARGET
+    matches!(e.code().0 as u32, 0x887A_0005 | 0x887A_0007 | 0x8899_000C)
+}
+
+/// Whether the frames of the bar and its panels go through DirectComposition.
+#[must_use]
+pub fn composing() -> bool {
+    COMPOSE.get()
+}
+
+/// Switches the windows to DirectComposition if this machine can (call it before any of them is made, on the UI thread).
+/// `WINRUST_ULW=1` keeps the layered-window path; so does a machine where a DirectComposition target cannot be made.
+pub fn compose_windows() -> bool {
+    if std::env::var_os("WINRUST_ULW").is_some_and(|v| v != "0") {
+        return false;
+    }
+    COMPOSE.set(true);
+    let ok = dev().is_ok_and(|d| probe_target(&d));
+    if !ok {
+        COMPOSE.set(false);
+        DEV.set(None);
+    }
+    ok
+}
+
+/// Can a window of the kind we make take a DirectComposition target? Tried on a hidden 1x1 window.
+fn probe_target(d: &Dev) -> bool {
+    let Some(dc) = d.dcomp.as_ref() else { return false };
+    // SAFETY: a window of the system's STATIC class, made and destroyed here.
+    unsafe {
+        let Ok(w) = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW, w!("STATIC"), None, WS_POPUP, 0, 0, 1, 1, None, None, None, None) else { return false };
+        let ok = dc.CreateTargetForHwnd(w, true).and_then(|t| dc.CreateVisual().and_then(|v| t.SetRoot(&v))).is_ok();
+        let _ = DestroyWindow(w);
+        ok
+    }
+}
+
+/// The extended style a window of ours is made with: no redirection bitmap when composed (DirectComposition draws it), a
+/// layered window otherwise.
+#[must_use]
+pub fn window_ex() -> u32 {
+    (if composing() { WS_EX_NOREDIRECTIONBITMAP } else { WS_EX_LAYERED }).0
+}
+
+fn make_target(dev: &Dev, hwnd: HWND) -> Result<Tgt> {
+    let dc = dev.dcomp.as_ref().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+    // SAFETY: a target on our own window and a visual that is its root.
+    unsafe {
+        let target = dc.CreateTargetForHwnd(hwnd, true)?;
+        let visual = dc.CreateVisual()?;
+        target.SetRoot(&visual)?;
+        Ok(Tgt { _target: target, visual: visual.cast()?, content: 0, opacity: 255, rect: (i32::MIN, 0, 0, 0) })
+    }
+}
+
+/// Everything that was painted and presented since the last call reaches the screen together. Once per frame of an owner.
+pub fn commit() {
+    let Some(d) = current_dev() else { return };
+    let Some(dc) = d.dcomp.as_ref() else { return };
+    // SAFETY: plain calls on the devices.
+    let lost = unsafe { dc.Commit().is_err_and(|e| device_gone(&e)) || d.d3d.GetDeviceRemovedReason().is_err() };
+    if lost {
+        lose_device();
+    }
+}
+
+/// A rectangle of a window's click region, device pixels in window coordinates; `r` rounds its corners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgn {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub r: i32,
+}
+
+/// Cuts a composed window to the union of `parts` (what is outside neither shows nor catches the mouse) or, with `None`, gives
+/// it back whole. A rounded part is one pixel wider on every side, so the smooth edge of what is drawn is not clipped. Does
+/// nothing while the windows are layered (their transparent pixels click through anyway), and only when the shape changed.
+pub fn shape(hwnd: HWND, parts: Option<&[Rgn]>) {
+    if !composing() {
+        return;
+    }
+    let (key, parts) = (hwnd.0 as isize, parts.filter(|p| !p.is_empty()).map(<[Rgn]>::to_vec));
+    if SHAPES.with_borrow(|m| m.get(&key) == Some(&parts)) {
+        return;
+    }
+    // SAFETY: regions are made here and handed to the window, which owns them from then on (freed again if it refuses).
+    unsafe {
+        let rgn = parts.as_deref().map(|p| {
+            let mut acc = HRGN::default();
+            for r in p {
+                let part = if r.r > 0 { CreateRoundRectRgn(r.x - 1, r.y - 1, r.x + r.w + 2, r.y + r.h + 2, 2 * r.r + 2, 2 * r.r + 2) } else { CreateRectRgn(r.x, r.y, r.x + r.w, r.y + r.h) };
+                if acc.is_invalid() {
+                    acc = part;
+                } else {
+                    CombineRgn(Some(acc), Some(acc), Some(part), RGN_OR);
+                    let _ = DeleteObject(part.into());
+                }
+            }
+            acc
+        });
+        if SetWindowRgn(hwnd, rgn, false) == 0
+            && let Some(r) = rgn
+        {
+            let _ = DeleteObject(r.into());
+        }
+    }
+    SHAPES.with_borrow_mut(|m| m.insert(key, parts));
+}
+
 /// A baked picture that stays in the render target's memory: the blurred desktop behind a panel. It belongs to the device
 /// it was made on, so a panel makes a new one each time it opens.
 pub struct Picture {
     bmp: ID2D1Bitmap,
+    /// The device it was made on: after a lost device it is not drawn.
+    epoch: u32,
     /// Size in DIPs.
     pub w: f32,
     pub h: f32,
@@ -381,10 +748,16 @@ impl Xf {
     }
 }
 
-/// Resources bound to the D2D device; rebuilt together after `D2DERR_RECREATE_TARGET`.
+/// What one [`Gfx`] keeps on the device: its own device context (resources made on any context of the device are shared), the
+/// context the frame in progress is drawn with, and the bitmaps cached for it. Rebuilt when the device is.
 struct Device {
-    rt: ID2D1DCRenderTarget,
+    epoch: u32,
+    /// The context that makes resources and draws DIB frames.
     ctx: ID2D1DeviceContext,
+    /// The context of the frame in progress: `ctx`, or the one a DirectComposition surface hands out.
+    cur: ID2D1DeviceContext,
+    /// Where the frame's origin is on its target (a DirectComposition surface sits somewhere inside a shared texture), DIPs.
+    base: Matrix3x2,
     brush: ID2D1SolidColorBrush,
     icons: HashMap<usize, ID2D1Bitmap>,
     shadows: HashMap<[u32; 6], (ID2D1Bitmap, f32)>,
@@ -406,48 +779,31 @@ pub struct Gfx {
     inter: Option<(IDWriteFactory6, IDWriteFontCollection2)>,
     face: &'static str,
     scale: f32,
-    software: bool,
 }
 
 impl Gfx {
     /// Needs COM initialised on this thread (WIC).
     pub fn new(scale: f32) -> Result<Self> {
-        // SAFETY: factory creation has no preconditions beyond COM for WIC.
-        unsafe {
-            let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
-            let round = factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES1 {
-                    startCap: D2D1_CAP_STYLE_ROUND,
-                    endCap: D2D1_CAP_STYLE_ROUND,
-                    dashCap: D2D1_CAP_STYLE_ROUND,
-                    lineJoin: D2D1_LINE_JOIN_ROUND,
-                    miterLimit: 10.0,
-                    dashStyle: D2D1_DASH_STYLE_SOLID,
-                    dashOffset: 0.0,
-                    transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL, // strokes scale with the icon, like SVG
-                },
-                None,
-            )?;
-            let (inter, face) = (inter(&dwrite), pick_face(&dwrite));
-            Ok(Self { factory, dwrite, wic, round, dev: None, paths: HashMap::new(), formats: HashMap::new(), layouts: HashMap::new(), inter, face, scale, software: false })
-        }
+        let s = shared()?;
+        Ok(Self {
+            factory: s.factory.clone(),
+            dwrite: s.dwrite.clone(),
+            wic: s.wic.clone(),
+            round: s.round.clone(),
+            dev: None,
+            paths: HashMap::new(),
+            formats: HashMap::new(),
+            layouts: HashMap::new(),
+            inter: s.inter.clone(),
+            face: s.face,
+            scale,
+        })
     }
 
     /// Device pixels per DIP.
     #[must_use]
     pub const fn scale(&self) -> f32 {
         self.scale
-    }
-
-    /// Select a target before creating a new popup's device-dependent backdrop.
-    pub fn target_for(&mut self, w: i32, h: i32) {
-        let software = i64::from(w) * i64::from(h) <= 2_000_000;
-        if self.software != software {
-            self.dev = None;
-            self.software = software;
-        }
     }
 
     /// Drops every cached icon bitmap (a panel that drew icons it does not own, whose handles may be reused).
@@ -464,52 +820,143 @@ impl Gfx {
     }
 
     fn device(&mut self) -> Result<&mut Device> {
-        if self.dev.is_none() {
-            let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: if self.software { D2D1_RENDER_TARGET_TYPE_SOFTWARE } else { D2D1_RENDER_TARGET_TYPE_DEFAULT },
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: 96.0 * self.scale,
-                dpiY: 96.0 * self.scale,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            };
-            // SAFETY: valid properties; the objects are owned by `Device`.
+        let d = dev()?;
+        if self.dev.as_ref().is_none_or(|x| x.epoch != d.epoch) {
+            // SAFETY: a context and a brush on the thread's device; the objects are owned by `Device`.
             let dev = unsafe {
-                let rt = self.factory.CreateDCRenderTarget(&props)?;
-                rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE); // ClearType needs an opaque target
-                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                let ctx = rt.cast::<ID2D1DeviceContext>()?;
-                let brush = rt.CreateSolidColorBrush(&Rgba::TRANSPARENT.d2d(), None)?;
-                Device { rt, ctx, brush, icons: HashMap::new(), shadows: HashMap::new() }
+                let ctx = d.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+                ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE); // ClearType needs an opaque target
+                ctx.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                ctx.SetDpi(96.0 * self.scale, 96.0 * self.scale);
+                let brush = ctx.CreateSolidColorBrush(&Rgba::TRANSPARENT.d2d(), None)?;
+                Device { epoch: d.epoch, cur: ctx.clone(), ctx, base: Matrix3x2::identity(), brush, icons: HashMap::new(), shadows: HashMap::new() }
             };
             self.dev = Some(dev);
         }
         Ok(self.dev.as_mut().expect("device was just created"))
     }
 
+    /// The generation of the device this renderer draws on now (a [`Picture`] of another one is not drawn).
+    fn epoch(&mut self) -> u32 {
+        self.device().map_or(0, |d| d.epoch)
+    }
+
     /// Paints one frame of `w`×`h` device pixels into `surf`; `draw` gets a cleared, transparent canvas in DIPs.
     pub fn paint(&mut self, surf: &mut Surface, w: i32, h: i32, draw: impl FnOnce(&mut Canvas<'_>)) -> Result<()> {
-        if w <= 0 || h <= 0 || !surf.ensure(w, h) {
+        if w <= 0 || h <= 0 {
             return Ok(());
         }
-        let rc = RECT { left: 0, top: 0, right: w, bottom: h };
-        let rt = self.device()?.rt.clone();
-        // SAFETY: the DIB stays selected into `surf.dc` for the whole frame.
+        let r = if surf.composed { self.paint_comp(surf, w, h, draw) } else { self.paint_dib(surf, w, h, draw) };
+        if let Err(e) = &r
+            && device_gone(e)
+        {
+            lose_device();
+        }
+        r
+    }
+
+    /// A frame into the surface's DirectComposition texture: no copy at all.
+    fn paint_comp(&mut self, surf: &mut Surface, w: i32, h: i32, draw: impl FnOnce(&mut Canvas<'_>)) -> Result<()> {
+        let d = dev()?;
+        let epoch = self.device()?.epoch;
+        let dc = d.dcomp.as_ref().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+        if surf.comp.as_ref().is_none_or(|c| c.w != w || c.h != h || c.epoch != epoch) {
+            // SAFETY: surface creation on the composition device.
+            let s = unsafe { dc.CreateSurface(w as u32, h as u32, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED)? };
+            if let Some(old) = surf.comp.replace(Comp { surf: s, w, h, epoch, bound: Cell::new(None) }) {
+                old.bound.set(None); // the window keeps showing it until the new one is presented
+            }
+        }
+        let comp = surf.comp.as_ref().expect("surface was just made");
+        let s = self.scale;
+        let mut off = POINT::default();
+        // SAFETY: BeginDraw hands out the surface's context; everything drawn stays inside the clip until EndDraw.
+        let ctx: ID2D1DeviceContext = unsafe { comp.surf.BeginDraw(None, &mut off)? };
+        let base = Matrix3x2::translation(off.x as f32 / s, off.y as f32 / s);
+        // SAFETY: setting the state of the context for this frame.
         unsafe {
-            rt.BindDC(surf.dc, &rc)?;
-            rt.BeginDraw();
-            rt.SetTransform(&Matrix3x2::identity());
-            rt.Clear(Some(&Rgba::TRANSPARENT.d2d()));
+            ctx.SetDpi(96.0 * s, 96.0 * s);
+            ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            ctx.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            ctx.SetTransform(&base);
+            ctx.PushAxisAlignedClip(&D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32 / s, bottom: h as f32 / s }, D2D1_ANTIALIAS_MODE_ALIASED);
+            ctx.Clear(Some(&Rgba::TRANSPARENT.d2d()));
+        }
+        {
+            let dv = self.dev.as_mut().expect("device was just made");
+            dv.cur = ctx.clone();
+            dv.base = base;
         }
         draw(&mut Canvas { g: self });
-        // SAFETY: matches the BeginDraw above.
         let started = BENCH_END.with(|b| b.get().map(|_| std::time::Instant::now()));
-        let end = unsafe { rt.EndDraw(None, None) };
+        // SAFETY: matches the BeginDraw above.
+        let end = unsafe {
+            ctx.PopAxisAlignedClip();
+            comp.surf.EndDraw()
+        };
         if let Some(started) = started {
             BENCH_END.with(|b| b.set(b.get().map(|d| d + started.elapsed())));
         }
-        if end.is_err() {
-            self.dev = None; // device lost or target broken: rebuild on the next frame
+        let dv = self.dev.as_mut().expect("device was just made");
+        dv.cur = dv.ctx.clone();
+        dv.base = Matrix3x2::identity();
+        end
+    }
+
+    /// A frame drawn on the GPU into a bitmap, read back and copied into the surface's DIB.
+    fn paint_dib(&mut self, surf: &mut Surface, w: i32, h: i32, draw: impl FnOnce(&mut Canvas<'_>)) -> Result<()> {
+        if !surf.ensure(w, h) {
+            return Ok(());
+        }
+        let ctx = self.device()?.ctx.clone();
+        let epoch = self.dev.as_ref().map_or(0, |d| d.epoch);
+        if surf.gpu.as_ref().is_none_or(|g| g.epoch != epoch || g.w != w || g.h != h) {
+            let props = |bitmap_options| D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: bitmap_options,
+                ..Default::default()
+            };
+            let size = D2D_SIZE_U { width: w as u32, height: h as u32 };
+            // SAFETY: two bitmaps of the frame's size on the thread's device.
+            surf.gpu = Some(unsafe {
+                Gpu {
+                    target: ctx.CreateBitmap(size, None, 0, &props(D2D1_BITMAP_OPTIONS_TARGET))?,
+                    copy: ctx.CreateBitmap(size, None, 0, &props(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW))?,
+                    epoch,
+                    w,
+                    h,
+                }
+            });
+        }
+        let gpu = surf.gpu.as_ref().expect("bitmaps were just made");
+        // SAFETY: the target is ours alone for the frame.
+        unsafe {
+            ctx.SetTarget(&gpu.target);
+            ctx.BeginDraw();
+            ctx.SetTransform(&Matrix3x2::identity());
+            ctx.Clear(Some(&Rgba::TRANSPARENT.d2d()));
+        }
+        draw(&mut Canvas { g: self });
+        let started = BENCH_END.with(|b| b.get().map(|_| std::time::Instant::now()));
+        // SAFETY: matches the BeginDraw above; the copy is mapped for reading only for the time of the row copy, into the
+        // DIB that holds `w * h` pixels.
+        let end = unsafe {
+            let end = ctx.EndDraw(None, None);
+            ctx.SetTarget(None::<&ID2D1Image>);
+            end.and_then(|()| {
+                gpu.copy.CopyFromBitmap(None, &gpu.target, None)?;
+                let m = gpu.copy.Map(D2D1_MAP_OPTIONS_READ)?;
+                let row = w as usize * 4;
+                for y in 0..h as usize {
+                    std::ptr::copy_nonoverlapping(m.bits.add(y * m.pitch as usize), surf.bits.cast::<u8>().add(y * row), row);
+                }
+                gpu.copy.Unmap()
+            })
+        };
+        if let Some(started) = started {
+            BENCH_END.with(|b| b.set(b.get().map(|d| d + started.elapsed())));
         }
         end
     }
@@ -720,8 +1167,14 @@ impl Canvas<'_> {
         b
     }
 
+    /// The context of the frame in progress (what is drawn goes through it).
     fn rt(&mut self) -> ID2D1RenderTarget {
-        self.dev().rt.clone().into()
+        self.dev().cur.clone().into()
+    }
+
+    /// The renderer's own context: it makes the bitmaps, effects and off-screen targets, which any context of the device draws.
+    fn own(&mut self) -> ID2D1RenderTarget {
+        self.dev().ctx.clone().into()
     }
 
     /// Device pixels per DIP.
@@ -1016,7 +1469,7 @@ impl Canvas<'_> {
             return;
         }
         let Some(bmp) = self.bitmap_of(icon) else { return };
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
             ctx.DrawBitmap(&bmp, Some(&r.d2d()), opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
@@ -1053,7 +1506,7 @@ impl Canvas<'_> {
                 b
             }
         };
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         let dst = Rect::new(r.x - pad, r.y - pad + dy, r.w + 2.0 * pad, r.h + 2.0 * pad);
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe { ctx.DrawBitmap(&bmp, Some(&dst.d2d()), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None) };
@@ -1065,7 +1518,7 @@ impl Canvas<'_> {
     }
 
     fn icon_bitmap(&mut self, icon: HICON) -> Option<ID2D1Bitmap> {
-        let rt = self.rt();
+        let rt = self.own();
         // SAFETY: WIC reads the icon's pixels; the converter yields premultiplied BGRA for D2D.
         unsafe {
             let src = self.g.wic.CreateBitmapFromHICON(icon).ok()?;
@@ -1097,7 +1550,7 @@ impl Canvas<'_> {
                 (b, pad)
             }
         };
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         let dst = Rect::new(r.x - pad, r.y - pad + dy, r.w + 2.0 * pad, r.h + 2.0 * pad);
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe {
@@ -1127,7 +1580,7 @@ impl Canvas<'_> {
         c: Rgba,
         shape: impl FnOnce(&ID2D1BitmapRenderTarget) -> Option<()>,
     ) -> Option<ID2D1Bitmap> {
-        let (rt, ctx) = (self.rt(), self.dev().ctx.clone());
+        let (rt, ctx) = (self.own(), self.dev().ctx.clone());
         let size = D2D_SIZE_F { width: w + 2.0 * pad, height: h + 2.0 * pad };
         // SAFETY: an off-screen target is drawn and read back within this frame's device.
         unsafe {
@@ -1157,7 +1610,7 @@ impl Canvas<'_> {
 
     /// Cuts a rounded rectangle out of what is drawn so far (a CSS outer `box-shadow` is not painted under its own box).
     pub fn erase(&mut self, r: Rect, radius: f32) {
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         let b = self.brush(Rgba::TRANSPARENT);
         // SAFETY: drawing inside BeginDraw/EndDraw; the blend mode is restored.
         unsafe {
@@ -1186,7 +1639,7 @@ impl Canvas<'_> {
             .ok()
         };
         let Some(shape) = shape else { return };
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         let b = self.brush(to);
         // SAFETY: drawing inside BeginDraw/EndDraw; the blend mode is restored.
         unsafe {
@@ -1214,7 +1667,7 @@ impl Canvas<'_> {
         if opacity <= 0.001 {
             return;
         }
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         let params = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1 {
             contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
             maskTransform: Matrix3x2::identity(),
@@ -1255,7 +1708,7 @@ impl Canvas<'_> {
         if w <= 0 || h <= 0 || px.len() < (w * h) as usize {
             return None;
         }
-        let (rt, ctx, s) = (self.rt(), self.dev().ctx.clone(), self.g.scale);
+        let (rt, ctx, s) = (self.own(), self.dev().ctx.clone(), self.g.scale);
         let props = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0 * s,
@@ -1291,7 +1744,7 @@ impl Canvas<'_> {
             bctx.Clear(Some(&Rgba::TRANSPARENT.d2d()));
             bctx.DrawImage(&out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
             bctx.EndDraw(None, None).ok()?;
-            Some(Picture { bmp: baked.GetBitmap().ok()?, w: size.width, h: size.height })
+            Some(Picture { bmp: baked.GetBitmap().ok()?, epoch: self.dev().epoch, w: size.width, h: size.height })
         }
     }
 
@@ -1299,7 +1752,7 @@ impl Canvas<'_> {
     /// centred, so what sticks out of the box is cut by the caller (`CSS object-fit: cover`). `None` if it cannot be read.
     pub fn image(&mut self, path: &str, w: f32, h: f32) -> Option<Picture> {
         use windows::Win32::Graphics::Imaging::{WICBitmapInterpolationModeFant, WICDecodeMetadataCacheOnDemand};
-        let (rt, s) = (self.rt(), self.g.scale);
+        let (rt, s) = (self.own(), self.g.scale);
         // SAFETY: WIC decodes and scales into a bitmap that the converter hands to D2D; every object is local to this call.
         unsafe {
             let dec = self.g.wic.CreateDecoderFromFilename(&HSTRING::from(path), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
@@ -1316,13 +1769,16 @@ impl Canvas<'_> {
             let conv = self.g.wic.CreateFormatConverter().ok()?;
             conv.Initialize(&scaler, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut).ok()?;
             let bmp = rt.CreateBitmapFromWicBitmap(&conv, None).ok()?;
-            Some(Picture { bmp, w: pw as f32 / s, h: ph as f32 / s })
+            Some(Picture { bmp, epoch: self.dev().epoch, w: pw as f32 / s, h: ph as f32 / s })
         }
     }
 
     /// Draws a baked picture with its top left corner at `(x, y)`, pixel for pixel.
     pub fn picture(&mut self, p: &Picture, x: f32, y: f32) {
-        let ctx = self.dev().ctx.clone();
+        if p.epoch != self.dev().epoch {
+            return;
+        }
+        let ctx = self.dev().cur.clone();
         let dst = Rect::new(x, y, p.w, p.h);
         // SAFETY: drawing inside BeginDraw/EndDraw.
         unsafe { ctx.DrawBitmap(&p.bmp, Some(&dst.d2d()), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None) };
@@ -1332,6 +1788,9 @@ impl Canvas<'_> {
     /// `opacity`: CSS `object-fit: cover` with a `border-radius`. It goes through a brush, so it follows an enclosing transform.
     pub fn picture_cover(&mut self, p: &Picture, r: Rect, radius: f32, opacity: f32) {
         use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BRUSH_PROPERTIES};
+        if p.epoch != self.dev().epoch {
+            return;
+        }
         let rt = self.rt();
         let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
         let brush = D2D1_BRUSH_PROPERTIES { opacity, transform: Matrix3x2::translation(r.cx() - p.w / 2.0, r.cy() - p.h / 2.0) };
@@ -1387,7 +1846,7 @@ impl Canvas<'_> {
 
     /// Runs `f` with everything it draws clipped to the geometry `mask` (a layer; the shape is in window coordinates).
     fn under_mask(&mut self, mask: ID2D1Geometry, f: impl FnOnce(&mut Self)) {
-        let ctx = self.dev().ctx.clone();
+        let ctx = self.dev().cur.clone();
         let mut params = D2D1_LAYER_PARAMETERS1 {
             contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
             geometricMask: std::mem::ManuallyDrop::new(Some(mask)),
@@ -1404,5 +1863,66 @@ impl Canvas<'_> {
             ctx.PopLayer();
             std::mem::ManuallyDrop::drop(&mut params.geometricMask);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+
+    fn gfx() -> Gfx {
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
+        Gfx::new(1.0).expect("direct2d")
+    }
+
+    fn frame(g: &mut Gfx, s: &mut Surface) {
+        g.paint(s, 64, 32, |c| {
+            c.fill(Rect::new(4.0, 4.0, 40.0, 20.0), 6.0, Rgba::hex(0x3366cc).alpha(0.8));
+            c.text("Ab", Rect::new(6.0, 4.0, 40.0, 20.0), Font::new(13.0, 600), Rgba::white(1.0), Align::Start);
+        })
+        .expect("a frame");
+    }
+
+    #[test]
+    fn one_device_per_thread() {
+        let (mut a, mut b) = (gfx(), gfx());
+        let (mut sa, mut sb) = (Surface::new(), Surface::new());
+        frame(&mut a, &mut sa);
+        let first = current_dev().expect("a device");
+        frame(&mut b, &mut sb);
+        assert!(Rc::ptr_eq(&first, &current_dev().expect("still one")), "the second renderer made a device of its own");
+        assert_eq!(sa.pixels(), sb.pixels(), "same drawing, same pixels");
+    }
+
+    #[test]
+    fn paint_survives_device_loss() {
+        let mut g = gfx();
+        let mut s = Surface::new();
+        frame(&mut g, &mut s);
+        let before = s.pixels().to_vec();
+        assert!(before.iter().any(|&p| p >> 24 != 0), "something was drawn");
+        let epoch = current_dev().expect("a device").epoch;
+        lose_device();
+        frame(&mut g, &mut s);
+        assert!(current_dev().expect("a new device").epoch > epoch);
+        assert_eq!(before, s.pixels(), "the frame after the loss is the same frame");
+    }
+
+    #[test]
+    fn a_mask_stands_in_the_world_it_was_pushed_in() {
+        let mut g = gfx();
+        let mut s = Surface::new();
+        g.paint(&mut s, 200, 20, |c| {
+            c.transformed(0.0, 0.0, 1.0, 50.0, 0.0, |c| {
+                c.masked(Rect::new(0.0, 0.0, 100.0, 20.0), 0.0, Xf::NONE, |c| c.fill(Rect::new(-1000.0, -1000.0, 3000.0, 3000.0), 0.0, Rgba::hex(0xff0000)));
+            });
+        })
+        .expect("a frame");
+        let row = &s.pixels()[..200];
+        let (first, last) = (row.iter().position(|&p| p >> 24 != 0), row.iter().rposition(|&p| p >> 24 != 0));
+        // a DirectComposition surface sits at an offset inside its texture and is drawn under that transform: masks follow it
+        assert_eq!((first, last), (Some(50), Some(149)), "the mask follows the world transform");
     }
 }

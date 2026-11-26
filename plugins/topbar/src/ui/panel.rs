@@ -750,7 +750,6 @@ impl Popup {
         let (w, h) = content.size(g);
         let place = content.place(); // asked again: a content that finds its place from its size (the switcher) knows it now
         let (bw, bh) = ((w * s).round() as i32, (h * s).round() as i32);
-        g.target_for(bw, bh);
         let size = (bw as f32 / s, bh as f32 / s);
         let at = place_box(&anchor, (bw, bh), place, s);
         let b = anchor.button;

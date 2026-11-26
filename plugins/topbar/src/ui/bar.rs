@@ -569,7 +569,6 @@ impl Bar {
     pub fn frame(&mut self, v: &View, live: &Live) -> Placement {
         let now = live.now;
         let s = self.scale;
-        self.gfx.target_for((v.screen.0 * s) as i32, (100.0 * s) as i32);
         self.motion.mode = Some(style::anim());
         let sh = shape(v.style, v.side, v.size);
 
