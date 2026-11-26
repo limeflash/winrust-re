@@ -21,3 +21,4 @@ pub mod taskview;
 pub mod tip;
 pub mod toast;
 pub mod tray_popup;
+pub mod winx;

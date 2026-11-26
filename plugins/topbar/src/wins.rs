@@ -17,6 +17,8 @@ thread_local! {
     static SW_PT: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// The monitor it is shown on (left, top, right, bottom).
     static SW_MON: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
+    /// The list holds the windows of one monitor only (the setting asked for it and there was another window to switch to).
+    static SW_PER: Cell<bool> = const { Cell::new(false) };
     /// The app button the previews are open for, and when the pointer was last seen away from both.
     static PV_BTN: Cell<i32> = const { Cell::new(NONE) };
     static PV_AWAY: Cell<u64> = const { Cell::new(0) };
@@ -212,6 +214,7 @@ unsafe fn taskview_content(calm: bool, skip: isize) -> Option<(Box<dyn panel::Co
                 taskview::Pick::Close(w) => closed(TASKVIEW, w as HWND),
                 taskview::Pick::Desktop(i) => vdesk::go(cur, i),
                 taskview::Pick::NewDesktop => vdesk::add(),
+                taskview::Pick::Scope => {}
             }
         }
     });
@@ -256,6 +259,7 @@ fn sw_pick(p: taskview::Pick) {
                 alt_done(false);
             }
             taskview::Pick::Close(w) => sw_remove(w as HWND),
+            taskview::Pick::Scope => sw_rescope(),
             _ => {}
         }
     }
@@ -267,29 +271,52 @@ unsafe fn open_switcher() {
     let Some(mut a) = anchor(NONE) else { return };
     a.screen = (mon.2, mon.3);
     let sw = Switch { selected: sw_selected, point: sw_point, pick: sw_pick };
-    let panel = Switcher::new(SCALE.get(), mon, win_cards(&wins), sw);
+    let panel = Switcher::new(SCALE.get(), mon, win_cards(&wins), SW_PER.get(), sw);
     panel::open(Box::new(panel), a);
+}
+
+/// The windows the switcher lists (the active one first, then the one before it) and the monitor they are shown on. With the
+/// per-monitor setting on, only those of the active window's monitor, when there is another window there to switch to.
+unsafe fn sw_windows() -> (Vec<HWND>, RECT, bool) {
+    let mut v: Vec<HWND> = Vec::new();
+    EnumWindows(Some(collect), &mut v as *mut _ as LPARAM); // z-order: the active window first, then the one before it
+    let mut mon = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
+    let mut per = false;
+    if i18n::style::alttab_per_monitor() && !v.is_empty() {
+        let of = |w: HWND| MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+        let m0 = of(v[0]);
+        let mut mi: MONITORINFO = zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(m0, &mut mi) != 0 {
+            let same: Vec<HWND> = v.iter().copied().filter(|&w| of(w) == m0).collect();
+            if same.len() > 1 {
+                v = same;
+                mon = mi.rcMonitor;
+                per = true;
+            }
+        }
+    }
+    (v, mon, per)
+}
+
+/// The scope button: flips the setting and lists the windows again, the chosen one staying chosen if it is still there.
+unsafe fn sw_rescope() {
+    i18n::style::set_alttab_per_monitor(!i18n::style::alttab_per_monitor());
+    let keep = SW.with_borrow(|(v, i)| v.get(*i).copied());
+    let (v, mon, per) = sw_windows();
+    if v.is_empty() {
+        return;
+    }
+    let at = keep.and_then(|w| v.iter().position(|&x| x == w)).unwrap_or(0);
+    SW.set((v, at));
+    SW_MON.set((mon.left, mon.top, mon.right, mon.bottom));
+    SW_PER.set(per);
+    open_switcher();
 }
 
 pub(crate) unsafe fn alt_tab(back: bool) {
     if !panel::is_open(Id::Switch) {
-        let mut v: Vec<HWND> = Vec::new();
-        EnumWindows(Some(collect), &mut v as *mut _ as LPARAM); // z-order: the active window first, then the one before it
-        // per monitor: only the windows on the active window's monitor (when there is another one to switch to), shown on that monitor
-        let mut mon = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
-        if i18n::style::alttab_per_monitor() && !v.is_empty() {
-            let of = |w: HWND| MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
-            let m0 = of(v[0]);
-            let mut mi: MONITORINFO = zeroed();
-            mi.cbSize = size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(m0, &mut mi) != 0 {
-                let same: Vec<HWND> = v.iter().copied().filter(|&w| of(w) == m0).collect();
-                if same.len() > 1 {
-                    v = same;
-                    mon = mi.rcMonitor;
-                }
-            }
-        }
+        let (v, mon, per) = sw_windows();
         let n = v.len();
         if n == 0 {
             return SWITCHING.store(false, Relaxed);
@@ -297,6 +324,7 @@ pub(crate) unsafe fn alt_tab(back: bool) {
         SW.set((v, if n == 1 { 0 } else if back { n - 1 } else { 1 }));
         SW_PT.set(Some(cursor()));
         SW_MON.set((mon.left, mon.top, mon.right, mon.bottom));
+        SW_PER.set(per);
         open_switcher();
     } else {
         SW.with_borrow_mut(|(v, i)| *i = if back { (*i + v.len() - 1) % v.len() } else { (*i + 1) % v.len() });

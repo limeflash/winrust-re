@@ -1286,7 +1286,7 @@ impl Content for SettingsPanel {
         Some((W, 700.0))
     }
 
-    fn resized(&mut self, g: &mut Gfx) -> Option<(f32, f32)> {
+    fn resized(&mut self, g: &mut Gfx, _now: u64) -> Option<(f32, f32)> {
         let (items, h) = self.build(&mut |s, f| g.measure(s, f));
         self.items = items;
         let new = (W, h);

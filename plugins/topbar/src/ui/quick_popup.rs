@@ -13,8 +13,9 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::rc::Rc;
 
-use super::anim::{self, CubicBezier, EASE, SNAP, SPRING};
+use super::anim::{self, CubicBezier, EASE, SNAP, SPRING, Transition};
 use super::gfx::{Align, Canvas, Font, Gfx, Rect, Rgba};
 use super::icons;
 use super::panel::{Along, Button, Content, Cx, Dir, Entry, Frame, Id, Look, Origin, Place, Shadow};
@@ -34,6 +35,8 @@ const BRIGHT: i32 = 22;
 const DEVICE: i32 = 23;
 const MEDIA: i32 = 24; // 24 previous, 25 play / pause, 26 next
 const GEAR: i32 = 27;
+const DEV: i32 = 300; // 300.. the outputs, 340.. the inputs
+const SOUND_MORE: i32 = 380;
 const BACK: i32 = 40;
 const SWITCH: i32 = 41;
 const NETWORKS: i32 = 42;
@@ -50,6 +53,9 @@ const MUTED: Rgba = Rgba::css(255, 154, 154, 1.0);
 const RED: Rgba = Rgba::css(255, 69, 58, 1.0);
 const GREEN: Rgba = Rgba::css(48, 209, 88, 1.0);
 const AMBER: Rgba = Rgba::css(255, 214, 10, 1.0);
+
+/// The mockup's `cubic-bezier(.32,.72,0,1)`: the strip and the list of devices changing places.
+const SHEET: CubicBezier = CubicBezier::new(0.32, 0.72, 0.0, 1.0);
 
 /// `ease-out`, what the slider's `transition: width .12s ease-out` uses.
 const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
@@ -68,6 +74,9 @@ const PREVIOUS: &str = "M19 5L9 12l10 7zM5 5v14";
 const PLAY: &str = "M7 4.5v15l12-7.5z";
 const PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
 const NEXT: &str = "M5 5l10 7-10 7zM19 5v14";
+const HEADPHONES: &str = "M4 14v-2a8 8 0 0 1 16 0v2M4 14h3v6H5a1 1 0 0 1-1-1zM20 14h-3v6h2a1 1 0 0 0 1-1z";
+const MONITOR: &str = "M3 4h18v12H3zM8 20h8M12 16v4";
+const MICROPHONE: &str = "M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3";
 
 /// One tile's two icons (the off one is the same drawing but for Night light) and whether the on one is filled.
 struct Icon {
@@ -128,6 +137,46 @@ pub struct Media {
     pub playing: bool,
 }
 
+/// What a sound device is, for its icon.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Speakers,
+    Headphones,
+    Monitor,
+    Microphone,
+}
+
+impl Kind {
+    #[must_use]
+    pub const fn icon(self) -> &'static str {
+        match self {
+            Self::Speakers => SPEAKER_2,
+            Self::Headphones => HEADPHONES,
+            Self::Monitor => MONITOR,
+            Self::Microphone => MICROPHONE,
+        }
+    }
+}
+
+/// A sound device of the machine.
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    /// The line under the name: the adapter and how it is connected.
+    pub sub: String,
+    pub kind: Kind,
+    /// Windows uses it now.
+    pub current: bool,
+}
+
+/// The active playback and recording devices.
+#[derive(Default, Debug)]
+pub struct Audio {
+    pub outputs: Vec<Device>,
+    pub inputs: Vec<Device>,
+}
+
 /// Everything the first page shows.
 pub struct State {
     pub tiles: Vec<Tile>,
@@ -138,6 +187,7 @@ pub struct State {
     pub media: Option<Media>,
     /// Charge in percent and whether the charger is plugged in; `None` without a battery.
     pub battery: Option<(i32, bool)>,
+    pub audio: Rc<Audio>,
 }
 
 /// A network in the list.
@@ -200,6 +250,8 @@ pub trait Host {
     fn tile(&mut self, i: usize, cx: &mut Cx);
     fn volume(&mut self, percent: i32);
     fn mute(&mut self);
+    /// Makes device `id` the one Windows plays through (`input` false) or records with.
+    fn audio_set(&mut self, input: bool, id: &str);
     /// Brightness follows the knob; `done` once it is let go (the screen is set then).
     fn brightness(&mut self, percent: i32, done: bool);
     /// 0 previous, 1 play / pause, 2 next.
@@ -219,10 +271,29 @@ pub trait Host {
 // ---------------------------------------------------------------------------------------------------------------------
 // geometry
 
+/// How far the panel's two states have got into each other: `grid` is the strip the tiles stand in (0 the 3x3 grid, 1 the row
+/// of icons), `tiles` each tile on its own clock, `list` the sound card's list of devices (0 hidden, 1 shown).
+#[derive(Clone, Copy)]
+struct Sheet {
+    grid: f32,
+    tiles: [f32; 9],
+    list: f32,
+}
+
+impl Sheet {
+    const CLOSED: Self = Self { grid: 0.0, tiles: [0.0; 9], list: 0.0 };
+    const OPEN: Self = Self { grid: 1.0, tiles: [1.0; 9], list: 1.0 };
+}
+
 /// The rectangles of the first page.
 struct Geo {
     tiles: [Rect; 9],
+    /// The corner radius and the top padding of each tile (they follow the sheet: 16 and 10 in the grid, 11 and 2 in the row).
+    radius: [f32; 9],
+    pad_top: [f32; 9],
     sound: Rect,
+    /// The part of the list that shows (its box grows from nothing, `grid-template-rows: 0fr` to `1fr`).
+    wrap: Rect,
     device: Rect,
     mute: Rect,
     vol: Rect,
@@ -237,31 +308,165 @@ struct Geo {
     height: f32,
 }
 
-fn geo(has_bright: bool, device_w: f32) -> Geo {
+/// `list_h` is the height of the list when it is all shown (`Lines::height`).
+fn geo(sh: Sheet, has_bright: bool, device_w: f32, list_h: f32) -> Geo {
     let tw = (INNER - 2.0 * GAP) / 3.0;
-    let tiles = std::array::from_fn(|i| Rect::new(PAD + (i % 3) as f32 * (tw + GAP), PAD + (i / 3) as f32 * (TILE_H + GAP), tw, TILE_H));
-    let y = PAD + 3.0 * TILE_H + 2.0 * GAP + GAP;
-    let h = 10.0 + 26.0 + GAP + 32.0 + if has_bright { GAP + 32.0 } else { 0.0 } + 12.0;
+    let tiles = std::array::from_fn(|i| {
+        let (grid, row) = (Rect::new(PAD + (i % 3) as f32 * (tw + GAP), PAD + (i / 3) as f32 * (TILE_H + GAP), tw, TILE_H), Rect::new(PAD + i as f32 * 40.0, PAD, 36.0, 36.0));
+        let t = sh.tiles[i];
+        Rect::new(anim::lerp(grid.x, row.x, t), anim::lerp(grid.y, row.y, t), anim::lerp(grid.w, row.w, t), anim::lerp(grid.h, row.h, t))
+    });
+    let radius = std::array::from_fn(|i| anim::lerp(16.0, 11.0, sh.tiles[i]));
+    let pad_top = std::array::from_fn(|i| anim::lerp(10.0, 2.0, sh.tiles[i]));
+    // the strip is 274 high as a grid and 36 as a row; the card follows it, 8 below
+    let y = PAD + anim::lerp(3.0 * TILE_H + 2.0 * GAP, 36.0, sh.grid) + GAP;
+    // the card: padding 10 12 12 and 8 between; the list's box takes its height and cancels its 8 of margin while it is empty
+    let shown = (list_h + GAP) * sh.list;
+    let sound_y = y + 10.0 + shown;
+    let h = 10.0 + shown + 26.0 + GAP + 32.0 + if has_bright { GAP + 32.0 } else { 0.0 } + 12.0;
     let sound = Rect::new(PAD, y, INNER, h);
     let (x0, x1) = (sound.x + 12.0, sound.x + sound.w - 12.0);
-    let device = Rect::new(x1 + 6.0 - device_w, y + 10.0, device_w, 26.0);
+    let wrap = Rect::new(x0, y + 10.0, x1 - x0, list_h * sh.list);
+    let device = Rect::new(x1 + 6.0 - device_w, sound_y - 1.0, device_w, 28.0);
     // a row is 32 high (the mute button); the 28 px track and the value are centred in it
     let row = |top: f32| {
         let track = Rect::new(x0 - 4.0 + 32.0 + 10.0, top + 2.0, (x1 - 40.0 - 10.0) - (x0 - 4.0 + 32.0 + 10.0), 28.0);
         (Rect::new(x0 - 4.0, top, 32.0, 32.0), track, Rect::new(x1 - 40.0, top, 40.0, 32.0))
     };
-    let (mute, vol, vol_num) = row(y + 10.0 + 26.0 + GAP);
-    let (bright_icon, bright, bright_num) = row(y + 10.0 + 26.0 + GAP + 32.0 + GAP);
+    let (mute, vol, vol_num) = row(sound_y + 26.0 + GAP);
+    let (bright_icon, bright, bright_num) = row(sound_y + 26.0 + GAP + 32.0 + GAP);
     let media = Rect::new(PAD, y + h + GAP, INNER, 58.0);
     let buttons = std::array::from_fn(|i| Rect::new(media.x + media.w - 8.0 - 40.0 * (3 - i) as f32, media.cy() - 20.0, 40.0, 40.0));
     let foot = Rect::new(PAD, media.y + media.h + GAP, INNER, 40.0);
     let gear = Rect::new(foot.x + foot.w - 40.0, foot.y, 40.0, 40.0);
-    Geo { tiles, sound, device, mute, vol, vol_num, bright_icon, bright, bright_num, media, buttons, foot, gear, height: foot.y + foot.h + PAD }
+    Geo { tiles, radius, pad_top, sound, wrap, device, mute, vol, vol_num, bright_icon, bright, bright_num, media, buttons, foot, gear, height: foot.y + foot.h + PAD }
+}
+
+/// One line of the list in the sound card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Line {
+    /// "Output" (true) or "Input".
+    Title(bool),
+    /// Device `n` of the outputs (true) or the inputs.
+    Device(bool, usize),
+    /// "Sound settings".
+    More,
+}
+
+impl Line {
+    fn id(self) -> i32 {
+        match self {
+            Self::Title(_) => -1,
+            Self::Device(out, n) => DEV + if out { 0 } else { 40 } + n as i32,
+            Self::More => SOUND_MORE,
+        }
+    }
+}
+
+/// The lines of the list from its top (`.audl`: 2 apart, a title 24, a device 40, the settings link 32 with 2 more above it,
+/// 6 of padding and a hairline under it) and its height.
+struct Lines {
+    lines: Vec<(Line, f32, f32)>,
+    /// The whole box, as `.audl` is.
+    height: f32,
+}
+
+impl Lines {
+    fn of(a: &Audio) -> Self {
+        let (mut y, mut lines) = (0.0, Vec::new());
+        let mut push = |l: Line, h: f32, y: &mut f32| {
+            lines.push((l, *y, h));
+            *y += h + 2.0;
+        };
+        for (out, list) in [(true, &a.outputs), (false, &a.inputs)] {
+            if list.is_empty() {
+                continue;
+            }
+            push(Line::Title(out), 24.0, &mut y);
+            for n in 0..list.len() {
+                push(Line::Device(out, n), 40.0, &mut y);
+            }
+        }
+        y += 2.0;
+        push(Line::More, 32.0, &mut y);
+        Self { lines, height: y - 2.0 + 6.0 + 1.0 }
+    }
+
+    /// What the box of the list takes in the card: it starts 4 px above its wrapper (a margin of -4).
+    fn shown(&self) -> f32 {
+        self.height - 4.0
+    }
 }
 
 /// The value (0..1) a pointer at `x` means on a 28 px track with a 24 px knob.
 fn slider_value(track: Rect, x: f32) -> f32 {
     ((x - track.x - 14.0) / (track.w - 28.0)).clamp(0.0, 1.0)
+}
+
+/// The strip and the list changing places (`.qg`, `.audw`): when each part of it moves and how, as the mockup's CSS has it.
+struct Slide {
+    open: bool,
+    grid: Transition,
+    tiles: [Transition; 9],
+    labels: [Transition; 9],
+    list: Transition,
+    fade: Transition,
+    items: Transition,
+    shift: Transition,
+}
+
+impl Slide {
+    fn new() -> Self {
+        Self {
+            open: false,
+            grid: Transition::new(0.0),
+            tiles: [Transition::new(0.0); 9],
+            labels: [Transition::new(1.0); 9],
+            list: Transition::new(0.0),
+            fade: Transition::new(0.0),
+            items: Transition::new(0.0),
+            shift: Transition::new(0.0),
+        }
+    }
+
+    /// Opens or closes the list; `snap` does it at once.
+    fn set(&mut self, open: bool, now: u64, snap: bool) {
+        self.open = open;
+        let to = f32::from(open);
+        let go = |t: &mut Transition, to: f32, dur: u32, delay: u32, ease: CubicBezier| {
+            if snap {
+                t.snap(to);
+            } else {
+                let (dur, delay) = anim::timing(style::anim(), dur, delay);
+                t.set(to, now, dur, delay, ease);
+            }
+        };
+        go(&mut self.grid, to, 500, 0, SHEET);
+        for i in 0..9 {
+            // `--dl`: the row's icons set off one after another from the left, the grid's tiles from the bottom right
+            let dl = if open { 16 * i as u32 } else { 12 * (8 - i as u32) };
+            go(&mut self.tiles[i], to, 500, dl, SHEET);
+            // the labels leave at once and come back last
+            if open { go(&mut self.labels[i], 0.0, 120, 0, EASE) } else { go(&mut self.labels[i], 1.0, 280, dl + 200, EASE) }
+        }
+        if open {
+            go(&mut self.list, 1.0, 500, 40, SHEET);
+            go(&mut self.fade, 1.0, 300, 100, EASE);
+        } else {
+            go(&mut self.list, 0.0, 450, 0, SHEET);
+            go(&mut self.fade, 0.0, 180, 0, EASE);
+        }
+        go(&mut self.items, to, 300, 0, EASE);
+        go(&mut self.shift, to, 450, 0, SHEET);
+    }
+
+    fn sheet(&self, now: u64) -> Sheet {
+        Sheet { grid: self.grid.value(now), tiles: std::array::from_fn(|i| self.tiles[i].value(now)), list: self.list.value(now) }
+    }
+
+    fn running(&self, now: u64) -> bool {
+        [&self.grid, &self.list, &self.fade, &self.items, &self.shift].iter().any(|t| t.running(now)) || self.tiles.iter().chain(&self.labels).any(|t| t.running(now))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,6 +504,12 @@ pub struct QuickPanel {
     device_w: f32,
     back_w: f32,
     bright_v: i32,
+    size: (f32, f32),
+    slide: Slide,
+    /// The button of the Sound card was pressed: the list opens or closes at the next frame (which knows the time).
+    toggle: bool,
+    /// The time of the frame being drawn, for the geometry that moves.
+    now: u64,
 }
 
 impl QuickPanel {
@@ -311,7 +522,7 @@ impl QuickPanel {
         }
         let wf = host.wifi();
         ON_WIFI.set(wifi);
-        Self {
+        let mut panel = Self {
             bright: st.bright.is_some(),
             bright_v: st.bright.unwrap_or(0),
             host,
@@ -324,7 +535,13 @@ impl QuickPanel {
             ctx: None,
             device_w: 90.0,
             back_w: 70.0,
-        }
+            size: (W, 0.0),
+            slide: Slide::new(),
+            toggle: false,
+            now: 0,
+        };
+        panel.size.1 = panel.geo().height;
+        panel
     }
 
     /// The password prompt for `ssid` already open (the renderer shows it).
@@ -347,14 +564,11 @@ impl QuickPanel {
             self.host.wifi_open();
         }
         self.page = to;
+        self.slide.set(false, self.now, true); // the Wi-Fi page has the panel at its first size
         self.flip = Some((0, dir));
         self.pass = None;
         self.ctx = None;
         ON_WIFI.set(to == Page::Wifi);
-    }
-
-    fn geo(&self) -> Geo {
-        geo(self.bright, self.device_w)
     }
 
     // ---- the Wi-Fi page's rectangles ----
@@ -455,61 +669,104 @@ fn brighter(c: Rgba, k: f32) -> Rgba {
 impl QuickPanel {
     // ---- the first page ----
 
+    /// The sheet as it is at the time of the frame being drawn (the Wi-Fi page keeps to the closed one).
+    fn sheet(&self) -> Sheet {
+        if self.page == Page::Wifi { Sheet::CLOSED } else { self.slide.sheet(self.now) }
+    }
+
+    fn lines(&self) -> Lines {
+        Lines::of(&self.st.audio)
+    }
+
+    fn geo(&self) -> Geo {
+        geo(self.sheet(), self.bright, self.device_w, self.lines().shown())
+    }
+
+    /// The output Windows plays through now: the name on the Sound card's button.
+    fn current_output(&self) -> Option<&Device> {
+        let a = &self.st.audio;
+        a.outputs.iter().find(|d| d.current).or(a.outputs.first())
+    }
+
     fn draw_main(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
         let accent = Rgba::colorref(pal().accent);
         let g = self.geo();
+        let sheet = self.sheet();
 
         for (i, r) in g.tiles.iter().enumerate() {
             let Some(tile) = self.st.tiles.get(i) else { continue };
             let id = i as i32;
             let on = f32::from(tile.on);
+            let t = sheet.tiles[i];
+            let compact = self.slide.open && self.page == Page::Main;
             let (fg_t, chip_t, op_t) = (f.tween(id, 1, on, 300, EASE), f.tween(id, 2, on, 350, EASE), f.tween(id, 3, on, 350, EASE));
             let (reveal, turn) = (f.tween(id, 4, on, 350, SPRING), f.tween(id, 5, on, 300, SPRING));
             let icon_t = f.tween(id, 6, on, 300, EASE);
             let hot = f.hover(id, 250, EASE);
             let press = f.tween(id, 7, f32::from(f.press == Some(id)), 250, SPRING);
             let fg = INK.mix(ON_ACCENT, fg_t);
+            let radius = g.radius[i];
             c.transformed(r.cx(), r.cy(), 1.0 - 0.05 * press, 0.0, 0.0, |c| {
-                c.fill(*r, 16.0, Rgba::white(0.07 + 0.025 * hot));
-                // `.fill`: a circle of the accent that grows from the chip, `clip-path` .35s spring, opacity .4 to 1
-                let origin = (r.x + 27.0, r.y + 26.0);
-                c.fill_disc_in(*r, 16.0, origin, 140.0 * reveal, brighter(accent, 1.0 + 0.12 * hot).alpha(0.4 + 0.6 * op_t));
-                c.circle(origin.0, origin.1, 16.0, Rgba::white(0.09).mix(Rgba::css(11, 18, 32, 0.14), chip_t));
+                c.fill(*r, radius, Rgba::white(0.07 + 0.025 * hot));
+                // `.fill`: a circle of the accent that grows from the chip, `clip-path` .35s spring, opacity .4 to 1; in the row
+                // it is `circle(30px at 18px 18px)`, enough to fill the whole 36 px square
+                let origin = (r.x + anim::lerp(27.0, 18.0, t), r.y + anim::lerp(26.0, 18.0, t));
+                c.fill_disc_in(*r, radius, origin, anim::lerp(140.0, 30.0, t) * reveal, brighter(accent, 1.0 + 0.12 * hot).alpha(0.4 + 0.6 * op_t));
+                // the chip: in the grid at the left, in the row the icon alone in the middle (its plate goes at once)
+                let chip = (if compact { r.cx() } else { r.x + 11.0 + 16.0 }, r.y + g.pad_top[i] + 16.0);
+                if !compact {
+                    c.circle(chip.0, chip.1, 16.0, Rgba::white(0.09).mix(Rgba::css(11, 18, 32, 0.14), chip_t));
+                }
                 // two icons on the chip: the off one turns away and shrinks, the on one turns in
                 let ic = &ICONS[i];
-                c.faded(1.0 - icon_t, |c| c.icon(ic.off, origin, 17.0 * (1.0 - 0.7 * turn), 2.0, fg, 90.0 * turn));
+                c.faded(1.0 - icon_t, |c| c.icon(ic.off, chip, 17.0 * (1.0 - 0.7 * turn), 2.0, fg, 90.0 * turn));
                 c.faded(icon_t, |c| {
                     let size = 17.0 * (0.3 + 0.7 * turn);
                     if ic.filled {
-                        c.glyph(ic.on, origin, size, fg);
+                        c.glyph(ic.on, chip, size, fg);
                     }
-                    c.icon(ic.on, origin, size, if ic.filled { 1.2 } else { 2.0 }, fg, -90.0 * (1.0 - turn));
+                    c.icon(ic.on, chip, size, if ic.filled { 1.2 } else { 2.0 }, fg, -90.0 * (1.0 - turn));
                 });
-                if i == 0 {
-                    let h = f.hover(MORE, 160, EASE);
-                    let at = (r.x + r.w - 11.0 - 7.0, origin.1);
-                    c.circle(at.0, at.1, 12.0, Rgba::css(11, 18, 32, 0.12).mix(Rgba::white(0.12), 1.0 - fg_t).fade(h));
-                    c.icon(CHEVRON_RIGHT, at, 14.0, 2.4, fg, 0.0);
+                // the label and the chevron come back last and leave first
+                let shown = self.slide.labels[i].value(self.now);
+                if shown > 0.01 {
+                    c.faded(shown, |c| {
+                        c.transformed(0.0, 0.0, 1.0, 0.0, 6.0 * (1.0 - shown), |c| {
+                            if i == 0 {
+                                let h = f.hover(MORE, 160, EASE);
+                                let at = (r.x + r.w - 11.0 - 7.0, chip.1);
+                                c.circle(at.0, at.1, 12.0, Rgba::css(11, 18, 32, 0.12).mix(Rgba::white(0.12), 1.0 - fg_t).fade(h));
+                                c.icon(CHEVRON_RIGHT, at, 14.0, 2.4, fg, 0.0);
+                            }
+                            let text_w = (INNER - 2.0 * GAP) / 3.0 - 22.0;
+                            let (lf, sf) = (Font::new(13.0, 600), Font::new(12.0, 400));
+                            let name = fit(c, label(i), lf, text_w);
+                            c.text(&name, Rect::new(r.x + 11.0, r.y + r.h - 10.0 - 31.0, text_w, 15.6), lf, fg, Align::Start);
+                            let status = fit(c, &tile.status, sf, text_w);
+                            c.text(&status, Rect::new(r.x + 11.0, r.y + r.h - 10.0 - 14.4, text_w, 14.4), sf, fg.fade(0.82), Align::Start);
+                        });
+                    });
                 }
-                let text_w = r.w - 22.0;
-                let (lf, sf) = (Font::new(13.0, 600), Font::new(12.0, 400));
-                let name = fit(c, label(i), lf, text_w);
-                c.text(&name, Rect::new(r.x + 11.0, r.y + TILE_H - 10.0 - 31.0, text_w, 15.6), lf, fg, Align::Start);
-                let status = fit(c, &tile.status, sf, text_w);
-                c.text(&status, Rect::new(r.x + 11.0, r.y + TILE_H - 10.0 - 14.4, text_w, 14.4), sf, fg.fade(0.82), Align::Start);
             });
         }
 
         // the sound card
         c.fill(g.sound, 16.0, Rgba::white(0.07));
-        c.text(t!("Звук", "Sound", ja: "サウンド", pt: "Som", zh: "声音"), Rect::new(g.sound.x + 12.0, g.sound.y + 10.0, 120.0, 26.0), Font::new(13.0, 600), INK, Align::Start);
+        let list = self.lines();
+        self.draw_list(c, f, &g, &list, accent);
+        let title_y = g.device.cy() - 13.0;
+        c.text(t!("Звук", "Sound", ja: "サウンド", pt: "Som", zh: "声音"), Rect::new(g.sound.x + 12.0, title_y, 120.0, 26.0), Font::new(13.0, 600), INK, Align::Start);
+        // the button: the icon of the output in use, its name, a chevron that turns over when the list is shown
+        let open_t = f.tween(DEVICE, 1, f32::from(self.slide.open), 250, EASE);
         let hot = f.hover(DEVICE, 250, EASE);
-        c.fill(g.device, 8.0, Rgba::white(0.1 * hot));
-        let name = t!("Динамики", "Speakers", ja: "スピーカー", pt: "Alto-falantes", zh: "扬声器");
-        let tw = c.measure(name, Font::new(12.0, 400)).ceil();
-        self.device_w = 8.0 + tw + 6.0 + 11.0 + 8.0;
-        c.text(name, Rect::new(g.device.x + 8.0, g.device.y, tw + 2.0, 26.0), Font::new(12.0, 400), DIM, Align::Start);
-        c.icon(CHEVRON_DOWN, (g.device.x + g.device.w - 8.0 - 5.5, g.device.cy()), 11.0, 2.6, DIM, 0.0);
+        c.fill(g.device, 8.0, Rgba::white((0.1 * hot).max(0.1 * open_t)));
+        let (icon, name) = self.current_output().map_or((Kind::Speakers.icon(), "\u{2014}"), |d| (d.kind.icon(), d.name.as_str()));
+        let font = Font::new(12.0, 500);
+        let name = fit(c, name, font, g.device.w - 8.0 - 14.0 - 7.0 - 7.0 - 11.0 - 8.0);
+        c.icon(icon, (g.device.x + 8.0 + 7.0, g.device.cy()), 14.0, 2.0, accent, 0.0);
+        c.text(&name, Rect::new(g.device.x + 8.0 + 14.0 + 7.0, g.device.y, g.device.w, g.device.h), font, INK, Align::Start);
+        let turn = f.tween(DEVICE, 3, f32::from(self.slide.open), 250, SPRING);
+        c.icon(CHEVRON_DOWN, (g.device.x + g.device.w - 8.0 - 5.5, g.device.cy()), 11.0, 2.6, DIM, 180.0 * (1.0 - turn));
 
         let (vol, muted) = self.st.vol.unwrap_or((0, false));
         let mute_t = f.tween(MUTE, 1, f32::from(muted), 300, EASE);
@@ -565,6 +822,59 @@ impl QuickPanel {
         let hot = f.hover(GEAR, 250, EASE);
         c.circle(g.gear.cx(), g.gear.cy(), 20.0, Rgba::white(0.07 + 0.03 * hot));
         c.icon(icons::GEAR, (g.gear.cx(), g.gear.cy()), 17.0, 2.0, INK, 0.0);
+    }
+
+    /// The list of devices in the sound card (`.audw`): its box opens like a drawer, the lines fade in and sink into place.
+    fn draw_list(&self, c: &mut Canvas<'_>, f: &mut Frame<'_>, g: &Geo, list: &Lines, accent: Rgba) {
+        let fade = self.slide.fade.value(self.now);
+        if g.wrap.h < 0.5 || fade < 0.01 {
+            return;
+        }
+        let (items, shift) = (self.slide.items.value(self.now), self.slide.shift.value(self.now));
+        // `.audl`: 6 px wider on each side and 4 px higher than its box, which clips it
+        let (ax, ay, aw) = (g.wrap.x - 6.0, g.wrap.y - 4.0, g.wrap.w + 12.0);
+        let (out, inp) = (&self.st.audio.outputs, &self.st.audio.inputs);
+        c.faded(fade, |c| {
+            c.clipped(g.wrap, |c| {
+                for &(line, y, h) in &list.lines {
+                    let r = Rect::new(ax, ay + y, aw, h);
+                    if let Line::Title(is_out) = line {
+                        let word = if is_out { t!("Вывод", "Output", ja: "出力", pt: "Saída", zh: "输出") } else { t!("Ввод", "Input", ja: "入力", pt: "Entrada", zh: "输入") };
+                        c.text(word, Rect::new(r.x + 8.0, r.y + 6.0, r.w - 16.0, 14.0), Font::new(11.5, 500), DIM2, Align::Start);
+                        continue;
+                    }
+                    let id = line.id();
+                    c.faded(items, |c| {
+                        c.transformed(0.0, 0.0, 1.0, 0.0, -6.0 * (1.0 - shift), |c| {
+                            let hot = f.hover(id, 140, EASE);
+                            match line {
+                                Line::Device(is_out, n) => {
+                                    let Some(d) = (if is_out { out } else { inp }).get(n) else { return };
+                                    c.fill(r, 10.0, Rgba::white(0.07 * hot));
+                                    let on = f.tween(id, 1, f32::from(d.current), 250, EASE);
+                                    let plate = Rect::new(r.x + 6.0, r.y + 6.0, 28.0, 28.0);
+                                    c.fill(plate, 8.0, Rgba::white(0.08).mix(accent, on));
+                                    c.icon(d.kind.icon(), (plate.cx(), plate.cy()), 15.0, 2.0, DIM.mix(ON_ACCENT, on), 0.0);
+                                    let w = r.w - 6.0 - 28.0 - 10.0 - 10.0 - 14.0 - 6.0;
+                                    let (nf, sf) = (Font::new(13.0, 500), Font::new(11.5, 400));
+                                    c.text_fit(&d.name, Rect::new(r.x + 44.0, r.y + 4.0, w, 16.0), nf, INK, Align::Start);
+                                    c.text_fit(&d.sub, Rect::new(r.x + 44.0, r.y + 21.0, w, 14.0), sf, DIM2, Align::Start);
+                                    if d.current {
+                                        c.icon(CHECK, (r.x + r.w - 6.0 - 7.0, r.cy()), 14.0, 2.8, accent, 0.0);
+                                    }
+                                }
+                                _ => {
+                                    c.fill(r, 8.0, Rgba::white(0.07 * hot));
+                                    c.text(t!("Параметры звука", "Sound settings", ja: "サウンド設定", pt: "Configurações de som", zh: "声音设置"), Rect::new(r.x + 8.0, r.y, r.w - 30.0, r.h), Font::new(12.0, 400), DIM, Align::Start);
+                                    c.icon(CHEVRON_RIGHT, (r.x + r.w - 8.0 - 6.0, r.cy()), 12.0, 2.4, DIM, 0.0);
+                                }
+                            }
+                        });
+                    });
+                }
+                c.fill(Rect::new(ax, ay + list.height - 1.0, aw, 1.0), 0.0, Rgba::white(0.07));
+            });
+        });
     }
 
     // ---- the second page ----
@@ -768,15 +1078,37 @@ impl Content for QuickPanel {
         (W, self.geo().height)
     }
 
+    /// The box with the list shown and the strip in its row, the largest the first page takes: the glass under it is grabbed
+    /// when the panel opens.
+    fn max_size(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
+        let lines = self.lines();
+        Some((W, geo(Sheet::OPEN, self.bright, self.device_w, lines.shown()).height.max(self.geo().height)))
+    }
+
+    /// The panel takes the height the strip and the list have got to: the list opens and closes here, at the time of the frame.
+    fn resized(&mut self, g: &mut Gfx, now: u64) -> Option<(f32, f32)> {
+        self.now = now;
+        if std::mem::take(&mut self.toggle) && self.page == Page::Main {
+            self.slide.set(!self.slide.open, now, false);
+        }
+        // the Sound card's button is as wide as the name of the output on it
+        let name = self.current_output().map_or("\u{2014}", |d| d.name.as_str());
+        let w = 8.0 + 14.0 + 7.0 + g.measure(name, Font::new(12.0, 500)).ceil() + 7.0 + 11.0 + 8.0;
+        self.device_w = w.min(220.0);
+        let new = (W, self.geo().height);
+        (new != std::mem::replace(&mut self.size, new)).then_some(new)
+    }
+
     fn pulse(&self) -> u32 {
         1000
     }
 
-    fn animating(&self, _now: u64) -> bool {
-        self.pass.is_some() || self.flip.is_some() || self.wifi.joining.is_some()
+    fn animating(&self, now: u64) -> bool {
+        self.pass.is_some() || self.flip.is_some() || self.wifi.joining.is_some() || self.toggle || self.slide.running(now)
     }
 
     fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
+        self.now = f.now;
         self.host.tick(self.page == Page::Wifi);
         self.st = self.host.state();
         self.wifi = self.host.wifi();
@@ -807,7 +1139,16 @@ impl Content for QuickPanel {
             Page::Main => {
                 let g = self.geo();
                 if let Some(i) = g.tiles.iter().position(|r| r.contains(x, y)) {
-                    return Some(if i == 0 && Rect::new(g.tiles[0].x + g.tiles[0].w - 11.0 - 14.0 - 10.0, g.tiles[0].y + 10.0, 34.0, 32.0).contains(x, y) { MORE } else { i as i32 });
+                    // the chevron of the Wi-Fi tile is only there while the tile is a tile
+                    let more = Rect::new(g.tiles[0].x + g.tiles[0].w - 11.0 - 14.0 - 10.0, g.tiles[0].y + 10.0, 34.0, 32.0);
+                    return Some(if i == 0 && self.sheet().tiles[0] < 0.5 && more.contains(x, y) { MORE } else { i as i32 });
+                }
+                // the devices (a line that is not yet, or no longer, in the box of the list is not there to be pointed at)
+                if g.wrap.contains(x, y) {
+                    let (ax, ay, aw) = (g.wrap.x - 6.0, g.wrap.y - 4.0, g.wrap.w + 12.0);
+                    if let Some(&(l, ..)) = self.lines().lines.iter().find(|&&(l, ly, h)| l.id() >= 0 && Rect::new(ax, ay + ly, aw, h).contains(x, y)) {
+                        return Some(l.id());
+                    }
                 }
                 let slider = |r: Rect| Rect::new(r.x - 8.0, r.y - 6.0, r.w + 16.0, r.h + 12.0);
                 let list = [
@@ -880,7 +1221,15 @@ impl Content for QuickPanel {
             0..=8 => self.host.tile(id as usize, cx),
             MORE => self.go(Page::Wifi),
             MUTE => self.host.mute(),
-            DEVICE => self.host.settings("ms-settings:sound", cx),
+            DEVICE => self.toggle = true,
+            SOUND_MORE => self.host.settings("ms-settings:sound", cx),
+            d if (DEV..SOUND_MORE).contains(&d) => {
+                let (input, n) = if d >= DEV + 40 { (true, (d - DEV - 40) as usize) } else { (false, (d - DEV) as usize) };
+                let audio = Rc::clone(&self.st.audio);
+                if let Some(dev) = (if input { &audio.inputs } else { &audio.outputs }).get(n) {
+                    self.host.audio_set(input, &dev.id);
+                }
+            }
             GEAR => self.host.settings("ms-settings:", cx),
             m if (MEDIA..MEDIA + 3).contains(&m) => {
                 if self.st.media.is_some() {
@@ -965,9 +1314,18 @@ impl Content for QuickPanel {
         }
     }
 
+    /// The tiles in their row have no labels: the tooltip says which is which (`title` in the mockup).
+    fn tip(&self, id: i32) -> Option<(String, Rect)> {
+        let i = usize::try_from(id).ok().filter(|&i| i < 9 && self.page == Page::Main && self.sheet().tiles[i] > 0.9)?;
+        Some((label(i).to_string(), self.geo().tiles[i]))
+    }
+
     fn nav(&self, from: Option<i32>, dir: Dir) -> Option<i32> {
         let order: Vec<i32> = match self.page {
-            Page::Main => (0..9).chain([MORE, DEVICE, MUTE, VOL]).chain(self.bright.then_some(BRIGHT)).chain([MEDIA, MEDIA + 1, MEDIA + 2, GEAR]).collect(),
+            Page::Main => {
+                let devices = self.lines().lines.into_iter().map(|(l, ..)| l.id()).filter(|&id| id >= 0 && self.slide.open);
+                (0..9).chain([MORE, DEVICE]).chain(devices).chain([MUTE, VOL]).chain(self.bright.then_some(BRIGHT)).chain([MEDIA, MEDIA + 1, MEDIA + 2, GEAR]).collect()
+            }
             Page::Wifi => {
                 let (card, _, rows) = self.layout();
                 let mut v = vec![BACK, SWITCH];
@@ -995,16 +1353,62 @@ impl Content for QuickPanel {
 mod tests {
     use super::*;
 
+    fn audio() -> Audio {
+        let d = |name: &str, current: bool| Device { id: name.into(), name: name.into(), sub: String::new(), kind: Kind::Speakers, current };
+        Audio { outputs: vec![d("Speakers", true), d("WH-1000XM5", false), d("DELL U2723QE", false)], inputs: vec![d("Microphone Array", true), d("WH-1000XM5", false)] }
+    }
+
     #[test]
     fn the_first_page_is_the_mockups() {
-        let g = geo(false, 90.0);
+        let g = geo(Sheet::CLOSED, false, 90.0, Lines::of(&audio()).shown());
         assert_eq!(g.height, 508.0); // 12 + 3 tiles of 86 and 2 gaps + 8 + sound 88 + 8 + player 58 + 8 + footer 40 + 12
         assert_eq!((g.tiles[0].x, g.tiles[0].y, g.tiles[0].h), (12.0, 12.0, 86.0));
         assert!((g.tiles[1].x - (12.0 + 113.333_33 + 8.0)).abs() < 1e-3);
         assert_eq!((g.mute.x, g.mute.y, g.mute.w, g.vol.x, g.vol.y, g.vol.w, g.vol.h), (20.0, 338.0, 32.0, 62.0, 340.0, 244.0, 28.0));
         assert_eq!(g.vol_num.x + g.vol_num.w, 356.0);
         assert_eq!(g.gear.x + g.gear.w, 368.0);
-        assert_eq!(geo(true, 90.0).height, 548.0); // a laptop's brightness row: 32 and a gap more
+        assert_eq!(geo(Sheet::CLOSED, true, 90.0, 0.0).height, 548.0); // a laptop's brightness row: 32 and a gap more
+    }
+
+    #[test]
+    fn the_list_of_devices_makes_the_panel_as_tall_as_the_mockups() {
+        // the strip is 36 high, the card holds a list of 299 (3 outputs, 2 inputs) and its 8 of gap, the rest is as before
+        let lines = Lines::of(&audio());
+        assert_eq!((lines.height, lines.shown()), (303.0, 299.0));
+        let g = geo(Sheet::OPEN, false, 90.0, lines.shown());
+        assert_eq!(g.height, 577.0);
+        assert_eq!((g.tiles[8].x, g.tiles[8].y, g.tiles[8].w, g.tiles[8].h), (332.0, 12.0, 36.0, 36.0));
+        assert_eq!((g.wrap.y, g.wrap.h), (66.0, 299.0));
+        assert_eq!(g.device.y, 56.0 + 10.0 + 299.0 + 8.0 - 1.0);
+    }
+
+    #[test]
+    fn the_lines_of_the_list_stand_as_the_mockups_do() {
+        let l = Lines::of(&audio());
+        let at = |line| l.lines.iter().find(|x| x.0 == line).map(|x| (x.1, x.2));
+        assert_eq!(at(Line::Title(true)), Some((0.0, 24.0)));
+        assert_eq!(at(Line::Device(true, 0)), Some((26.0, 40.0)));
+        assert_eq!(at(Line::Title(false)), Some((152.0, 24.0)));
+        assert_eq!(at(Line::More), Some((264.0, 32.0)));
+        // no input device: its title is not there either
+        let only_out = Lines::of(&Audio { outputs: audio().outputs, inputs: Vec::new() });
+        assert!(only_out.lines.iter().all(|x| x.0 != Line::Title(false)));
+    }
+
+    #[test]
+    fn the_strip_goes_to_its_row_tile_by_tile_and_back() {
+        let mut slide = Slide::new();
+        assert_eq!(slide.sheet(0).grid, 0.0);
+        slide.set(true, 1000, false);
+        assert!(slide.running(1100));
+        // each tile starts 16 ms after the one before it, and all have arrived 500 ms after the last
+        let mid = slide.sheet(1100);
+        assert!(mid.tiles[0] > mid.tiles[8] && mid.grid > 0.0 && mid.grid < 1.0);
+        let end = slide.sheet(1000 + 16 * 8 + 500);
+        assert_eq!((end.grid, end.list, end.tiles), (1.0, 1.0, [1.0; 9]));
+        assert!(!slide.running(3000));
+        slide.set(false, 3000, true); // snapped, as the Wi-Fi page does
+        assert_eq!(slide.sheet(3000).grid, 0.0);
     }
 
     #[test]

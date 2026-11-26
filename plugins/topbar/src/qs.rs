@@ -2,6 +2,7 @@
 //! tiles say and do, the volume and the brightness, the player, and the Wi-Fi networks (the WLAN API: scan, join with a
 //! password, connect, disconnect, forget). The panel itself is `ui::quick_popup`; the calendar's opening is here too.
 use super::*;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
 use ui::quick_popup as qp;
 
@@ -293,11 +294,15 @@ unsafe fn wifi_radio_wlan(on: bool) {
 /// The machine's data and actions for the quick settings panel.
 pub(crate) struct Live {
     last: u64,
+    /// The sound devices, read again every few seconds the panel is open (a read takes some milliseconds) and at once after
+    /// one is chosen; and when it was read.
+    audio: Rc<qp::Audio>,
+    audio_at: u64,
 }
 
 impl Live {
     unsafe fn new() -> Self {
-        Self { last: now_ms() }
+        Self { last: now_ms(), audio: Rc::new(crate::audio::read()), audio_at: now_ms() }
     }
 }
 
@@ -319,6 +324,10 @@ impl qp::Host for Live {
                 read_nets();
             } else {
                 crate::quick::refresh();
+                if now.saturating_sub(self.audio_at) >= 3000 {
+                    self.audio = Rc::new(crate::audio::read());
+                    self.audio_at = now;
+                }
             }
         }
     }
@@ -357,6 +366,7 @@ impl qp::Host for Live {
             bright: (b >= 0).then_some(b),
             media: crate::quick::MEDIA.lock().unwrap().clone().map(|m| qp::Media { title: m.title, artist: m.artist, playing: m.playing }),
             battery: (pct >= 0).then_some((pct, ac)),
+            audio: Rc::clone(&self.audio),
         }
     }
 
@@ -404,6 +414,20 @@ impl qp::Host for Live {
     fn mute(&mut self) {
         // SAFETY: as above.
         unsafe { toggle_mute() }
+    }
+
+    fn audio_set(&mut self, input: bool, id: &str) {
+        // SAFETY: the system's policy call on the bar's thread; the master volume is looked up again for the new default.
+        unsafe {
+            if crate::audio::set_default(id, input) {
+                if !input {
+                    EP.set(None);
+                    read_volume();
+                }
+                self.audio = Rc::new(crate::audio::read());
+                self.audio_at = now_ms();
+            }
+        }
     }
 
     fn brightness(&mut self, percent: i32, done: bool) {
