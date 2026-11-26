@@ -29,8 +29,7 @@ pub(crate) unsafe fn style_menu() {
 
 /// One page of the gear's menu, opened at the gear.
 pub(crate) unsafe fn gear_page(glyph: &'static str, title: &str, sub: &str, items: Vec<fly::MItem>, pick: impl FnOnce(usize) + 'static) {
-    let bar = BAR.load(Relaxed) as HWND;
-    fly::menu(tip_cx(&bar_layout(bar), GEAR), Some((null_mut(), glyph, title.to_string(), sub.to_string())), items, pick);
+    fly::menu(tip_cx(GEAR), Some((null_mut(), glyph, title.to_string(), sub.to_string())), items, pick);
 }
 
 pub(crate) fn back() -> fly::MItem {
@@ -40,26 +39,15 @@ pub(crate) fn back() -> fly::MItem {
 pub(crate) fn style_name(s: i18n::style::Style) -> &'static str {
     use i18n::style::Style::*;
     match s {
-        Normal => t!("Обычный", "Normal", ja: "通常", pt: "Normal", zh: "正常"),
-        Terminal => t!("Терминал", "Terminal", ja: "ターミナル", pt: "Terminal", zh: "终端"),
-        Dock => t!("Плавающий док", "Floating dock", ja: "フローティング ドック", pt: "Dock flutuante", zh: "悬浮停靠"),
-        Tiling => t!("Тайлинг", "Tiling", ja: "タイル表示", pt: "Lado a lado", zh: "平铺"),
-        Road => t!("Белая дорога", "White road", ja: "白い道", pt: "Estrada branca", zh: "白色道路"),
-        Ruby => t!("Рубин", "Ruby", ja: "ルビー", pt: "Rubi", zh: "红宝石"),
-        Win98 => "Windows 98",
-        Win7 => "Windows 7",
+        Classic => t!("Классика", "Classic", ja: "クラシック", pt: "Clássico", zh: "经典"),
+        Floating => t!("Парящая", "Floating", ja: "フローティング", pt: "Flutuante", zh: "悬浮"),
+        Dock => t!("Док", "Dock", ja: "ドック", pt: "Dock", zh: "停靠"),
     }
 }
 
-/// Repaints the bar in the new look; `moved` = its place or size may have changed too.
-pub(crate) unsafe fn relook(moved: bool) {
-    let bar = BAR.load(Relaxed) as HWND;
-    place(bar);
-    if moved {
-        bar_anim(bar);
-    }
-    apply_opacity(bar);
-    InvalidateRect(bar, null(), 0);
+/// Puts the bar in the new look: its place and size may have changed (the renderer glides to them), the colours too.
+pub(crate) unsafe fn relook() {
+    place(BAR.load(Relaxed) as HWND);
 }
 
 /// The language of every WinRust program (written to lang.txt; the others pick it up when they start).
@@ -81,13 +69,13 @@ pub(crate) unsafe fn language_page() {
 pub(crate) unsafe fn theme_page() {
     let mut items = vec![back()];
     for (k, &s) in i18n::style::ALL.iter().enumerate() {
-        let it = fly::MItem::new(style_name(s)).swatch(i18n::style::PALS[k].accent).on(s == style()).beta(s.beta());
+        let it = fly::MItem::new(style_name(s)).swatch(i18n::style::pal().accent).on(s == style());
         items.push(if k == 0 { it.sep() } else { it });
     }
     gear_page("\u{E790}", t!("Тема", "Theme", ja: "テーマ", pt: "Tema", zh: "主题"), t!("Готовый вид панели и окон", "A ready-made look for the bar and windows", ja: "バーとウィンドウのできあいの外観", pt: "Uma aparência pronta para a barra e as janelas", zh: "任务栏和窗口的现成外观"), items, |i| {
         let Some(&s) = i.checked_sub(1).and_then(|k| i18n::style::ALL.get(k)) else { return style_menu() };
         i18n::style::set_style(s);
-        relook(false);
+        relook();
         theme_page();
     });
 }
@@ -121,14 +109,9 @@ pub(crate) unsafe fn bar_page() {
             13 => crate::set_stick(!crate::stick()),
             _ => return style_menu(),
         }
-        relook(i != 12 && i != 13);
+        relook();
         bar_page();
     });
-}
-
-/// Bar transparency from the colours page (the window is layered; 100 % = opaque).
-pub(crate) unsafe fn apply_opacity(hwnd: HWND) {
-    SetLayeredWindowAttributes(hwnd, 0, (255 * i18n::style::bar_opacity() as u32 / 100) as u8, LWA_ALPHA);
 }
 
 /// The user's own look: every colour of the bar and the WinRust windows, and the bar's transparency. Each colour opens
@@ -175,7 +158,6 @@ pub(crate) unsafe fn colors_page() {
         } else {
             i18n::style::reset_custom();
         }
-        apply_opacity(bar);
         InvalidateRect(bar, null(), 0);
         colors_page();
     });
@@ -183,7 +165,7 @@ pub(crate) unsafe fn colors_page() {
 
 /// Saved looks (theme + colours + opacity): apply one, save what is on screen, delete.
 pub(crate) unsafe fn templates_page() {
-    use i18n::style::{ALL, PALS, Theme};
+    use i18n::style::Theme;
     let list = i18n::style::themes();
     let now = Theme::current("");
     let mut items = vec![back(), fly::MItem::head(t!("Мои шаблоны", "My templates", ja: "マイ テンプレート", pt: "Meus modelos", zh: "我的模板")).sep()];
@@ -192,7 +174,7 @@ pub(crate) unsafe fn templates_page() {
     }
     let first = items.len(); // index of the first template row
     for th in &list {
-        let accent = if th.colors[4] != u32::MAX { th.colors[4] } else { PALS[ALL.iter().position(|&s| s == th.style).unwrap_or(0)].accent };
+        let accent = if th.colors[4] != u32::MAX { th.colors[4] } else { th.accent.color() };
         let same = (th.style, th.colors, th.opacity) == (now.style, now.colors, now.opacity);
         items.push(fly::MItem::new(th.name.clone()).hint(style_name(th.style)).swatch(accent).on(same));
     }
@@ -207,7 +189,7 @@ pub(crate) unsafe fn templates_page() {
             return style_menu();
         } else if (first..save).contains(&i) {
             list[i - first].apply();
-            relook(false);
+            relook();
         } else if i == save {
             let name = |n: usize| tf!("Шаблон {}", "Template {}", ja: "テンプレート {}", pt: "Modelo {}", zh: "模板 {}", n);
             let n = (1..).find(|&n| !list.iter().any(|t| t.name == name(n))).unwrap_or(1);
@@ -243,7 +225,7 @@ pub(crate) unsafe fn reset_page() {
     gear_page("\u{E777}", t!("Сбросить всё?", "Reset everything?", ja: "すべてをリセットしますか?", pt: "Restaurar tudo?", zh: "全部重置？"), t!("Тема, цвета, панель. Шаблоны останутся", "Theme, colors, bar. Templates stay", ja: "テーマ、色、バー。テンプレートは残ります", pt: "Tema, cores, barra. Os modelos permanecem", zh: "主题、颜色、任务栏。模板保留"), items, |i| {
         if i == 0 {
             i18n::style::reset_all();
-            relook(true);
+            relook();
         }
         style_menu();
     });

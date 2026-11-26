@@ -6,53 +6,155 @@ use std::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, PostMessageW, RegisterWindowMessageW};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The shape of the bar. Every style shares one palette (`BASE` plus the accent); they differ only in geometry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Style {
-    Normal,
-    Terminal, // monospace, green on black, square corners
-    Dock,     // the bar is a floating pill in the middle
-    Tiling,   // a thin status strip at the top, windows side by side
-    Road,     // "White road": light ivory, faint triangles in the background
-    Ruby,     // deep ruby, a smooth glossy gradient
-    Win98,    // BETA: classic grey, navy accent, square corners, Tahoma
-    Win7,     // BETA: Aero-like glass blue
+    /// Edge to edge along the screen side, square.
+    #[default]
+    Classic,
+    /// Inset 8 px from the screen edges, rounded, with a shadow.
+    Floating,
+    /// A centred pill as wide as its buttons.
+    Dock,
 }
 
-pub const ALL: [Style; 8] = [Style::Normal, Style::Terminal, Style::Dock, Style::Tiling, Style::Road, Style::Ruby, Style::Win98, Style::Win7];
+pub const ALL: [Style; 3] = [Style::Classic, Style::Floating, Style::Dock];
 
 impl Style {
     pub fn name(self) -> &'static str {
         match self {
-            Style::Normal => "normal",
-            Style::Terminal => "terminal",
+            Style::Classic => "classic",
+            Style::Floating => "floating",
             Style::Dock => "dock",
-            Style::Tiling => "tiling",
-            Style::Road => "road",
-            Style::Ruby => "ruby",
-            Style::Win98 => "win98",
-            Style::Win7 => "win7",
         }
     }
-    /// Unknown or empty text (no file yet, a hand edit) is the normal style.
+    /// Unknown or empty text (no file yet, a hand edit, a style of an older version) is the classic style.
     pub fn parse(s: &str) -> Style {
-        ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or(Style::Normal)
+        ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or_default()
     }
-    /// Square corners everywhere.
-    // only the terminal keeps the monospace, square look; tiling uses the same sans and rounded shapes as the rest
-    pub fn square(self) -> bool {
-        matches!(self, Style::Terminal | Style::Win98)
+}
+
+/// The accent colour (%ProgramData%\WinRust\accent.txt). A hand-picked accent in colors.txt wins over it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Accent {
+    #[default]
+    Blue,
+    Teal,
+    Lilac,
+    Amber,
+    Rose,
+}
+
+impl Accent {
+    pub const ALL: [Accent; 5] = [Accent::Blue, Accent::Teal, Accent::Lilac, Accent::Amber, Accent::Rose];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Accent::Blue => "blue",
+            Accent::Teal => "teal",
+            Accent::Lilac => "lilac",
+            Accent::Amber => "amber",
+            Accent::Rose => "rose",
+        }
     }
-    /// Still unfinished: the menu marks it with a red BETA.
-    pub fn beta(self) -> bool {
-        matches!(self, Style::Win98 | Style::Win7)
+    /// Unknown or empty text is blue.
+    pub fn parse(s: &str) -> Accent {
+        Accent::ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or_default()
     }
-    pub fn mono(self) -> bool {
-        self == Style::Terminal
+    pub const fn color(self) -> u32 {
+        match self {
+            Accent::Blue => rgb(0x62, 0xa0, 0xea),
+            Accent::Teal => rgb(0x5b, 0xc8, 0xaf),
+            Accent::Lilac => rgb(0xc0, 0xa5, 0xf5),
+            Accent::Amber => rgb(0xff, 0xa3, 0x48),
+            Accent::Rose => rgb(0xf0, 0x8a, 0xa6),
+        }
     }
-    /// Dark text on a light background.
-    pub fn light(self) -> bool {
-        matches!(self, Style::Road | Style::Win98)
+}
+
+/// How much the UI moves (%ProgramData%\WinRust\anim.txt): full, short (80 ms, no delays) or none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Anim {
+    #[default]
+    Full,
+    Reduced,
+    Off,
+}
+
+impl Anim {
+    pub const ALL: [Anim; 3] = [Anim::Full, Anim::Reduced, Anim::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Anim::Full => "full",
+            Anim::Reduced => "reduced",
+            Anim::Off => "off",
+        }
     }
+    /// Unknown or empty text is full.
+    pub fn parse(s: &str) -> Anim {
+        Anim::ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or_default()
+    }
+}
+
+/// One word in %ProgramData%\WinRust\<file>, cached as an index and read again at most once a second (like the style).
+struct Choice {
+    file: &'static str,
+    cur: AtomicU8, // MAX = not read yet
+    at: AtomicU64, // when the file was last read, ms since the epoch
+}
+
+impl Choice {
+    const fn new(file: &'static str) -> Choice {
+        Choice { file, cur: AtomicU8::new(u8::MAX), at: AtomicU64::new(0) }
+    }
+    fn path(&self) -> Option<PathBuf> {
+        std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join(self.file))
+    }
+    /// The index `parse` makes of the file's text.
+    fn get(&self, parse: impl Fn(&str) -> usize) -> usize {
+        if self.cur.load(Relaxed) == u8::MAX || now_ms().saturating_sub(self.at.load(Relaxed)) > 1000 {
+            let text = self.path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+            self.cur.store(parse(&text) as u8, Relaxed);
+            self.at.store(now_ms(), Relaxed);
+        }
+        self.cur.load(Relaxed) as usize
+    }
+    /// Switches this process, writes the choice and tells the other WinRust windows to repaint.
+    fn set(&self, index: usize, name: &str) {
+        self.cur.store(index as u8, Relaxed);
+        self.at.store(now_ms(), Relaxed);
+        if let Some(f) = self.path() {
+            let _ = std::fs::create_dir_all(f.parent().unwrap());
+            let _ = std::fs::write(f, name);
+        }
+        unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+    }
+    /// The next `get` reads the file.
+    fn forget(&self) {
+        self.cur.store(u8::MAX, Relaxed);
+    }
+}
+
+static ACCENT: Choice = Choice::new("accent.txt");
+static ANIM: Choice = Choice::new("anim.txt");
+
+pub fn accent() -> Accent {
+    Accent::ALL[ACCENT.get(|s| Accent::parse(s) as usize)]
+}
+
+/// Also drops a hand-picked accent colour, so the choice shows.
+pub fn set_accent(a: Accent) {
+    set_custom_color(4, None);
+    ACCENT.set(a as usize, a.name());
+}
+
+pub fn anim() -> Anim {
+    Anim::ALL[ANIM.get(|s| Anim::parse(s) as usize)]
+}
+
+pub fn set_anim(a: Anim) {
+    ANIM.set(a as usize, a.name());
 }
 
 static CUR: AtomicU8 = AtomicU8::new(u8::MAX); // index into ALL; MAX = not read yet
@@ -76,6 +178,8 @@ pub fn reload() {
     // WINRUST_STYLE overrides the file for this process only (to look at a style without switching every window)
     let name = std::env::var("WINRUST_STYLE").ok().or_else(|| file().and_then(|f| std::fs::read_to_string(f).ok()));
     store(Style::parse(&name.unwrap_or_default()));
+    ACCENT.forget();
+    ANIM.forget();
 }
 
 /// The current style. The file is read again at most once a second, so a program that missed the broadcast still follows.
@@ -239,25 +343,27 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
-/// In the order of `ALL`. Neutral, low-contrast surfaces and one restrained accent (the look of macOS / modern fintech apps).
-pub const PALS: [Pal; 8] = [
-    // normal: graphite with the Apple system blue
-    Pal { bg: rgb(22, 22, 24), line: rgb(46, 46, 50), hover: rgb(36, 36, 40), active: rgb(44, 44, 49), accent: rgb(10, 132, 255), text: rgb(245, 245, 247), dim: rgb(142, 142, 147) },
-    // terminal: green on black
-    Pal { bg: rgb(8, 11, 9), line: rgb(30, 48, 35), hover: rgb(16, 28, 20), active: rgb(22, 38, 27), accent: rgb(74, 222, 128), text: rgb(204, 232, 212), dim: rgb(98, 132, 108) },
-    // dock: midnight ink with indigo
-    Pal { bg: rgb(17, 18, 25), line: rgb(40, 42, 56), hover: rgb(29, 31, 42), active: rgb(37, 40, 54), accent: rgb(124, 134, 255), text: rgb(240, 241, 246), dim: rgb(138, 142, 160) },
-    // tiling: dark with amber
-    Pal { bg: rgb(16, 17, 20), line: rgb(38, 40, 46), hover: rgb(27, 29, 34), active: rgb(35, 37, 43), accent: rgb(245, 182, 82), text: rgb(224, 226, 231), dim: rgb(120, 125, 138) },
-    // white road: warm ivory with gold
-    Pal { bg: rgb(247, 245, 240), line: rgb(226, 220, 207), hover: rgb(238, 233, 222), active: rgb(232, 225, 210), accent: rgb(176, 134, 52), text: rgb(28, 26, 22), dim: rgb(124, 117, 104) },
-    // ruby: deep garnet surfaces, a bright ruby accent, warm rose-white text
-    Pal { bg: rgb(26, 7, 13), line: rgb(72, 22, 36), hover: rgb(46, 13, 24), active: rgb(60, 17, 31), accent: rgb(232, 52, 84), text: rgb(252, 238, 241), dim: rgb(178, 126, 139) },
-    // win98: button-face grey, navy title colour
-    Pal { bg: rgb(192, 192, 192), line: rgb(128, 128, 128), hover: rgb(212, 208, 200), active: rgb(160, 160, 160), accent: rgb(0, 0, 128), text: rgb(0, 0, 0), dim: rgb(64, 64, 64) },
-    // win7: Aero glass blue
-    Pal { bg: rgb(31, 58, 96), line: rgb(72, 108, 154), hover: rgb(58, 92, 138), active: rgb(74, 112, 160), accent: rgb(120, 190, 255), text: rgb(255, 255, 255), dim: rgb(176, 198, 226) },
-];
+/// The Obsidian palette every style shares: near-black ink, cool white text, a soft blue accent.
+pub const BASE: Pal = Pal {
+    bg: rgb(0x14, 0x15, 0x1b),
+    line: rgb(0x2a, 0x2b, 0x33),
+    hover: rgb(0x26, 0x27, 0x2f),
+    active: rgb(0x2f, 0x30, 0x38),
+    accent: Accent::Blue.color(),
+    text: rgb(0xec, 0xee, 0xf4),
+    dim: rgb(0xa3, 0xa9, 0xb8),
+};
+
+/// `BASE` in each accent, in the order of `Accent::ALL`.
+static TINTED: [Pal; 5] = {
+    let mut p = [BASE; 5];
+    let mut i = 0;
+    while i < 5 {
+        p[i].accent = Accent::ALL[i].color();
+        i += 1;
+    }
+    p
+};
 
 /// Status colours shared by every style (Apple's dark-mode system green, yellow, red).
 pub const GOOD: u32 = rgb(48, 209, 88);
@@ -265,9 +371,9 @@ pub const WARN: u32 = rgb(255, 214, 10);
 pub const BAD: u32 = rgb(255, 69, 58);
 
 pub fn pal() -> &'static Pal {
-    let base = &PALS[ALL.iter().position(|&s| s == style()).unwrap_or(0)];
+    let base = &TINTED[accent() as usize];
     let Some(o) = custom_colors() else { return base };
-    // one leaked copy per (style, overrides): a handful at most, and pal() has to hand out a reference
+    // one leaked copy per (accent, overrides): a handful at most, and pal() has to hand out a reference
     static CACHE: std::sync::Mutex<Vec<(usize, [u32; 7], &'static Pal)>> = std::sync::Mutex::new(Vec::new());
     let key = base as *const Pal as usize;
     let mut v = CACHE.lock().unwrap();
@@ -315,11 +421,9 @@ fn read_colors() -> [u32; 7] {
 fn parse_colors(text: &str) -> [u32; 7] {
     let mut o = [u32::MAX; 7];
     for l in text.split(['\n', ';']) {
-        if let Some((k, v)) = l.split_once('=') {
-            if let (Some(i), Ok(v)) = (COLOR_NAMES.iter().position(|n| *n == k.trim()), u32::from_str_radix(v.trim(), 16)) {
-                if v <= 0xFFFFFF { o[i] = rgb((v >> 16) as u8, (v >> 8) as u8, v as u8); }
-            }
-        }
+        if let Some((k, v)) = l.split_once('=')
+            && let (Some(i), Ok(v)) = (COLOR_NAMES.iter().position(|n| *n == k.trim()), u32::from_str_radix(v.trim(), 16))
+            && v <= 0xFFFFFF { o[i] = rgb((v >> 16) as u8, (v >> 8) as u8, v as u8); }
     }
     o
 }
@@ -348,7 +452,7 @@ pub fn set_custom_color(i: usize, c: Option<u32>) {
 /// Back to the style's own colours and opacity.
 pub fn reset_custom() {
     save_colors([u32::MAX; 7]);
-    set_bar_opacity(100);
+    set_bar_opacity(85);
 }
 
 fn save_colors(c: [u32; 7]) {
@@ -366,13 +470,15 @@ fn opacity_file() -> Option<PathBuf> {
     std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("bar-opacity.txt"))
 }
 
-static OPACITY: AtomicU8 = AtomicU8::new(100);
+static OPACITY: AtomicU8 = AtomicU8::new(85);
 static OPACITY_AT: AtomicU64 = AtomicU64::new(0);
 
-/// How opaque the topbar is, percent (30..=100). Re-read once a second.
+fn nearest_opacity(v: u8) -> u8 { [100u8, 85, 70, 55, 40].into_iter().min_by_key(|n| n.abs_diff(v)).unwrap() }
+
+/// How opaque the topbar is, percent. Re-read once a second.
 pub fn bar_opacity() -> u8 {
     if now_ms().saturating_sub(OPACITY_AT.load(Relaxed)) > 1000 {
-        let v = opacity_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).map_or(100, |v| v.clamp(30, 100));
+        let v = opacity_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).map_or(85, nearest_opacity);
         OPACITY.store(v, Relaxed);
         OPACITY_AT.store(now_ms(), Relaxed);
     }
@@ -380,7 +486,7 @@ pub fn bar_opacity() -> u8 {
 }
 
 pub fn set_bar_opacity(v: u8) {
-    let v = v.clamp(30, 100);
+    let v = nearest_opacity(v);
     OPACITY.store(v, Relaxed);
     OPACITY_AT.store(now_ms(), Relaxed);
     if let Some(f) = opacity_file() {
@@ -397,26 +503,28 @@ pub struct Theme {
     pub style: Style,
     pub colors: [u32; 7],
     pub opacity: u8,
+    pub accent: Accent,
 }
 
 impl Theme {
     fn line(&self) -> String {
-        format!("{}\t{}\t{}\t{}", self.name.replace(['\t', '\r', '\n'], " "), self.style.name(), self.opacity, colors_text(&self.colors, ";"))
+        format!("{}\t{}\t{}\t{}\t{}", self.name.replace(['\t', '\r', '\n'], " "), self.style.name(), self.opacity, colors_text(&self.colors, ";"), self.accent.name())
     }
     fn parse(l: &str) -> Option<Theme> {
-        let mut f = l.trim_end_matches('\r').splitn(4, '\t');
+        let mut f = l.trim_end_matches('\r').splitn(5, '\t');
         let name = f.next().filter(|n| !n.trim().is_empty())?.to_string();
         let style = Style::parse(f.next()?);
-        let opacity = f.next()?.trim().parse::<u8>().ok()?.clamp(30, 100);
-        Some(Theme { name, style, colors: parse_colors(f.next().unwrap_or("")), opacity })
+        let opacity = f.next()?.trim().parse::<u8>().ok().map(nearest_opacity)?;
+        Some(Theme { name, style, colors: parse_colors(f.next().unwrap_or("")), opacity, accent: Accent::parse(f.next().unwrap_or("")) })
     }
     /// What is on screen now.
     pub fn current(name: &str) -> Theme {
-        Theme { name: name.into(), style: style(), colors: read_colors(), opacity: bar_opacity() }
+        Theme { name: name.into(), style: style(), colors: read_colors(), opacity: bar_opacity(), accent: accent() }
     }
     /// Switches every WinRust window to this look.
     pub fn apply(&self) {
         set_bar_opacity(self.opacity);
+        set_accent(self.accent);
         save_colors(self.colors);
         set_style(self.style);
     }
@@ -445,17 +553,17 @@ pub fn reset_all() {
     set_autohide(false);
     set_align_left(false);
     set_alttab_per_monitor(false);
-    Theme { name: String::new(), style: Style::Normal, colors: [u32::MAX; 7], opacity: 100 }.apply();
+    Theme { name: String::new(), style: Style::Classic, colors: [u32::MAX; 7], opacity: 85, accent: Accent::Blue }.apply();
 }
 
 /// A raised surface (a card, a tile): pure white on the light style, a step up from the background on the dark ones.
 pub fn card() -> u32 {
-    if style().light() { rgb(255, 255, 255) } else { mix(pal().bg, pal().text, 0.06) }
+    mix(pal().bg, pal().text, 0.06)
 }
 
 /// Text and glyphs drawn on an accent fill.
 pub fn on_accent() -> u32 {
-    if style().light() || style() == Style::Ruby { rgb(255, 255, 255) } else { pal().bg }
+    rgb(11, 18, 32)
 }
 
 /// `a` moved toward `b` by `t` (0..1), per channel.
@@ -465,84 +573,6 @@ pub fn mix(a: u32, b: u32, t: f32) -> u32 {
         (x + (y - x) * t.clamp(0.0, 1.0)).round() as u32
     };
     ch(0) | ch(8) << 8 | ch(16) << 16
-}
-
-/// The White road background over `r`: faceted ivory triangles, a few of them traced in gold.
-/// Does nothing in the other styles. Needs GDI+ started (GdiplusStartup) by the program.
-pub unsafe fn backdrop(dc: windows_sys::Win32::Graphics::Gdi::HDC, r: windows_sys::Win32::Foundation::RECT, scale: f32) {
-    use windows_sys::Win32::Graphics::GdiPlus::*;
-    let ruby = style() == Style::Ruby;
-    if !style().light() && !ruby {
-        return;
-    }
-    let mut g: *mut GpGraphics = std::ptr::null_mut();
-    if unsafe { GdipCreateFromHDC(dc, &mut g) } != 0 || g.is_null() {
-        return;
-    }
-    let argb = |c: u32, a: f32| ((a.clamp(0.0, 1.0) * 255.0) as u32) << 24 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255);
-    if ruby {
-        // smooth: a vertical ruby gradient (lighter on top, near-black garnet below) and a soft gloss over the upper third
-        let (x, y, w, h) = (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1));
-        unsafe {
-            GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-            let mut br: *mut GpLineGradient = std::ptr::null_mut();
-            GdipCreateLineBrushI(&Point { X: x, Y: y }, &Point { X: x, Y: y + h }, argb(mix(pal().bg, rgb(150, 18, 42), 0.62), 1.0), argb(mix(pal().bg, rgb(0, 0, 0), 0.25), 1.0), WrapModeTileFlipXY, &mut br);
-            GdipFillRectangleI(g, br as *mut GpBrush, x, y, w, h);
-            GdipDeleteBrush(br as *mut GpBrush);
-            let gh = (h / 3).max(1);
-            GdipCreateLineBrushI(&Point { X: x, Y: y }, &Point { X: x, Y: y + gh }, argb(rgb(255, 255, 255), 0.09), argb(rgb(255, 255, 255), 0.0), WrapModeTileFlipXY, &mut br);
-            GdipFillRectangleI(g, br as *mut GpBrush, x, y, w, gh);
-            GdipDeleteBrush(br as *mut GpBrush);
-            GdipDeleteGraphics(g);
-        }
-        return;
-    }
-    let (x0, y0, w, h) = (r.left as f32, r.top as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32);
-    let s = 58.0 * scale.max(0.5);
-    let (cols, rows) = ((w / s) as i32 + 2, (h / (s * 0.866)) as i32 + 2);
-    // a lattice of equilateral-ish triangles; each vertex nudged by a hash so the facets look cut by hand
-    let pt = |i: i32, j: i32| {
-        let (hx, hy) = (hash(i, j, 1) - 0.5, hash(i, j, 2) - 0.5);
-        let off = if j & 1 == 1 { s * 0.5 } else { 0.0 };
-        PointF { X: x0 + i as f32 * s - off + hx * s * 0.34, Y: y0 + j as f32 * s * 0.866 + hy * s * 0.3 - s * 0.4 }
-    };
-    let gold = pal().accent;
-    unsafe {
-        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-        let mut br: *mut GpSolidFill = std::ptr::null_mut();
-        GdipCreateSolidFill(0, &mut br);
-        let mut pen: *mut GpPen = std::ptr::null_mut();
-        GdipCreatePen1(0, 1.0, UnitPixel, &mut pen);
-        for j in 0..rows {
-            for i in 0..cols {
-                let (a, b, c, d) = if j & 1 == 0 { (pt(i, j), pt(i + 1, j), pt(i, j + 1), pt(i + 1, j + 1)) } else { (pt(i, j), pt(i + 1, j), pt(i + 1, j + 1), pt(i + 2, j + 1)) };
-                for (k, tri) in [[a, b, c], [b, d, c]].iter().enumerate() {
-                    let v = hash(i, j, 3 + k as u32);
-                    // light from the top left: most facets near white, some a touch warmer or greyer
-                    let shade = if v < 0.5 { mix(pal().bg, rgb(255, 255, 255), 0.25 + v) } else { mix(pal().bg, rgb(226, 214, 190), (v - 0.5) * 0.45) };
-                    GdipSetSolidFillColor(br, argb(shade, 1.0));
-                    GdipFillPolygon(g, br as *mut GpBrush, tri.as_ptr(), 3, FillModeAlternate);
-                    // facet edges: a hairline of white; one triangle in nine traced in gold
-                    let (edge, wd) = if hash(i, j, 7 + k as u32) > 0.84 { (argb(gold, 0.6), 1.0 * scale) } else { (argb(rgb(255, 255, 255), 0.7), 0.6) };
-                    GdipSetPenColor(pen, edge);
-                    GdipSetPenWidth(pen, wd);
-                    GdipDrawPolygon(g, pen, tri.as_ptr(), 3);
-                }
-            }
-        }
-        GdipDeletePen(pen);
-        GdipDeleteBrush(br as *mut GpBrush);
-        GdipDeleteGraphics(g);
-    }
-}
-
-/// 0..1 from a lattice point (stable between paints).
-fn hash(i: i32, j: i32, salt: u32) -> f32 {
-    let mut x = (i as u32).wrapping_mul(0x9E37_79B1) ^ (j as u32).wrapping_mul(0x85EB_CA77) ^ salt.wrapping_mul(0xC2B2_AE3D);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x2C1B_3C6D);
-    x ^= x >> 12;
-    (x & 0xFFFF) as f32 / 65535.0
 }
 
 fn font_file(name: &str) -> bool {
@@ -557,11 +587,7 @@ pub fn sans_face() -> &'static str {
 
 /// The UI font of the current style.
 pub fn ui_face() -> &'static str {
-    match style() {
-        s if s.mono() => "Consolas",
-        Style::Win98 => "Tahoma",
-        _ => sans_face(),
-    }
+    sans_face()
 }
 
 /// The icon font: Segoe Fluent Icons (Windows 11, same code points) or Segoe MDL2 Assets.
@@ -579,16 +605,13 @@ mod tests {
         for s in ALL {
             assert_eq!(Style::parse(s.name()), s);
         }
-        assert_eq!(Style::parse(" Tiling\r\n"), Style::Tiling);
-        assert_eq!(Style::parse(""), Style::Normal);
-        assert_eq!(Style::parse("neon"), Style::Normal);
-        assert_eq!(PALS.len(), ALL.len());
+        assert_eq!(Style::parse(" Tiling\r\n"), Style::Classic);
+        assert_eq!(Style::parse(""), Style::Classic);
+        assert_eq!(Style::parse("neon"), Style::Classic);
     }
 
     #[test]
-    fn hash_is_stable_and_in_range() {
-        assert_eq!(hash(3, 4, 1), hash(3, 4, 1));
-        assert!((0..50).all(|i| (0.0..=1.0).contains(&hash(i, -i, 2))));
+    fn mix_blends() {
         assert_eq!(mix(rgb(0, 0, 0), rgb(200, 100, 50), 0.5), rgb(100, 50, 25));
     }
 
@@ -597,11 +620,11 @@ mod tests {
         let mut c = [u32::MAX; 7];
         c[0] = rgb(1, 2, 3);
         c[4] = rgb(250, 128, 0);
-        let t = Theme { name: "Ночь\tтест".into(), style: Style::Ruby, colors: c, opacity: 70 };
+        let t = Theme { name: "Ночь\tтест".into(), style: Style::Floating, colors: c, opacity: 70, accent: Accent::Rose };
         let back = Theme::parse(&t.line()).unwrap();
         assert_eq!(back.name, "Ночь тест");
-        assert_eq!((back.style, back.colors, back.opacity), (Style::Ruby, c, 70));
-        assert_eq!(Theme::parse("a\tnormal\t5\t").unwrap().opacity, 30);
+        assert_eq!((back.style, back.colors, back.opacity, back.accent), (Style::Floating, c, 70, Accent::Rose));
+        assert_eq!(Theme::parse("a\tnormal\t5\t").unwrap().opacity, 40);
         assert!(Theme::parse("").is_none() && Theme::parse("x\tnormal").is_none());
         let mut one = [u32::MAX; 7];
         one[0] = rgb(1, 2, 3);

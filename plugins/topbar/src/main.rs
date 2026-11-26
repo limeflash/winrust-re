@@ -30,6 +30,9 @@ mod shot;
 mod lang;
 mod settings;
 mod thumbs;
+mod ui;
+mod render;
+use ui::bar::{self as barui, keys::*};
 use {tray::*, status::*, run::*, shot::*, lang::*, settings::*};
 use windows::{
     Win32::{
@@ -61,59 +64,58 @@ use windows_sys::Win32::{
     UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
-/// A corner radius in logical px, 0 in the square styles.
+/// A corner radius in logical px.
 fn rr(v: i32) -> i32 {
-    if style().square() { 0 } else { sc(v) }
+    sc(v)
 }
-/// The bar sits at the top of the screen (tiling) instead of the bottom.
-fn at_top() -> bool {
-    style() == Style::Tiling && !vert()
-}
-/// The bar stands on the left or right edge of the screen (its "width" is bar_h(), it spans the screen height).
+/// The bar stands on the left or right edge of the screen (its thickness is bar_h(), it spans the screen height).
 fn vert() -> bool {
     i18n::style::side() != i18n::style::Side::Bottom
 }
-/// The floating dock (a pill in the middle of the bottom edge); a side bar is never a dock.
+/// The dock: a pill in the middle of the edge, as long as its content.
 fn dock() -> bool {
-    style() == Style::Dock && !vert()
+    style() == Style::Dock
 }
-/// Screen x of a side bar's current left edge, slid away by the show/hide animation.
-unsafe fn bar_x() -> i32 {
-    if i18n::style::side() == i18n::style::Side::Left { -bar_off() } else { GetSystemMetrics(SM_CXSCREEN) - bar_h() + bar_off() }
+/// The bar's look now: thickness, gap to the screen edge, corner radius (spec section 1).
+fn shape() -> barui::Shape {
+    barui::shape(style(), i18n::style::side(), i18n::style::bar_size())
 }
-/// Top-left of the bar window now.
-unsafe fn bar_pos() -> (i32, i32) {
-    if vert() { (bar_x(), 0) } else { (bar_x_w().0, bar_y()) }
+/// Design pixels to device pixels, rounded like the renderer does.
+fn dp(v: f32) -> i32 {
+    (v * SCALE.get()).round() as i32
+}
+/// Thickness of the bar in device pixels.
+fn bar_h() -> i32 {
+    dp(shape().thick)
+}
+/// Thickness plus the gap to the screen edge ("barOuter"): popups stand 12 dip beyond it.
+fn bar_outer() -> i32 {
+    dp(shape().outer())
+}
+/// Screen y of the top edge of a bottom bar (with its gap) when it is in place.
+unsafe fn bar_top() -> i32 {
+    GetSystemMetrics(SM_CYSCREEN) - bar_outer()
 }
 /// Screen x of a popup of width `w` next to a side bar.
 unsafe fn side_x(w: i32) -> i32 {
-    if i18n::style::side() == i18n::style::Side::Left { bar_h() + sc(8) } else { GetSystemMetrics(SM_CXSCREEN) - bar_h() - sc(8) - w }
+    let o = bar_outer() + dp(12.0);
+    if i18n::style::side() == i18n::style::Side::Left { o } else { GetSystemMetrics(SM_CXSCREEN) - o - w }
 }
-/// Length of the bar's long axis: the screen height for a side bar, the width otherwise.
-unsafe fn axis_len() -> i32 {
-    GetSystemMetrics(if vert() { SM_CYSCREEN } else { SM_CXSCREEN })
-}
-/// Gap under the floating dock.
-fn dock_gap() -> i32 {
-    if dock() { sc(8) } else { 0 }
-}
-/// Screen x and width of the bar: the whole screen, or the dock in the middle.
-unsafe fn bar_x_w() -> (i32, i32) {
-    let cx = GetSystemMetrics(SM_CXSCREEN);
-    if dock() {
-        let w = (cx * 3 / 5).max(sc(720)).min(cx);
-        ((cx - w) / 2, w)
-    } else {
-        (0, cx)
-    }
-}
-/// Screen y of the bar's current top edge, slid away by the show/hide animation.
-unsafe fn bar_y() -> i32 {
-    if at_top() { -bar_off() } else { bar_top() + bar_off() }
-}
-/// Screen y of a popup of height `h` next to the bar: above it, or below it when the bar is at the top.
+/// Screen y of a popup of height `h` above the bar (beside a side bar: standing 12 dip above the screen's bottom).
 unsafe fn pop_y(h: i32) -> i32 {
-    if vert() { GetSystemMetrics(SM_CYSCREEN) - sc(8) - h } else if at_top() { bar_h() + sc(8) } else { bar_top() - sc(8) - h }
+    if vert() { GetSystemMetrics(SM_CYSCREEN) - dp(12.0) - h } else { bar_top() - dp(12.0) - h }
+}
+/// How far the hide animation has pushed the bar out of its place, in px.
+fn bar_off() -> i32 {
+    UI.with_borrow(|u| u.as_ref().map_or(0, |b| b.placement().slide))
+}
+/// False once the bar has slid away completely.
+fn bar_visible() -> bool {
+    UI.with_borrow(|u| u.as_ref().is_none_or(|b| !b.placement().gone))
+}
+/// The bar window's rectangle on screen as (left, top, width, height), including the strip above a bottom bar.
+fn bar_win() -> (i32, i32, i32, i32) {
+    UI.with_borrow(|u| u.as_ref().map_or((0, 0, 0, 0), |b| b.placement().win))
 }
 const GOOD: u32 = winrust_common::style::GOOD;
 const BAD: u32 = winrust_common::style::BAD;
@@ -121,24 +123,7 @@ const WARN: u32 = winrust_common::style::WARN;
 const CALLBACK: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
 const NO_WINDOW: u32 = 0x0800_0000;
-const BAR_H: i32 = 40;
-// hit-test results. Buttons (Start, pins, windows) are >= 0 in left-to-right order; tray apps are TAPP + index.
-const NONE: i32 = -1;
-const SEARCH: i32 = -10;
-const TASKVIEW: i32 = -14; // Task View button (virtual desktops), right of search (#83)
-const LEAD: i32 = 2; // slots before Start: search, Task View
-const CLOCK: i32 = -4;
-const LANG: i32 = -6;
-const WIFI_I: i32 = -7;
-const VOL_I: i32 = -8;
-const BAT_I: i32 = -9;
-const TAPP: i32 = -1000;
-const SHOWDESK: i32 = -13; // the thin strip right of the clock: show desktop (#87)
-const GEAR: i32 = -12; // the gear at the left end: the Style menu
-const GEAR_X: (i32, i32) = (6, 36); // its left edge and width, before scaling (sc() is applied where used)
-const POW_R: i32 = -15; // Restart button next to the clock (#173)
-const POW_S: i32 = -16; // Shut down button
-const SYS_GRP: i32 = -11; // hover key of the one pill around wifi + volume + battery (they open the same panel)
+// hit-test keys (Start 0, app buttons >= 1, tray slots TAPP + n): see ui::bar::keys
 const WIN_START: u32 = WM_APP + 10; // posted by the keyboard hook: Win key pressed alone
 const ALT_TAB: u32 = WM_APP + 11; // posted by the keyboard hook: Alt+Tab (wp 1 = Shift held: backwards)
 const ALT_UP: u32 = WM_APP + 12; // posted by the keyboard hook: Alt released while switching (wp 1 = Esc: cancel)
@@ -236,8 +221,8 @@ thread_local! {
     static ORDER: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // unpinned windows in the order their buttons were added
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static BUSY: Cell<bool> = const { Cell::new(false) }; // a fade is still running: the painter asks for another frame
-    static BAR_P: Cell<f32> = const { Cell::new(0.0) }; // bar slide: 0 = off screen, 1 = in place
-    static BAR_T: Cell<u64> = const { Cell::new(0) };
+    static UI: RefCell<Option<barui::Bar>> = const { RefCell::new(None) }; // the bar's renderer and its animation state
+    static SHADOW: Cell<HWND> = const { Cell::new(null_mut()) }; // the window under the floating bars that holds their shadow
     static DESK_T: Cell<u64> = const { Cell::new(0) }; // last moment the bar had a reason to stay on the desktop
     static SCALE: Cell<f32> = const { Cell::new(1.0) };
     static OLD_STATE: Cell<usize> = const { Cell::new(ABS_ALWAYSONTOP as usize) };
@@ -261,15 +246,6 @@ fn wide(s: &str) -> Vec<u16> {
 fn sc(v: i32) -> i32 {
     (v as f32 * SCALE.get()) as i32
 }
-fn bar_h() -> i32 {
-    let d = [-6, 0, 8][i18n::style::bar_size() as usize % 3]; // small / normal / large
-    if vert() { sc(60 + d) } else { sc(BAR_H + d) }
-}
-/// Screen y of the bar's top edge when it is in place (bottom of the primary monitor, or its top in the tiling style).
-unsafe fn bar_top() -> i32 {
-    if at_top() { 0 } else { GetSystemMetrics(SM_CYSCREEN) - bar_h() - dock_gap() }
-}
-
 // ---------- taskbar / appbar ----------
 
 const FCELL: i32 = 38;
@@ -291,8 +267,7 @@ unsafe fn fly_toggle() {
     let (_, fw, fh) = fly_size();
     FHOT.set(-1);
     let scr = GetSystemMetrics(SM_CXSCREEN);
-    let (bx, bw) = bar_x_w();
-    let cx = bx + layout(if vert() { axis_len() } else { bw }).apps.0 + sc(12); // above the chevron
+    let cx = tip_cx(TAPP); // above the chevron
     SetWindowRgn(w, CreateRoundRectRgn(0, 0, fw + 1, fh + 1, rr(12), rr(12)), 1);
     let (x, y) = if vert() { (side_x(fw), (cx - fh / 2).clamp(sc(8), GetSystemMetrics(SM_CYSCREEN) - fh - sc(8))) } else { ((cx - fw / 2).clamp(sc(8), scr - fw - sc(8)), pop_y(fh)) };
     TF_ANIM.set((now_ms(), x, y));
@@ -305,8 +280,7 @@ unsafe fn fly_toggle() {
 
 /// How far the tray flyout still is from its place at opening progress `e` (0..1): it rises toward the bar's far side.
 unsafe fn tf_slide(e: f32) -> i32 {
-    let d = ((1.0 - e) * sc(14) as f32) as i32;
-    if at_top() { -d } else { d }
+    ((1.0 - e) * sc(14) as f32) as i32
 }
 
 /// Opening progress 0..1 of the tray flyout, eased, and of its icon `n` (each one starts 25 ms after the previous).
@@ -520,7 +494,7 @@ unsafe fn show_tip(s: String, cx: i32) {
         return;
     }
     let x = (cx - w / 2).clamp(sc(4), GetSystemMetrics(SM_CXSCREEN) - w - sc(4));
-    SetWindowPos(tw, HWND_TOPMOST, x, if at_top() { bar_h() - bar_off() + sc(6) } else { bar_top() + bar_off() - h - sc(6) }, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(tw, HWND_TOPMOST, x, bar_top() + bar_off() - h - sc(6), w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(tw, null(), 1);
 }
 
@@ -733,16 +707,15 @@ unsafe fn hide_taskbar_if_shown() {
     }
 }
 
-/// Reserves the bottom strip of the primary monitor (maximized windows stay above it).
+/// Reserves the strip the bar takes (maximized windows stay clear of it) and draws it in its place.
 unsafe fn place(hwnd: HWND) {
-    apply_opacity(hwnd);
     let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
     let mut ab: APPBARDATA = zeroed();
     ab.cbSize = size_of::<APPBARDATA>() as u32;
     ab.hWnd = hwnd;
-    // the reserved strip: the bar itself plus the dock's gap under it
-    // the dock reserves nothing: maximized windows take the whole screen and the dock slides away over them
-    let strip = if dock() || i18n::style::autohide() { 0 } else { bar_h() };
+    // classic: the bar, floating: the bar and its gap, the dock reserves nothing (maximized windows take the whole screen and
+    // the dock slides away over them); auto-hide reserves nothing either
+    let strip = if i18n::style::autohide() { 0 } else { dp(shape().reserve()) };
     if vert() {
         let left = i18n::style::side() == i18n::style::Side::Left;
         ab.uEdge = if left { ABE_LEFT } else { ABE_RIGHT };
@@ -750,12 +723,6 @@ unsafe fn place(hwnd: HWND) {
         SHAppBarMessage(ABM_QUERYPOS, &mut ab);
         if left { ab.rc.left = sane_edge(ab.rc.left, cx) } else { ab.rc.right = cx - sane_edge(cx - ab.rc.right, cx) }
         if left { ab.rc.right = ab.rc.left + strip } else { ab.rc.left = ab.rc.right - strip }
-    } else if at_top() {
-        ab.uEdge = ABE_TOP;
-        ab.rc = RECT { left: 0, top: 0, right: cx, bottom: strip };
-        SHAppBarMessage(ABM_QUERYPOS, &mut ab);
-        ab.rc.top = sane_edge(ab.rc.top, cy);
-        ab.rc.bottom = ab.rc.top + strip;
     } else {
         ab.uEdge = ABE_BOTTOM;
         ab.rc = RECT { left: 0, top: cy - strip, right: cx, bottom: cy };
@@ -768,17 +735,10 @@ unsafe fn place(hwnd: HWND) {
     // windows slide under the bar and, covering the whole monitor, count as "fullscreen" and hide the bar.
     // Also with Explorer: it does not always honour the appbar when its own taskbar is hidden (#89).
     {
-        set_work_area(if vert() { if ab.uEdge == ABE_LEFT { RECT { left: ab.rc.right, top: 0, right: cx, bottom: cy } } else { RECT { left: 0, top: 0, right: ab.rc.left, bottom: cy } } } else if at_top() { RECT { left: 0, top: ab.rc.bottom, right: cx, bottom: cy } } else { RECT { left: 0, top: 0, right: cx, bottom: ab.rc.top } });
+        set_work_area(if vert() { if ab.uEdge == ABE_LEFT { RECT { left: ab.rc.right, top: 0, right: cx, bottom: cy } } else { RECT { left: 0, top: 0, right: ab.rc.left, bottom: cy } } } else { RECT { left: 0, top: 0, right: cx, bottom: ab.rc.top } });
     }
-    let (x, w) = bar_x_w();
-    // the dock is a pill; the other styles a plain strip
-    SetWindowRgn(hwnd, if dock() { CreateRoundRectRgn(0, 0, w + 1, bar_h() + 1, bar_h(), bar_h()) } else { null_mut() }, 1);
-    if vert() {
-        SetWindowPos(hwnd, HWND_TOPMOST, bar_x(), 0, bar_h(), cy, SWP_NOACTIVATE);
-    } else {
-        SetWindowPos(hwnd, HWND_TOPMOST, x, bar_y(), w, bar_h(), SWP_NOACTIVATE);
-    }
-    InvalidateRect(hwnd, null(), 0);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    redraw(hwnd);
 }
 
 /// How far from its screen edge the bar may sit after ABM_QUERYPOS (room left for other appbars). Explorer sometimes answers
@@ -911,8 +871,8 @@ unsafe fn lnk_target(lnk: &[u16]) -> String {
 }
 
 /// The target's own icon: SHGetFileInfo on the .lnk adds the shortcut arrow, so that is only the fallback.
-unsafe fn lnk_icon(lnk: &[u16], target: &str) -> HICON {
-    let ic = item_icon(&resolve_cmd(&wstr_of(lnk)), icon_px());
+unsafe fn lnk_icon(lnk: &[u16], target: &str, px: i32) -> HICON {
+    let ic = item_icon(&resolve_cmd(&wstr_of(lnk)), px);
     if !ic.is_null() {
         return ic;
     }
@@ -932,6 +892,10 @@ unsafe fn lnk_icon(lnk: &[u16], target: &str) -> HICON {
 /// a 32 px icon stretched by DrawIconEx comes out jagged.
 fn icon_px() -> i32 {
     sc(24)
+}
+/// Size the bar's app icons are loaded at: the design draws them up to 40 dip, and 1.24 times that when they lift on hover.
+fn bar_icon_px() -> i32 {
+    sc(64)
 }
 
 /// Icon of a file, shortcut (its target's icon, no arrow) or shell item ("shell:AppsFolder\<app id>") rendered by the
@@ -976,7 +940,7 @@ unsafe fn win_icon(w: HWND) -> HICON {
         }
         return own(w);
     }
-    let ic = EXE_ICONS.with_borrow_mut(|m| *m.entry(exe.clone()).or_insert_with(|| item_icon(&exe, icon_px())));
+    let ic = EXE_ICONS.with_borrow_mut(|m| *m.entry(exe.clone()).or_insert_with(|| item_icon(&exe, bar_icon_px())));
     if ic.is_null() { own(w) } else { ic }
 }
 
@@ -1006,7 +970,7 @@ unsafe fn store_icon(frame: HWND) -> HICON {
         return null_mut();
     }
     let id = format!(r"shell:AppsFolder\{}", wstr_of(&buf));
-    EXE_ICONS.with_borrow_mut(|m| *m.entry(id.clone()).or_insert_with(|| item_icon(&id, icon_px())))
+    EXE_ICONS.with_borrow_mut(|m| *m.entry(id.clone()).or_insert_with(|| item_icon(&id, bar_icon_px())))
 }
 
 /// "c:\program files\windowsapps\claude_5.1.0.0_x64__pzs8\app\claude.exe" -> ("claude_pzs8", "app\claude.exe"):
@@ -1204,7 +1168,7 @@ unsafe fn load_pins() {
         let lnk = wide(&f.to_string_lossy());
         let target = lnk_target(&lnk);
         let target = fix_msix_pin(&lnk, &target).unwrap_or(target);
-        let icon = lnk_icon(&lnk, &target);
+        let icon = lnk_icon(&lnk, &target, bar_icon_px());
         let args = lnk_args(&lnk);
         let aumid = lnk_aumid(&lnk).to_lowercase();
         PINS.with_borrow_mut(|p| p.push(Pin { lnk, target, args, aumid, icon }));
@@ -1366,8 +1330,6 @@ fn refresh_status() {
 
 // ---------- Restart and Shut down on the bar (#173): one pill between the system group and the clock ----------
 
-const POWER_KEYS: [i32; 2] = [POW_R, POW_S];
-
 /// Restart or shut down after a confirmation, so a stray click does not end the session.
 unsafe fn power_click(key: i32) {
     let (q, arg) = if key == POW_R {
@@ -1380,72 +1342,14 @@ unsafe fn power_click(key: i32) {
     }
 }
 
-/// Draws the power buttons; `cell(start, len)` is the button's rectangle along the bar.
-unsafe fn paint_power(dc: HDC, l: &Layout, hot: i32, f_glyph: HFONT, cell: impl Fn(i32, i32) -> RECT) {
-    let pill = cell(l.power.0, l.power.1 - l.power.0);
-    fill(dc, pill, mix(pal().bg, pal().hover, 0.6), sc(8));
-    SelectObject(dc, f_glyph);
-    for (i, k) in POWER_KEYS.into_iter().enumerate() {
-        let rc = cell(l.power.0 + i as i32 * sc(32), sc(32));
-        glow(dc, k, hot == k, rc, mix(pal().bg, pal().hover, 0.6), mix(pal().hover, pal().accent, 0.35), sc(8));
-        text(dc, if k == POW_R { "\u{E777}" } else { "\u{E7E8}" }, rc, pal().text, DT_CENTER);
-    }
+/// The bar element under a client point of the bar window (device pixels), straight from the frame's layout table.
+unsafe fn hit(x: i32, y: i32) -> i32 {
+    UI.with_borrow(|u| u.as_ref().map_or(NONE, |b| b.hit(x, y)))
 }
 
-struct Layout {
-    x0: i32, // first slot: the search button; Start and the rest follow
-    bw: i32,
-    gap: i32,
-    power: (i32, i32),
-    apps: (i32, i32),
-    sys: (i32, i32),
-    clock: (i32, i32),
-}
-
-fn layout(w: i32) -> Layout {
-    let gap = sc(4);
-    let clock = (w - sc(96), w - sc(6));
-    let power = (clock.0 - sc(4) - sc(32) * POWER_KEYS.len() as i32, clock.0 - sc(4));
-    let sys = (power.0 - sc(4) - sc(150 + if BAT.get().0 >= 0 { 66 } else { 0 }), power.0 - sc(4));
-    let apps = (sys.0 - sc(24) * tray_count() as i32, sys.0);
-    let margin = (w - apps.0) + sc(8); // keep the button group centered and clear of both sides
-    let n = BTNS.with_borrow(|b| b.len()) as i32 + LEAD; // + the search and Task View slots
-    let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(sc(16), sc(44 + [-6, 0, 8][i18n::style::bar_size() as usize % 3]));
-    // centered on search + Start + pins only: opening an unpinned window adds a button on the right instead of shifting Start left
-    let fixed = (PINS.with_borrow(|p| p.len()) as i32 + LEAD + 1).min(n);
-    // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
-    let right_limit = w - margin - (n * (bw + gap) - gap);
-    let centered = (w - (fixed * (bw + gap) - gap)) / 2;
-    Layout { x0: if i18n::style::align_left() { 0 } else { centered }.min(right_limit).max(sc(GEAR_X.0 + GEAR_X.1 + 6)), bw, gap, power, apps, sys, clock } // clear of the gear
-}
-
-unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
-    let mut r: RECT = zeroed();
-    GetClientRect(hwnd, &mut r);
-    // a side bar runs the same layout along its height
-    let (x, l) = if vert() { (y, layout(r.bottom)) } else { (x, layout(r.right)) };
-    if x < sc(GEAR_X.0 + GEAR_X.1) {
-        return GEAR;
-    }
-    if x >= l.clock.1 {
-        return SHOWDESK;
-    }
-    if x >= l.clock.0 {
-        return CLOCK;
-    }
-    if x >= l.power.0 {
-        return POWER_KEYS.get(((x - l.power.0) / sc(32)) as usize).copied().unwrap_or(NONE);
-    }
-    if x >= l.sys.0 {
-        let d = x - l.sys.0;
-        return if d < sc(42) { LANG } else if d < sc(74) { WIFI_I } else if d < sc(106) { VOL_I } else { BAT_I };
-    }
-    if x >= l.apps.0 {
-        return TAPP + (x - l.apps.0) / sc(24);
-    }
-    let n = BTNS.with_borrow(|b| b.len()) as i32 + LEAD;
-    let (d, i) = (x - l.x0, (x - l.x0) / (l.bw + l.gap));
-    if d < 0 || d % (l.bw + l.gap) >= l.bw || i >= n { NONE } else if i == 0 { SEARCH } else if i == 1 { TASKVIEW } else { i - LEAD }
+/// Screen position (x for a bottom bar, y for a side bar) of the middle of a bar element, for its tooltip and menus.
+unsafe fn tip_cx(h: i32) -> i32 {
+    UI.with_borrow(|u| u.as_ref().and_then(|b| b.screen_center(h))).map_or(0, |(x, y)| if vert() { y } else { x })
 }
 
 // ---------- animation ----------
@@ -1484,83 +1388,21 @@ unsafe fn hv(key: i32, on: bool) -> f32 {
     ease(v)
 }
 
-/// Rounded highlight that fades in and out; `from` is the colour it sits on. A click also flashes it in the accent colour.
+/// Rounded highlight that fades in and out (the flyouts' rows); `from` is the colour it sits on.
 unsafe fn glow(dc: HDC, key: i32, on: bool, r: RECT, from: u32, to: u32, rad: i32) {
     let t = hv(key, on);
-    let p = press_t(key);
-    if t > 0.01 || p > 0.0 {
-        fill(dc, r, mix(mix(from, to, t), pal().accent, 0.5 * p), rad);
+    if t > 0.01 {
+        fill(dc, r, mix(from, to, t), rad);
     }
 }
 
 thread_local! {
-    static PRESS: Cell<(i32, u64)> = const { Cell::new((i32::MIN, 0)) }; // last clicked element and when
-    static SEEN: RefCell<HashMap<isize, u64>> = RefCell::new(HashMap::new()); // when each taskbar button first showed
+    static PRESS: Cell<(i32, u64)> = const { Cell::new((i32::MIN, 0)) }; // last clicked bar element and when
 }
 
-/// Marks `key` as just clicked / dropped on: its highlight flashes and its icon squeezes for a moment.
+/// Marks `key` as just pressed: its icon squeezes for a moment.
 unsafe fn press(key: i32) {
     PRESS.set((key, now_ms()));
-}
-
-/// 1.0 right after the click, easing to 0 over 320 ms (keeps the painter running meanwhile).
-unsafe fn press_t(key: i32) -> f32 {
-    let (k, t0) = PRESS.get();
-    let t = now_ms().saturating_sub(t0) as f32 / 320.0;
-    if k != key || t >= 1.0 {
-        return 0.0;
-    }
-    BUSY.set(true);
-    (1.0 - t) * (1.0 - t)
-}
-
-/// 0..1 over 260 ms after a taskbar button first appears: new windows pop in instead of snapping into place.
-unsafe fn appear(key: isize) -> f32 {
-    let now = now_ms();
-    let t0 = SEEN.with_borrow_mut(|m| {
-        if m.len() > 512 {
-            m.clear(); // shortcut: closed windows are never pruned one by one; a clear only replays the pop-in
-        }
-        *m.entry(key).or_insert(now)
-    });
-    let t = now.saturating_sub(t0) as f32 / 260.0;
-    if t >= 1.0 {
-        return 1.0;
-    }
-    BUSY.set(true);
-    ease(t)
-}
-
-/// How far the bar sits below its place: it rises in at start and drops out of the way (and back) when a fullscreen
-/// window takes the screen.
-fn bar_off() -> i32 {
-    ((1.0 - ease(BAR_P.get())) * (bar_h() + dock_gap()) as f32) as i32
-}
-
-unsafe fn bar_anim(hwnd: HWND) {
-    BAR_T.set(now_ms());
-    SetTimer(hwnd, 5, 15, None);
-}
-
-unsafe fn bar_step(hwnd: HWND) {
-    // hides for a fullscreen game or video, and with "auto-hide" on while the pointer is away (never otherwise: not over the desktop, not in any style)
-    let target = if FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)) { 0.0 } else { 1.0 };
-    let now = now_ms();
-    let dt = now.saturating_sub(BAR_T.replace(now)).min(50) as f32;
-    let p = BAR_P.get();
-    let p = if p < target { (p + dt / 380.0).min(target) } else { (p - dt / 240.0).max(target) };
-    BAR_P.set(p);
-    if p > 0.0 && IsWindowVisible(hwnd) == 0 {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-    let (px, py) = bar_pos();
-    SetWindowPos(hwnd, HWND_TOPMOST, px, py, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-    if p == target {
-        KillTimer(hwnd, 5);
-        if p == 0.0 {
-            ShowWindow(hwnd, SW_HIDE); // not just moved away: a hidden bar cannot cover a game
-        }
-    }
 }
 
 /// True when the foreground window covers the whole primary monitor (game, F11 video, presentation).
@@ -1609,15 +1451,19 @@ unsafe fn fs_update(hwnd: HWND) {
     let now = now_ms();
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let sw = GetSystemMetrics(SM_CXSCREEN);
+    // the hot zone is a 6 dip strip at the edge; while the bar is out, the pointer over it keeps it there
+    let (edge, outer, shown) = (dp(6.0), bar_outer(), bar_visible());
     let over = if vert() {
-        if i18n::style::side() == i18n::style::Side::Left { pt.x <= 0 || (pt.x < bar_h() && BAR_P.get() > 0.0) } else { pt.x >= sw - 1 || (pt.x >= sw - bar_h() && BAR_P.get() > 0.0) }
-    } else if at_top() { pt.y <= 0 || (pt.y < bar_h() && BAR_P.get() > 0.0) } else { pt.y >= sh - 1 || (pt.y >= sh - bar_h() - dock_gap() && BAR_P.get() > 0.0) };
+        if i18n::style::side() == i18n::style::Side::Left { pt.x < edge || (pt.x < outer && shown) } else { pt.x >= sw - edge || (pt.x >= sw - outer && shown) }
+    } else {
+        pt.y >= sh - edge || (pt.y >= sh - outer && shown)
+    };
     if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || fly::any_open() || over {
         DESK_T.set(now);
     }
     let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
     if DESK_HIDE.swap(desk, Relaxed) != desk {
-        bar_anim(hwnd);
+        redraw(hwnd);
     }
     if FULLSCREEN.swap(fs, Relaxed) != fs {
         if fs {
@@ -1625,7 +1471,7 @@ unsafe fn fs_update(hwnd: HWND) {
             hide_tip(hwnd);
             thumbs::hide_preview();
         }
-        bar_anim(hwnd);
+        redraw(hwnd);
     }
     // the 250 ms watch is only needed while the pointer decides (auto-hide, dock, desktop, bar away); otherwise
     // the foreground event, ABN_FULLSCREENAPP and the 1 s tick call this
@@ -1656,9 +1502,8 @@ unsafe fn dock_covered() -> bool {
     }
     let mut r: RECT = zeroed();
     GetWindowRect(fg, &mut r);
-    let (x, w) = bar_x_w();
-    let top = GetSystemMetrics(SM_CYSCREEN) - bar_h() - dock_gap();
-    r.bottom > top && r.right > x && r.left < x + w
+    let Some((x, y, w, h)) = UI.with_borrow(|u| u.as_ref().map(|b| b.placement().rest)) else { return false };
+    r.bottom > y && r.top < y + h && r.right > x && r.left < x + w
 }
 
 /// SetForegroundWindow that also works when the request comes from a keyboard hook (we have not "received input" then).
@@ -1669,7 +1514,6 @@ unsafe fn force_fg(hw: HWND) {
 /// Fills `r` (right / bottom exclusive) in colour `c`; `rad` > 0 rounds the corners (rad = corner diameter), anti-aliased
 /// through GDI+. Plain GDI for square boxes and when GDI+ is not available.
 unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
-    let rad = if style().square() { 0 } else { rad };
     let (w, h) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -1800,374 +1644,185 @@ unsafe fn clock_texts() -> (String, String) {
     (String::from_utf16_lossy(&a[..n]), String::from_utf16_lossy(&b[..m]))
 }
 
-/// The side bar: the same layout as the bottom one, run along the height (top to bottom: gear, search, Start, pins and windows,
-/// tray, system, clock), icons only.
-unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
-    let [f_txt, f_small, f_glyph, f_bold] = fonts;
-    let l = layout(cr.bottom);
-    let fg = GetForegroundWindow();
-    let (lft, rgt) = (sc(6), cr.right - sc(6));
-    let cx = (lft + rgt) / 2;
-    let left = i18n::style::side() == i18n::style::Side::Left;
-    let hot = HOT.get();
-    let active_bg = mix(pal().active, pal().accent, 0.12);
-    let cell = |y: i32, len: i32| RECT { left: lft, top: y, right: rgt, bottom: y + len };
-    let dim = mix(pal().dim, pal().text, 0.5);
-
-    let gr = cell(sc(GEAR_X.0), sc(GEAR_X.1));
-    glow(dc, GEAR, hot == GEAR, gr, pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    text(dc, "\u{E713}", gr, if hot == GEAR { pal().text } else { dim }, DT_CENTER);
-
-    let sb = cell(l.x0, l.bw);
-    glow(dc, SEARCH, hot == SEARCH, sb, pal().bg, pal().hover, sc(8));
-    text(dc, "\u{E721}", sb, if hot == SEARCH { pal().text } else { dim }, DT_CENTER);
-    let tb = cell(l.x0 + l.bw + l.gap, l.bw);
-    glow(dc, TASKVIEW, hot == TASKVIEW, tb, pal().bg, pal().hover, sc(8));
-    text(dc, "\u{E7C4}", tb, if hot == TASKVIEW { pal().text } else { dim }, DT_CENTER);
-
-    BTNS.with_borrow(|btns| {
-        for (i, b) in btns.iter().enumerate() {
-            let y = l.x0 + (i as i32 + LEAD) * (l.bw + l.gap);
-            let r = cell(y, l.bw);
-            let mid = y + l.bw / 2;
-            let act = b.wins.contains(&fg);
-            let att = !act && FLASH.with_borrow(|f| b.wins.iter().any(|w| f.contains(w))); // flashing: lit until it is activated
-            let (th, ta, tp) = (hv(i as i32, hot == i as i32), hv(2000 + i as i32, act), press_t(i as i32));
-            if th > 0.01 || ta > 0.01 || tp > 0.0 {
-                fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), active_bg, ta), pal().accent, 0.5 * tp), sc(8));
-            }
-            if att {
-                fill(dc, r, mix(pal().bg, pal().accent, 0.4), sc(8));
-            }
-            if i == 0 {
-                let t = ((sc(8) as f32) * (1.0 + 0.12 * th) * (1.0 - 0.2 * tp)) as i32;
-                let g = sc(1).max(1);
-                let tint = [mix(pal().accent, pal().text, 0.35), mix(pal().accent, pal().text, 0.15), mix(pal().accent, pal().text, 0.15), pal().accent];
-                for (k, (dx, dy)) in [(-1, -1), (0, -1), (-1, 0), (0, 0)].into_iter().enumerate() {
-                    let (px, py) = (cx + if dx < 0 { -t - g } else { g }, mid + if dy < 0 { -t - g } else { g });
-                    fill(dc, RECT { left: px, top: py, right: px + t, bottom: py + t }, tint[k], sc(3));
-                }
-                continue;
-            }
-            let ic = match b.pin {
-                Some(p) => PINS.with_borrow(|pins| pins.get(p).map_or(null_mut(), |p| p.icon)),
-                None => b.icon,
-            };
-            let ic = if ic.is_null() { b.wins.first().map_or(ic, |&w| icon_of(w)) } else { ic }; // a pin whose icon failed to load (#91)
-            let key = b.pin.map(|p| -(p as isize) - 1).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0);
-            let isz = (icon_px().min(l.bw - sc(6)) as f32 * (1.0 - 0.18 * tp) * (0.55 + 0.45 * appear(key))) as i32;
-            if !ic.is_null() {
-                DrawIconEx(dc, cx - isz / 2, mid - isz / 2, ic, isz, isz, 0, null_mut(), DI_NORMAL);
-            }
-            if !b.wins.is_empty() {
-                // the running-app pill stands on the edge facing the screen's border
-                let min = b.wins.iter().all(|&w| IsIconic(w) != 0);
-                let pl = sc(6) + (sc(12) as f32 * ta) as i32;
-                let col = if act || att { pal().accent } else if min { mix(pal().dim, pal().bg, 0.45) } else { pal().dim };
-                let px = if left { sc(1) } else { cr.right - sc(4) };
-                fill(dc, RECT { left: px, top: mid - pl / 2, right: px + sc(3), bottom: mid + pl / 2 }, col, sc(3));
-            }
-        }
-    });
-
-    fill(dc, RECT { left: cx - sc(9), top: l.apps.0 - sc(5), right: cx + sc(9), bottom: l.apps.0 - sc(5) + 1 }, pal().line, 0);
-
-    glow(dc, TAPP, hot == TAPP, cell(l.apps.0, sc(24)), pal().bg, pal().hover, sc(8));
-    let turn = ease(hv(TF_KEY, IsWindowVisible(TRAYFLY.get()) != 0));
-    chevron(dc, cx, l.apps.0 + sc(12), sc(5), if left { 90.0 } else { 270.0 } + 180.0 * turn, mix(pal().text, pal().accent, turn));
-    SelectObject(dc, f_txt);
-    let bar = bar_idx();
-    TAPPS.with_borrow(|t| {
-        for (k, &ix) in bar.iter().enumerate() {
-            let (i, ti) = (k + 1, &t[ix]);
-            let y = l.apps.0 + i as i32 * sc(24);
-            glow(dc, TAPP + i as i32, hot == TAPP + i as i32, cell(y, sc(24)), pal().bg, pal().hover, sc(8));
-            if !ti.icon.is_null() {
-                DrawIconEx(dc, cx - sc(8), y + sc(4), ti.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
-            }
-        }
-    });
-
-    paint_power(dc, &l, hot, f_glyph, cell);
-    glow(dc, LANG, hot == LANG, cell(l.sys.0, sc(42)), pal().bg, pal().hover, sc(8));
-    let grp = cell(l.sys.0 + sc(44), l.sys.1 - l.sys.0 - sc(44));
-    let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
-    if tg > 0.01 || pg > 0.0 {
-        fill(dc, grp, mix(mix(pal().bg, pal().hover, tg), pal().accent, 0.5 * pg), sc(8));
+/// The dominant saturated colour of an icon (what its window indicator is painted in), `None` for grey ones.
+unsafe fn dominant(ic: HICON) -> Option<ui::gfx::Rgba> {
+    let mut ii: ICONINFO = zeroed();
+    if GetIconInfo(ic, &mut ii) == 0 {
+        return None;
     }
-    text(dc, &lang_name(), cell(l.sys.0, sc(42)), pal().text, DT_CENTER);
-    net_icon(dc, cx, l.sys.0 + sc(58), sc(17), f_glyph);
-    SelectObject(dc, f_glyph);
-    let (vol, muted) = VOL.get();
-    let vg = if muted || vol == 0 { "\u{E74F}" } else if vol < 34 { "\u{E993}" } else if vol < 67 { "\u{E994}" } else { "\u{E995}" };
-    text(dc, vg, cell(l.sys.0 + sc(79), sc(22)), if muted { BAD } else { pal().text }, DT_CENTER);
-    let (pct, ac) = BAT.get();
-    if pct >= 0 {
-        let col = if ac { GOOD } else if pct <= 15 { BAD } else { pal().text };
-        let (bw, bh) = (sc(22), sc(11));
-        let (bx, by) = (cx - bw / 2 - sc(1), l.sys.0 + sc(111));
-        fill(dc, RECT { left: bx, top: by, right: bx + bw, bottom: by + bh }, col, sc(4));
-        fill(dc, RECT { left: bx + sc(1), top: by + sc(1), right: bx + bw - sc(1), bottom: by + bh - sc(1) }, mix(pal().bg, pal().hover, tg), sc(3));
-        let fw = ((bw - sc(4)) * pct / 100).max(sc(1));
-        fill(dc, RECT { left: bx + sc(2), top: by + sc(2), right: bx + sc(2) + fw, bottom: by + bh - sc(2) }, col, sc(2));
-        fill(dc, RECT { left: bx + bw + sc(1), top: by + sc(3), right: bx + bw + sc(3), bottom: by + bh - sc(3) }, col, sc(1));
-        SelectObject(dc, f_small);
-        text(dc, &format!("{pct}%"), cell(l.sys.0 + sc(126), sc(18)), pal().text, DT_CENTER);
+    if !ii.hbmMask.is_null() {
+        DeleteObject(ii.hbmMask);
     }
-
-    let cb = cell(l.clock.0, l.clock.1 - l.clock.0);
-    glow(dc, CLOCK, hot == CLOCK || fly::is_open(fly::Kind::Cal), cb, pal().bg, pal().hover, sc(8));
-    let (tm, dt) = clock_texts();
-    let mid = (cb.top + cb.bottom) / 2;
-    SelectObject(dc, f_bold);
-    text(dc, &tm, RECT { left: 0, top: cb.top, right: cr.right, bottom: mid + sc(1) }, pal().text, DT_CENTER);
-    SelectObject(dc, f_small);
-    text(dc, &dt, RECT { left: 0, top: mid - sc(1), right: cr.right, bottom: cb.bottom }, mix(pal().dim, pal().text, 0.35), DT_CENTER);
+    let color = ii.hbmColor;
+    if color.is_null() {
+        return None;
+    }
+    let mut bm: BITMAP = zeroed();
+    GetObjectW(color, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _);
+    let (w, h) = (bm.bmWidth, bm.bmHeight);
+    let mut px = vec![0u32; (w.max(0) * h.max(0)) as usize];
+    if !px.is_empty() {
+        let mut bi: BITMAPINFO = zeroed();
+        bi.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..zeroed() };
+        let dc = GetDC(null_mut());
+        GetDIBits(dc, color, 0, h as u32, px.as_mut_ptr().cast(), &mut bi, DIB_RGB_COLORS);
+        ReleaseDC(null_mut(), dc);
+    }
+    DeleteObject(color);
+    let alpha_used = px.iter().any(|p| p >> 24 != 0);
+    // 12 hue buckets, each pixel weighing saturation x brightness: the loudest hue wins over big grey areas
+    let mut bucket = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 12];
+    for &p in &px {
+        if alpha_used && p >> 24 < 128 {
+            continue;
+        }
+        let (r, g, b) = (((p >> 16) & 255) as f32 / 255.0, ((p >> 8) & 255) as f32 / 255.0, (p & 255) as f32 / 255.0);
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        let (sat, d) = (if mx > 0.0 { (mx - mn) / mx } else { 0.0 }, mx - mn);
+        if sat < 0.35 || mx < 0.35 {
+            continue;
+        }
+        let hue = if mx == r { ((g - b) / d).rem_euclid(6.0) } else if mx == g { (b - r) / d + 2.0 } else { (r - g) / d + 4.0 };
+        let k = (hue * 2.0) as usize % 12;
+        let wt = sat * mx;
+        let e = &mut bucket[k];
+        *e = (e.0 + wt, e.1 + r * wt, e.2 + g * wt, e.3 + b * wt);
+    }
+    let best = bucket.iter().max_by(|a, b| a.0.total_cmp(&b.0))?;
+    if best.0 < (w * h) as f32 * 0.02 {
+        return None;
+    }
+    let c = ui::gfx::Rgba::new(best.1 / best.0, best.2 / best.0, best.3 / best.0, 1.0);
+    Some(c.mix(ui::gfx::Rgba::white(1.0), 0.12))
 }
 
 thread_local! {
-    static BG: Cell<(HDC, HBITMAP, u64)> = const { Cell::new((null_mut(), null_mut(), 0)) }; // cached background layer and its key
-    static FONTS: Cell<([HFONT; 4], u64)> = const { Cell::new(([null_mut(); 4], 0)) };
+    static ICON_COLOR: RefCell<HashMap<usize, Option<ui::gfx::Rgba>>> = RefCell::new(HashMap::new());
 }
 
-fn key_of(v: impl std::hash::Hash) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.hash(&mut h);
-    h.finish() | 1 // never 0, the "empty" key
-}
-
-/// The bar's background for this size, side and style, redrawn only when one of them changes.
-unsafe fn bg_layer(wdc: HDC, cr: RECT) -> HDC {
-    let h = cr.bottom;
-    let p = pal();
-    let key = key_of((cr.right, h, vert(), at_top(), i18n::style::side() == i18n::style::Side::Left, style().light(), format!("{:?}", style()), [p.bg, p.text, p.line, p.accent], SCALE.get().to_bits()));
-    let (mut dc, mut bmp, k) = BG.get();
-    if k == key && !dc.is_null() {
-        return dc;
-    }
-    if dc.is_null() {
-        dc = CreateCompatibleDC(wdc);
-    }
-    if !bmp.is_null() {
-        DeleteObject(bmp);
-    }
-    bmp = CreateCompatibleBitmap(wdc, cr.right, h);
-    SelectObject(dc, bmp); // the DC's first bitmap is the stock 1x1 one: nothing to give back
-    BG.set((dc, bmp, key));
-    // frosted-glass look: a hairline on top, a faint light catch under it, then the panel colour fading in
-    let lit = mix(pal().bg, pal().text, 0.045);
-    if vert() {
-        fill(dc, cr, pal().bg, 0);
-    } else {
-        for y in 0..h {
-            fill(dc, RECT { left: 0, top: y, right: cr.right, bottom: y + 1 }, mix(lit, pal().bg, (y as f32 / sc(18) as f32).min(1.0)), 0);
+/// The window indicator colour of an icon: its dominant hue, worked out once per icon; the accent for grey ones.
+unsafe fn icon_color(ic: HICON) -> ui::gfx::Rgba {
+    let c = ICON_COLOR.with_borrow_mut(|m| {
+        if m.len() > 256 {
+            m.clear();
         }
-    }
-    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
-    if vert() {
-        // the hairline faces the windows
-        let x = if i18n::style::side() == i18n::style::Side::Left { cr.right - 1 } else { 0 };
-        fill(dc, RECT { left: x, top: 0, right: x + 1, bottom: h }, pal().line, 0);
-    }
-    let edge = if at_top() { h - 1 } else { 0 }; // the hairline faces the windows
-    if !vert() {
-        fill(dc, RECT { left: 0, top: edge, right: cr.right, bottom: edge + 1 }, pal().line, 0);
-    }
-    if !at_top() && !vert() {
-        fill(dc, RECT { left: 0, top: 1, right: cr.right, bottom: 2 }, mix(pal().bg, pal().text, 0.08), 0);
-    }
-    dc
-}
-
-/// The bar's four fonts, made again only when the scale or the style's faces change.
-unsafe fn bar_fonts() -> [HFONT; 4] {
-    let key = key_of((SCALE.get().to_bits(), ui_face(), winrust_common::style::icon_face()));
-    let (fonts, k) = FONTS.get();
-    if k == key {
-        return fonts;
-    }
-    fonts.iter().filter(|f| !f.is_null()).for_each(|&f| {
-        DeleteObject(f);
+        *m.entry(ic as usize).or_insert_with(|| if ic.is_null() { None } else { dominant(ic) })
     });
-    let (face, gface) = (wide(ui_face()), wide(winrust_common::style::icon_face()));
-    let font = |f: &[u16], px: i32, wt: i32| CreateFontW(-sc(px), 0, 0, 0, wt, 0, 0, 0, 1, 0, 0, 5, 0, f.as_ptr());
-    let fonts = [font(&face, 13, 400), font(&face, 12, 400), font(&gface, 16, 400), font(&face, 13, 600)];
-    FONTS.set((fonts, key));
-    fonts
+    c.unwrap_or_else(|| ui::gfx::Rgba::colorref(pal().accent))
 }
 
-unsafe fn paint(hwnd: HWND) {
-    let mut ps: PAINTSTRUCT = zeroed();
-    let wdc = BeginPaint(hwnd, &mut ps);
-    let mut cr: RECT = zeroed();
-    GetClientRect(hwnd, &mut cr);
-    let h = cr.bottom;
-    BUSY.set(false);
-    let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right, h));
-    let old = SelectObject(dc, bmp);
-    // the background (gradient, facets, hairlines) is the same every frame: drawn once per size / style, then copied
-    BitBlt(dc, 0, 0, cr.right, h, bg_layer(wdc, cr), 0, 0, SRCCOPY);
-    SetBkMode(dc, TRANSPARENT as i32);
-    let [f_txt, f_small, f_glyph, f_bold] = bar_fonts();
-    let of = SelectObject(dc, f_txt);
+fn whwnd(h: HWND) -> windows::Win32::Foundation::HWND {
+    windows::Win32::Foundation::HWND(h.cast())
+}
 
-    'horiz: {
+fn wicon(ic: HICON) -> windows::Win32::UI::WindowsAndMessaging::HICON {
+    windows::Win32::UI::WindowsAndMessaging::HICON(ic.cast())
+}
 
-    if vert() {
-        paint_vert(dc, cr, [f_txt, f_small, f_glyph, f_bold]);
-        break 'horiz;
-    }
-    let l = layout(cr.right);
+/// What the bar shows now, gathered from the program's state.
+unsafe fn build_view() -> barui::View {
+    let s = SCALE.get();
     let fg = GetForegroundWindow();
-    let (top, bot) = (sc(4), h - sc(4));
-    let mid = (top + bot) / 2;
-    let cell = |x: i32, w: i32| RECT { left: x, top, right: x + w, bottom: bot };
-    let hot = HOT.get();
-    let active_bg = mix(pal().active, pal().accent, 0.12); // the focused app's button: a hint of the accent, not plain grey
-
-    // the gear at the left end: the Style menu
-    let gr = RECT { left: sc(GEAR_X.0), top, right: sc(GEAR_X.0 + GEAR_X.1), bottom: bot };
-    glow(dc, GEAR, hot == GEAR, gr, pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    text(dc, "\u{E713}", gr, if hot == GEAR { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
-
-    // search button (left of Start)
-    let sb = RECT { left: l.x0, top, right: l.x0 + l.bw, bottom: bot };
-    glow(dc, SEARCH, hot == SEARCH, sb, pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    text(dc, "\u{E721}", sb, if hot == SEARCH { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
-    let tb = RECT { left: l.x0 + l.bw + l.gap, top, right: l.x0 + 2 * l.bw + l.gap, bottom: bot };
-    glow(dc, TASKVIEW, hot == TASKVIEW, tb, pal().bg, pal().hover, sc(8));
-    text(dc, "\u{E7C4}", tb, if hot == TASKVIEW { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
-
-    // Start, pinned apps, open windows (center)
-    BTNS.with_borrow(|btns| {
-        for (i, b) in btns.iter().enumerate() {
-            let x = l.x0 + (i as i32 + LEAD) * (l.bw + l.gap);
-            let r = RECT { left: x, top, right: x + l.bw, bottom: bot };
-            let act = b.wins.contains(&fg);
-            let att = !act && FLASH.with_borrow(|f| b.wins.iter().any(|w| f.contains(w))); // flashing: lit until it is activated
-            let (th, ta, tp) = (hv(i as i32, hot == i as i32), hv(2000 + i as i32, act), press_t(i as i32));
-            if th > 0.01 || ta > 0.01 || tp > 0.0 {
-                fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), active_bg, ta), pal().accent, 0.5 * tp), sc(8));
-            }
-            if att {
-                fill(dc, r, mix(pal().bg, pal().accent, 0.4), sc(8));
-            }
-            if i == 0 {
-                // Windows logo in four tiles, lit from the top left; grows a little on hover, squeezes on click
-                let t = ((sc(8) as f32) * (1.0 + 0.12 * th) * (1.0 - 0.2 * tp)) as i32;
-                let (g, cx) = (sc(1).max(1), (r.left + r.right) / 2);
-                let tint = [mix(pal().accent, pal().text, 0.35), mix(pal().accent, pal().text, 0.15), mix(pal().accent, pal().text, 0.15), pal().accent];
-                for (k, (dx, dy)) in [(-1, -1), (0, -1), (-1, 0), (0, 0)].into_iter().enumerate() {
-                    let (px, py) = (cx + if dx < 0 { -t - g } else { g }, mid + if dy < 0 { -t - g } else { g });
-                    fill(dc, RECT { left: px, top: py, right: px + t, bottom: py + t }, tint[k], sc(3));
-                }
-                continue;
-            }
-            let ic = match b.pin {
-                Some(p) => PINS.with_borrow(|pins| pins.get(p).map_or(null_mut(), |p| p.icon)),
-                None => b.icon,
-            };
-            let ic = if ic.is_null() { b.wins.first().map_or(ic, |&w| icon_of(w)) } else { ic }; // a pin whose icon failed to load (#91)
-            let key = b.pin.map(|p| -(p as isize) - 1).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0);
-            // squeezes on click, grows in when new, lifts a pixel on hover
-            let isz = (icon_px().min(l.bw - sc(6)) as f32 * (1.0 - 0.18 * tp) * (0.55 + 0.45 * appear(key))) as i32;
-            if !ic.is_null() {
-                DrawIconEx(dc, x + (l.bw - isz) / 2, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32, ic, isz, isz, 0, null_mut(), DI_NORMAL);
-            }
-            if !b.wins.is_empty() {
-                let min = b.wins.iter().all(|&w| IsIconic(w) != 0);
-                let pw = sc(6) + (sc(12) as f32 * ta) as i32; // the running-app pill stretches when its window is active
-                let py = bot - sc(4);
-                let col = if act || att { pal().accent } else if min { mix(pal().dim, pal().bg, 0.45) } else { pal().dim };
-                fill(dc, RECT { left: x + (l.bw - pw) / 2, top: py, right: x + (l.bw + pw) / 2, bottom: py + sc(3) }, col, sc(3));
-                if b.wins.len() > 1 {
-                    // a second, shorter pill: more than one window behind this button
-                    fill(dc, RECT { left: x + (l.bw + pw) / 2 + sc(2), top: py, right: x + (l.bw + pw) / 2 + sc(5), bottom: py + sc(3) }, col, sc(3));
-                }
-            }
-        }
+    let apps = BTNS.with_borrow(|btns| {
+        btns.iter()
+            .skip(1) // Start is the layout's own button
+            .map(|b| {
+                let ic = match b.pin {
+                    Some(p) => PINS.with_borrow(|pins| pins.get(p).map_or(null_mut(), |p| p.icon)),
+                    None => b.icon,
+                };
+                let ic = if ic.is_null() { b.wins.first().map_or(ic, |&w| icon_of(w)) } else { ic }; // a pin whose icon failed to load (#91)
+                let active = b.wins.contains(&fg);
+                let flash = !active && FLASH.with_borrow(|f| b.wins.iter().any(|w| f.contains(w))); // lit until it is activated
+                barui::AppView { icon: wicon(ic), wins: b.wins.len(), active, flash, color: icon_color(ic) }
+            })
+            .collect()
     });
-
-    // a hairline between the app buttons and the tray side
-    fill(dc, RECT { left: l.apps.0 - sc(5), top: mid - sc(9), right: l.apps.0 - sc(5) + 1, bottom: mid + sc(9) }, pal().line, 0);
-
-    // tray apps
-    glow(dc, TAPP, hot == TAPP, cell(l.apps.0, sc(24)), pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    let open_tf = IsWindowVisible(TRAYFLY.get()) != 0;
-    let turn = ease(hv(TF_KEY, open_tf)); // the chevron turns over as the flyout opens, and back
-    let cc = cell(l.apps.0, sc(24));
-    chevron(dc, (cc.left + cc.right) / 2, mid, sc(5), if at_top() { 180.0 } else { 0.0 } + 180.0 * turn, mix(pal().text, pal().accent, turn));
-    SelectObject(dc, f_txt);
-    let bar = bar_idx();
-    TAPPS.with_borrow(|t| {
-        for (k, &ix) in bar.iter().enumerate() {
-            let (i, ti) = (k + 1, &t[ix]);
-            let x = l.apps.0 + i as i32 * sc(24);
-            glow(dc, TAPP + i as i32, hot == TAPP + i as i32, cell(x, sc(24)), pal().bg, pal().hover, sc(8));
-            if !ti.icon.is_null() {
-                DrawIconEx(dc, x + sc(4), mid - sc(8), ti.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
-            }
-        }
-    });
-
-    // system group: language on its own, then one pill for wifi + volume + battery (like Windows 11: they open one panel)
-    paint_power(dc, &l, hot, f_glyph, |s, len| RECT { left: s, top, right: s + len, bottom: bot });
-    let tb = RECT { left: l.sys.0, top, right: l.sys.1, bottom: bot };
-    glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(42), bottom: bot }, pal().bg, pal().hover, sc(8));
-    let grp = RECT { left: tb.left + sc(44), top, right: tb.right, bottom: bot };
-    let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
-    if tg > 0.01 || pg > 0.0 {
-        fill(dc, grp, mix(mix(pal().bg, pal().hover, tg), pal().accent, 0.5 * pg), sc(8));
-    }
-    let mut x = tb.left + sc(10);
-    text(dc, &lang_name(), cell(x, sc(34)), pal().text, DT_LEFT);
-    x += sc(42);
-    net_icon(dc, x + sc(9), mid, sc(17), f_glyph);
-    x += sc(32);
-    SelectObject(dc, f_glyph);
+    let tray = {
+        let bar = bar_idx();
+        TAPPS.with_borrow(|t| bar.iter().map(|&i| wicon(t[i].icon)).collect())
+    };
+    let (time, date) = clock_texts();
+    let (bat, ac) = BAT.get();
     let (vol, muted) = VOL.get();
-    let vg = if muted || vol == 0 { "\u{E74F}" } else if vol < 34 { "\u{E993}" } else if vol < 67 { "\u{E994}" } else { "\u{E995}" };
-    text(dc, vg, cell(x, sc(22)), if muted { BAD } else { pal().text }, DT_CENTER);
-    x += sc(32);
-    let (pct, ac) = BAT.get();
-    if pct >= 0 {
-        let col = if ac { GOOD } else if pct <= 15 { BAD } else { pal().text };
-        let (bw, bh, by) = (sc(22), sc(11), mid - sc(5));
-        fill(dc, RECT { left: x, top: by, right: x + bw, bottom: by + bh }, col, sc(4)); // outline
-        fill(dc, RECT { left: x + sc(1), top: by + sc(1), right: x + bw - sc(1), bottom: by + bh - sc(1) }, mix(pal().bg, pal().hover, tg), sc(3));
-        let fw = ((bw - sc(4)) * pct / 100).max(sc(1));
-        fill(dc, RECT { left: x + sc(2), top: by + sc(2), right: x + sc(2) + fw, bottom: by + bh - sc(2) }, col, sc(2));
-        fill(dc, RECT { left: x + bw + sc(1), top: by + sc(3), right: x + bw + sc(3), bottom: by + bh - sc(3) }, col, sc(1)); // terminal nub
-        SelectObject(dc, f_txt);
-        text(dc, &format!("{pct}%"), cell(x + bw + sc(8), sc(40)), pal().text, DT_LEFT);
+    barui::View {
+        style: style(),
+        side: i18n::style::side(),
+        size: i18n::style::bar_size(),
+        align_left: i18n::style::align_left(),
+        screen: (GetSystemMetrics(SM_CXSCREEN) as f32 / s, GetSystemMetrics(SM_CYSCREEN) as f32 / s),
+        op: i18n::style::bar_opacity() as f32 / 100.0,
+        apps,
+        tray,
+        battery: (bat >= 0).then_some((bat, ac)),
+        vol: (if vol < 0 { 50 } else { vol }, muted),
+        net: match net() {
+            Link::Wifi(q) => barui::Net::Wifi(q),
+            Link::NoInternet(q) => barui::Net::NoInternet(q),
+            Link::Cable => barui::Net::Cable,
+            Link::Offline => barui::Net::Offline,
+        },
+        lang: lang_name(),
+        time,
+        date,
     }
+}
 
-    // time (semibold) over the date (dimmed)
-    let cb = cell(l.clock.0, l.clock.1 - l.clock.0);
-    glow(dc, CLOCK, hot == CLOCK || fly::is_open(fly::Kind::Cal), cb, pal().bg, pal().hover, sc(8));
-    let (tm, dt) = clock_texts();
-    SelectObject(dc, f_bold);
-    text(dc, &tm, RECT { left: cb.left, top: cb.top, right: cb.right, bottom: mid + sc(1) }, pal().text, DT_CENTER);
-    SelectObject(dc, f_small);
-    text(dc, &dt, RECT { left: cb.left, top: mid - sc(1), right: cb.right, bottom: cb.bottom }, mix(pal().dim, pal().text, 0.35), DT_CENTER);
+/// The pointer and the open panels.
+unsafe fn build_live() -> barui::Live {
+    let now = now_ms();
+    let (pk, pt) = PRESS.get();
+    let menu_at = |key: i32| fly::menu_at().is_some_and(|cx| (cx - tip_cx(key)).abs() <= 3); // a menu that opened at that button
+    barui::Live {
+        now,
+        hot: HOT.get(),
+        press: if now.saturating_sub(pt) < 220 { pk } else { NONE },
+        gear: menu_at(GEAR),
+        start: fly::is_open(fly::Kind::Start),
+        qs: fly::is_open(fly::Kind::Quick) || fly::is_open(fly::Kind::Wifi),
+        cal: fly::is_open(fly::Kind::Cal),
+        lang: menu_at(LANG),
+        tray: IsWindowVisible(TRAYFLY.get()) != 0,
+        hidden: FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)),
     }
+}
 
-    BitBlt(wdc, 0, 0, cr.right, h, dc, 0, 0, SRCCOPY);
-    SelectObject(dc, of);
-    SelectObject(dc, old);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-    if BUSY.get() {
-        SetTimer(hwnd, 4, 16, None); // next animation frame
+/// Draws one frame of the bar (and of its shadow) and puts it on screen; asks for the next one while anything moves.
+/// Everything that wants the bar redrawn invalidates it, WM_PAINT lands here.
+unsafe fn redraw(hwnd: HWND) {
+    let (view, live) = (build_view(), build_live());
+    let Some(p) = UI.with_borrow_mut(|u| u.as_mut().map(|b| b.frame(&view, &live))) else { return };
+    let shadow = SHADOW.get();
+    if p.gone {
+        ShowWindow(hwnd, SW_HIDE); // not just moved away: a hidden bar cannot cover a game
+        ShowWindow(shadow, SW_HIDE);
+        KillTimer(hwnd, 4);
+        return;
+    }
+    UI.with_borrow(|u| {
+        if let Some(b) = u {
+            b.present(whwnd(hwnd), whwnd(shadow));
+        }
+    });
+    if IsWindowVisible(hwnd) == 0 {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    // the shadow of the floating styles stands right under the bar; the flat style has none
+    // (backdrop-filter: blur(30px) saturate(1.4) of the mockup would be a third, "glass" window here, behind the bar)
+    if p.shadow.is_some() {
+        if IsWindowVisible(shadow) == 0 {
+            ShowWindow(shadow, SW_SHOWNOACTIVATE);
+        }
+        SetWindowPos(shadow, hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        ShowWindow(shadow, SW_HIDE);
+    }
+    if p.busy || live.press != NONE {
+        SetTimer(hwnd, 4, 16, None);
     } else {
         KillTimer(hwnd, 4);
     }
-    EndPaint(hwnd, &ps);
 }
 
 // ---------- input ----------
@@ -2277,7 +1932,7 @@ fn windows_ru(n: usize) -> String {
 
 /// Right-click menu of an app button, like the Windows 11 jump list: the app on top, its windows (when there are several),
 /// open / pin / Start, then close and end process in red.
-unsafe fn app_menu(hwnd: HWND, h: i32) {
+unsafe fn app_menu(h: i32) {
     #[derive(Clone, Copy)]
     enum A {
         Win(HWND),
@@ -2338,7 +1993,7 @@ unsafe fn app_menu(hwnd: HWND, h: i32) {
     let acts: Vec<A> = items.iter().map(|x| x.1).collect();
     let items = items.into_iter().map(|x| x.0).collect();
     let first_pid = wins.first().map_or(0, |&w| { let mut pid = 0; GetWindowThreadProcessId(w, &mut pid); pid });
-    fly::menu(tip_cx(&bar_layout(hwnd), h), Some((icon, "", name, sub)), items, move |i| {
+    fly::menu(tip_cx(h), Some((icon, "", name, sub)), items, move |i| {
         match acts.get(i).copied() {
             Some(A::Win(w)) => {
                 if IsIconic(w) != 0 {
@@ -2482,7 +2137,7 @@ unsafe fn pin_exe(path: &str, args: &str) {
         if let Ok(t) = std::fs::read_to_string(unpinned_file()) {
             let _ = std::fs::write(unpinned_file(), t.lines().filter(|l| *l != line).map(|l| format!("{l}\n")).collect::<String>());
         }
-        let icon = lnk_icon(&lnk, exe);
+        let icon = lnk_icon(&lnk, exe, bar_icon_px());
         PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: exe.to_string(), args, aumid: String::new(), icon }));
     }
 }
@@ -2502,7 +2157,7 @@ unsafe fn on_drop(hwnd: HWND, hd: HDROP) {
         })
         .collect();
     DragFinish(hd);
-    let h = hit(hwnd, pt.x, pt.y);
+    let h = hit(pt.x, pt.y);
     press(if h == NONE { 0 } else { h });
     if h == 0 {
         let added: Vec<&String> = files.iter().filter(|f| fly::start_pin(f)).collect();
@@ -2566,7 +2221,6 @@ unsafe fn open_launcher() -> bool {
 
 /// Right click on Start: the Win+X menu (Explorer's own is gone with the bar).
 unsafe fn start_menu() {
-    let bar = BAR.load(Relaxed) as HWND;
     // (label in ru/en/ja/pt/zh, target); "!" targets are actions of ours, the rest goes through `open`
     let tools: [(&str, &str, &str, &str, &str, &str); 15] = [
         ("Приложения и возможности", "Apps and Features", "アプリと機能", "Aplicativos e Recursos", "应用和功能", "ms-settings:appsfeatures"),
@@ -2594,7 +2248,7 @@ unsafe fn start_menu() {
         targets.push(*to);
     }
     let head = (null_mut(), "\u{E700}", t!("Пуск", "Start", ja: "開始", pt: "Iniciar", zh: "启动").to_string(), String::new());
-    fly::menu(tip_cx(&bar_layout(bar), 0), Some(head), items, move |i| {
+    fly::menu(tip_cx(0), Some(head), items, move |i| {
         let Some(&to) = targets.get(i) else { return };
         let quiet = |c: &mut Command| { let _ = c.creation_flags(NO_WINDOW).spawn(); };
         match to {
@@ -2808,7 +2462,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 fly::MItem::new(t!("Настройка даты и времени", "Adjust date and time", ja: "日付と時刻を調整する", pt: "Ajustar data e hora")),
                 fly::MItem::new(t!("Параметры уведомлений", "Notification settings", ja: "通知の設定", pt: "Configurações de notificação")),
             ];
-            fly::menu(tip_cx(&bar_layout(BAR.load(Relaxed) as HWND), CLOCK), None, items, |i| {
+            fly::menu(tip_cx(CLOCK), None, items, |i| {
                 if i == 0 {
                     // the classic applet opens at once with or without Explorer; the Settings page needs Explorer started first
                     let _ = Command::new("control.exe").arg("timedate.cpl").creation_flags(NO_WINDOW).spawn();
@@ -2847,7 +2501,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 }),
                 (Some(&w), false) => close_window(w), // right / middle click
                 // several windows of one app: pick which one (the same list the right-click menu opens with)
-                (Some(_), true) if wins.len() > 1 => app_menu(BAR.load(Relaxed) as HWND, h),
+                (Some(_), true) if wins.len() > 1 => app_menu(h),
                 (Some(&w), true) => {
                     // like the Windows taskbar: the active app's button minimizes it, a minimized one restores, any other raises
                     let fg = GetForegroundWindow();
@@ -2875,46 +2529,14 @@ struct ShellHookInfo {
 
 /// HSHELL_GETMINRECT: a window is minimizing / restoring and asks where its taskbar button is: the shrink animation
 /// flies there instead of to the bottom left corner of the screen.
-unsafe fn min_rect(info: *mut ShellHookInfo, bar: HWND) {
-    let (w, l) = ((*info).hwnd, bar_layout(bar));
+unsafe fn min_rect(info: *mut ShellHookInfo, _bar: HWND) {
+    let w = (*info).hwnd;
     let exe = exe_of(w);
     let i = BTNS.with_borrow(|b| b.iter().position(|b| b.wins.contains(&w)).or_else(|| b.iter().position(|b| !exe.is_empty() && b.wins.first().is_some_and(|&x| exe_of(x) == exe))));
-    let x = match i {
-        Some(i) => l.x0 + (i as i32 + LEAD) * (l.bw + l.gap),
-        None => (l.x0 + l.apps.0) / 2, // no button (yet): the middle of the bar
-    };
-    if vert() {
-        let left = bar_x() + sc(4);
-        (*info).rc = RECT { left, top: x, right: left + bar_h() - sc(8), bottom: x + l.bw };
-        return;
+    // no button (yet): fly to Start
+    if let Some((left, top, right, bottom)) = UI.with_borrow(|u| u.as_ref().and_then(|b| b.screen_rect(i.map_or(0, |i| i as i32)))) {
+        (*info).rc = RECT { left, top, right, bottom };
     }
-    let (top, x) = (bar_top() + sc(4), x + bar_x_w().0);
-    (*info).rc = RECT { left: x, top, right: x + l.bw, bottom: top + bar_h() - sc(8) };
-}
-
-/// Screen x of the middle of a bar element, for its tooltip and menus.
-unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
-    // along the bar: screen x for a bottom bar, screen y for a side bar
-    (if vert() { 0 } else { bar_x_w().0 }) + match h {
-        GEAR => sc(GEAR_X.0 + GEAR_X.1 / 2),
-        SEARCH => l.x0 + l.bw / 2,
-        TASKVIEW => l.x0 + (l.bw + l.gap) + l.bw / 2,
-        CLOCK => (l.clock.0 + l.clock.1) / 2,
-        SHOWDESK => l.clock.1 + sc(3),
-        POW_R | POW_S => l.power.0 + POWER_KEYS.iter().position(|&k| k == h).unwrap_or(0) as i32 * sc(32) + sc(16),
-        LANG => l.sys.0 + sc(21),
-        WIFI_I => l.sys.0 + sc(58),
-        VOL_I => l.sys.0 + sc(90),
-        BAT_I => l.sys.0 + sc(130),
-        t if (TAPP..TAPP + 100).contains(&t) => l.apps.0 + (t - TAPP) * sc(24) + sc(12),
-        i => l.x0 + (i + LEAD) * (l.bw + l.gap) + l.bw / 2,
-    }
-}
-
-unsafe fn bar_layout(hwnd: HWND) -> Layout {
-    let mut r: RECT = zeroed();
-    GetClientRect(hwnd, &mut r);
-    layout(if vert() { r.bottom } else { r.right })
 }
 
 /// Registers the bar as an appbar with explorer (again after explorer restarts: its list starts empty).
@@ -2953,13 +2575,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return 0;
     }
     match msg {
-        WM_PAINT => paint(hwnd),
+        WM_PAINT => {
+            ValidateRect(hwnd, null());
+            redraw(hwnd);
+        }
         WM_ERASEBKGND => return 1,
         WM_TIMER if wp == 2 => {
             KillTimer(hwnd, 2);
             let h = HOT.get();
             if h != NONE && !fly::any_open() {
-                let cx = tip_cx(&bar_layout(hwnd), h);
+                let cx = tip_cx(h);
                 // an app button with windows shows their live previews (#92), anything else its tip
                 if !thumbs::show_preview(h, cx) {
                     thumbs::hide_preview();
@@ -2985,16 +2610,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             InvalidateRect(hwnd, null(), 0); // the label shows the new language right away
         }
-        WM_TIMER if wp == 4 => {
-            InvalidateRect(hwnd, null(), 0);
-        }
-        WM_TIMER if wp == 5 => bar_step(hwnd),
+        WM_TIMER if wp == 4 => redraw(hwnd), // next animation frame
         WIN_START => fly::toggle(fly::Kind::Start),
         ALT_TAB => alt_tab(wp == 1),
         WIN_NUM => win_num(wp),
         WIN_X => start_menu(),
         WIN_V => {
-            let (x, w) = bar_x_w();
+            let (x, _, w, _) = bar_win();
             hist::show(hwnd, x + w / 2);
         }
         0x031D => hist::on_update(hwnd), // WM_CLIPBOARDUPDATE
@@ -3007,7 +2629,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         VOLKEY => {
             if wp == 2 { toggle_mute() } else { add_volume(if wp == 0 { 4 } else { -4 }) }
             KillTimer(hwnd, 2);
-            show_tip(vol_tip(), tip_cx(&bar_layout(hwnd), VOL_I));
+            show_tip(vol_tip(), tip_cx(VOL_I));
             SetTimer(hwnd, 6, 1200, None);
             InvalidateRect(hwnd, null(), 0);
         }
@@ -3030,7 +2652,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             repaint_if_changed(hwnd, true);
         }
         WM_MOUSEMOVE => {
-            let h = hit(hwnd, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
+            let h = hit((lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             TrackMouseEvent(&mut tme);
             if HOT.replace(h) != h {
@@ -3051,15 +2673,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             press(VOL_I); // the speaker flashes so it is clear what the wheel changed
             KillTimer(hwnd, 2);
             if !fly::any_open() {
-                show_tip(vol_tip(), tip_cx(&bar_layout(hwnd), VOL_I)); // and the level shows above it for a moment
+                show_tip(vol_tip(), tip_cx(VOL_I)); // and the level shows above it for a moment
                 SetTimer(hwnd, 6, 1200, None);
             }
             InvalidateRect(hwnd, null(), 0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-            let x = (lp & 0xffff) as i16 as i32;
-            let h = hit(hwnd, x, (lp >> 16) as i16 as i32);
-            let x = if vert() { (lp >> 16) as i16 as i32 } else { x }; // position along the bar
+            let (px, py) = ((lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
+            let h = hit(px, py);
+            let (wx, wy, ..) = bar_win();
+            let x = if vert() { py + wy } else { px + wx }; // screen position along the bar
             hide_tip(hwnd);
             thumbs::hide_preview();
             if h != NONE {
@@ -3068,7 +2691,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if h == NONE && msg == WM_RBUTTONDOWN {
                 fly::context_menu(x); // right click on an empty spot
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
-                app_menu(hwnd, h);
+                app_menu(h);
             } else {
                 click(h, msg == WM_LBUTTONDOWN, msg == WM_MBUTTONDOWN);
             }
@@ -3091,6 +2714,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_taskbar(OLD_STATE.get());
             forget_taskbar_state();
             DestroyWindow(HOST.replace(null_mut()));
+            DestroyWindow(SHADOW.replace(null_mut()));
             announce(); // icons go back to explorer's tray
             PostQuitMessage(0);
         }
@@ -3106,6 +2730,11 @@ fn main() {
             forget_taskbar_state();
             set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // a killed bar's reserved strip
             announce(); // a killed bar took its tray icons with it; apps re-register with explorer
+            return;
+        }
+        // `topbar --render <file.png> [classic|floating|dock] [bottom|left|right] [0|1|2] ...`: one frame of the bar into a PNG, no windows
+        if let Some(i) = std::env::args().position(|a| a == "--render") {
+            render::render(&std::env::args().skip(i + 1).collect::<Vec<_>>());
             return;
         }
         if std::env::args().any(|a| a == "--shot") {
@@ -3165,6 +2794,11 @@ fn main() {
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: class.as_ptr(), ..zeroed() };
         RegisterClassW(&wc);
         let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), bar_h(), null_mut(), null_mut(), hi, null());
+        // The floating styles' shadow: a click-through layered window right under the bar (see redraw())
+        let shc = wide("topbar_shadow");
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: hi, lpszClassName: shc.as_ptr(), ..zeroed() });
+        SHADOW.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, shc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
+        UI.set(barui::Bar::new(SCALE.get()).ok());
         // Our own Shell_TrayWnd (hidden, topmost, so apps find it before explorer's): apps register their tray icons here.
         let tc = wide("Shell_TrayWnd");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(tray_proc), hInstance: hi, lpszClassName: tc.as_ptr(), ..zeroed() });
@@ -3213,7 +2847,6 @@ fn main() {
         SetTimer(hwnd, 1, 1000, None); // status poll; windows come from win_event
         BAR.store(hwnd as isize, Relaxed);
         hist::init(hwnd);
-        bar_anim(hwnd); // the bar slides in (it starts hidden above the screen)
         SetTimer(hwnd, 3, 250, None); // fullscreen watch
         windows_sys::Win32::UI::Accessibility::SetWinEventHook(0x000A, 0x000B, null_mut(), Some(snap_proc), 0, 0, 0); // EVENT_SYSTEM_MOVESIZESTART..END
         // foreground, minimize start/end, create..hide, name, cloaked/uncloaked (2 = WINEVENT_SKIPOWNPROCESS). Not

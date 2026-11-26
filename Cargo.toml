@@ -2,6 +2,7 @@
 name = "plugin-launcher"
 version = "0.5.9"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 
 [[bin]]
@@ -30,6 +31,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graph
 embed-resource = "3"
 
 # One workspace: one Cargo.lock, one target\ (every exe lands in target\release), shared dependencies are built once.
+[workspace.package]
+rust-version = "1.100"
+
 [workspace]
 members = [
     "common",

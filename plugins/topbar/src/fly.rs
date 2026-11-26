@@ -113,6 +113,7 @@ thread_local! {
     static OVER: Cell<Option<Act>> = const { Cell::new(None) };
     static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider
     static MENU_X: Cell<i32> = const { Cell::new(0) };
+    static MENU_CX: Cell<i32> = const { Cell::new(0) }; // where the open menu was asked to stand (screen px along the bar)
     static CONFIRM: Cell<i32> = const { Cell::new(-1) };
     static FIN: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // where the open flyout rests
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started opening
@@ -314,6 +315,11 @@ pub fn start_pin(path: &str) -> bool {
 
 pub fn is_open(k: Kind) -> bool {
     FLY.get() == Some(k)
+}
+
+/// Where the open menu stands along the bar (the bar lights the button it belongs to), `None` when no menu is open.
+pub fn menu_at() -> Option<i32> {
+    is_open(Kind::Menu).then(|| MENU_CX.get())
 }
 
 pub fn any_open() -> bool {
@@ -777,7 +783,6 @@ pub struct MItem {
     pub danger: bool,
     pub sep: bool,
     pub head: bool,  // a section caption: small dim text, not clickable
-    pub beta: bool,  // a red BETA at the right end
     pub swatch: u32, // a colour dot before the label (COLORREF), u32::MAX = none
 }
 
@@ -785,16 +790,12 @@ impl MItem {
     pub fn head(label: impl Into<String>) -> Self {
         MItem { head: true, ..MItem::new(label) }
     }
-    pub fn beta(mut self, on: bool) -> Self {
-        self.beta = on;
-        self
-    }
     pub fn swatch(mut self, c: u32) -> Self {
         self.swatch = c;
         self
     }
     pub fn new(label: impl Into<String>) -> Self {
-        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false, head: false, beta: false, swatch: u32::MAX }
+        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false, head: false, swatch: u32::MAX }
     }
     pub fn hint(mut self, h: &'static str) -> Self {
         self.hint = h;
@@ -833,6 +834,7 @@ pub fn menu(cx: i32, head: Option<(HICON, &'static str, String, String)>, items:
     MITEMS.set(items);
     MHEAD.set(head);
     MPICK.set(Some(Box::new(pick)));
+    MENU_CX.set(cx);
     MENU_X.set(if vert() { cx } else { cx - sc(MW) / 2 }); // along a side bar it holds the anchor y
     toggle(Kind::Menu);
 }
@@ -886,6 +888,7 @@ pub fn context_menu(x: i32) {
 pub fn close() {
     let h = FH.replace(null_mut());
     FLY.set(None);
+    unsafe { InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0) }; // the bar's open button goes out
     if h.is_null() {
         return;
     }
@@ -1010,6 +1013,7 @@ pub fn toggle(k: Kind) {
         SetWindowRgn(hw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(16), rr(16)), 1);
         FH.set(hw);
         FLY.set(Some(k));
+        InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's button lights up
         ShowWindow(hw, SW_SHOW);
         force_fg(hw);
         SetTimer(hw, 1, 1000, None);
@@ -1284,16 +1288,12 @@ unsafe fn track(dc: HDC, rc: RECT, frac: f32) {
     fill(dc, RECT { left: l, top: m - th, right: x.max(l + 2 * th), bottom: m + th }, pal().accent, 2 * th);
     let kr = sc(10);
     fill(dc, RECT { left: x - kr - 1, top: m - kr, right: x + kr + 1, bottom: m + kr + sc(2) }, mix(card(), 0, 0.22), 2 * kr + 2);
-    fill(dc, RECT { left: x - kr, top: m - kr, right: x + kr, bottom: m + kr }, if style().light() { rgb(255, 255, 255) } else { mix(pal().text, card(), 0.04) }, 2 * kr);
+    fill(dc, RECT { left: x - kr, top: m - kr, right: x + kr, bottom: m + kr }, mix(pal().text, card(), 0.04), 2 * kr);
 }
 
 /// A raised rounded surface: a hairline edge (a soft shadow on the light style) around `base`.
 unsafe fn surface(dc: HDC, rc: RECT, base: u32, rad: i32) {
-    let light = style().light();
-    if light {
-        fill(dc, RECT { top: rc.top + sc(1), bottom: rc.bottom + sc(2), ..rc }, mix(pal().bg, pal().dim, 0.16), rad);
-    }
-    fill(dc, rc, if light { mix(pal().bg, pal().line, 0.9) } else { mix(base, pal().text, 0.07) }, rad);
+    fill(dc, rc, mix(base, pal().text, 0.07), rad);
     fill(dc, RECT { left: rc.left + 1, top: rc.top + 1, right: rc.right - 1, bottom: rc.bottom - 1 }, base, rad - 2);
 }
 
@@ -1309,9 +1309,8 @@ unsafe fn paint(hw: HWND, k: Kind) {
     BUSY.set(false);
     let (dc, bmp) = (CreateCompatibleDC(wdc), CreateCompatibleBitmap(wdc, cr.right, cr.bottom));
     let old = SelectObject(dc, bmp);
-    fill(dc, cr, if style().light() { mix(pal().bg, pal().dim, 0.3) } else { mix(pal().bg, pal().text, 0.12) }, sc(16));
+    fill(dc, cr, mix(pal().bg, pal().text, 0.12), sc(16));
     fill(dc, inset(cr, 1), pal().bg, sc(16));
-    winrust_common::style::backdrop(dc, inset(cr, 1), sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
     let (face, gface) = (wide(ui_face()), wide(winrust_common::style::icon_face()));
     let font = |f: &[u16], px: i32, wt: i32| CreateFontW(-sc(px), 0, 0, 0, wt, 0, 0, 0, 1, 0, 0, 5, 0, f.as_ptr());
@@ -1644,7 +1643,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 }
                 let full = sc(12 + CTX_ROW * items.len() as i32);
                 let mr = RECT { left: mx, top: my, right: mx + sc(CTX_W), bottom: my + (full as f32 * (0.4 + 0.6 * t)) as i32 };
-                fill(dc, RECT { left: mr.left - 1, top: mr.top + sc(2), right: mr.right + 1, bottom: mr.bottom + sc(4) }, mix(pal().bg, 0, if style().light() { 0.12 } else { 0.5 }), sc(14));
+                fill(dc, RECT { left: mr.left - 1, top: mr.top + sc(2), right: mr.right + 1, bottom: mr.bottom + sc(4) }, mix(pal().bg, 0, 0.5), sc(14));
                 surface(dc, mr, card, sc(12));
                 for ((ir, a), (label, what)) in ctx_rects().iter().zip(&items) {
                     if ir.bottom > mr.bottom - sc(4) {
@@ -1714,9 +1713,6 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         rx -= sc(18);
                     }
                     SelectObject(dc, f_small);
-                    if it.beta {
-                        text(dc, "BETA", RECT { left: lx, right: rx, ..*rc }, rgb(255, 59, 48), DT_RIGHT);
-                    }
                     if !it.hint.is_empty() {
                         text(dc, it.hint, RECT { left: lx, right: rx, ..*rc }, mix(pal().dim, pal().bg, 0.25), DT_RIGHT);
                     }
@@ -1776,7 +1772,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         let ic = ICONS.with_borrow_mut(|m| {
                             *m.entry(app.1.clone()).or_insert_with(|| {
                                 let t = lnk_target(&app.1);
-                                lnk_icon(&app.1, &t)
+                                lnk_icon(&app.1, &t, icon_px())
                             })
                         });
                         if !ic.is_null() {

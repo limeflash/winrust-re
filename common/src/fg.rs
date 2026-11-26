@@ -10,6 +10,8 @@ use windows_sys::Win32::{
     },
 };
 
+// HWND is an opaque handle passed to Win32, not dereferenced here.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn force(h: HWND) {
     unsafe {
         // a click on our own window already gives us the right; attaching while its button is down would hand it back

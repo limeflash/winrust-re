@@ -754,7 +754,7 @@ fn theme() -> Theme {
     let p = winrust_common::style::pal();
     let up = |t: f32| mix(p.bg, p.text, t);
     let card = winrust_common::style::card();
-    Theme { bg: p.bg, side: up(0.03), card, sep: up(0.1), hover: mix(card, p.text, 0.045), sel: up(0.1), accent: p.accent, fg: p.text, dim: p.dim, off: up(0.2), square: winrust_common::style::style().square() }
+    Theme { bg: p.bg, side: up(0.03), card, sep: up(0.1), hover: mix(card, p.text, 0.045), sel: up(0.1), accent: p.accent, fg: p.text, dim: p.dim, off: up(0.2), square: false }
 }
 
 use winrust_common::style::rgb;
@@ -904,7 +904,7 @@ fn max_scroll(rows: usize, ch: i32) -> i32 {
 unsafe fn frame(hwnd: HWND) {
     let t = theme();
     let set = |attr: u32, v: u32| unsafe { windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(hwnd, attr, &v as *const u32 as _, 4) };
-    set(20, !winrust_common::style::style().light() as u32); // dark caption buttons, except on the light style
+    set(20, 1); // dark caption buttons
     set(35, t.side); // caption colour: one surface with the sidebar
     set(36, t.fg); // caption text
     set(34, t.sep); // border
@@ -914,7 +914,7 @@ unsafe fn frame(hwnd: HWND) {
 /// (Re)creates the fonts when the style's face (Segoe UI Variable / Consolas) differs from the one in use.
 /// 0 body, 1 page title, 2 icons, 3 small text, 4 section headers, 5 small icons.
 fn refresh_fonts() {
-    let mono = winrust_common::style::style().mono();
+    let mono = false;
     APP.with_borrow_mut(|a| {
         if a.fonts[0] != 0 && a.mono == mono {
             return;
@@ -958,7 +958,6 @@ unsafe fn paint(hwnd: HWND) {
             };
             shape(mem, rc, t.bg, 0);
             // sidebar: one surface with the title bar, a hairline to the content
-            winrust_common::style::backdrop(mem, RECT { left: p(SIDE), ..rc }, a.dpi as f32 / 96.0);
             shape(mem, RECT { left: 0, top: 0, right: p(SIDE), bottom: ch }, t.side, 0);
             shape(mem, RECT { left: p(SIDE), top: 0, right: p(SIDE) + 1, bottom: ch }, t.sep, 0);
             for (i, pg) in a.pages.iter().enumerate() {
@@ -1182,8 +1181,7 @@ unsafe fn paint(hwnd: HWND) {
                 let hh = ((pr.bottom - pr.top) as f32 * (0.35 + 0.65 * k)) as i32;
                 let r = if down { RECT { bottom: pr.top + hh, ..pr } } else { RECT { top: pr.bottom - hh, ..pr } };
                 let rad = rd(12) * 2;
-                let light = winrust_common::style::style().light();
-                shape(mem, RECT { left: r.left - p(2), top: r.top + p(4), right: r.right + p(2), bottom: r.bottom + p(10) }, mix(t.bg, 0, if light { 0.08 } else { 0.35 }), rad + p(8));
+                shape(mem, RECT { left: r.left - p(2), top: r.top + p(4), right: r.right + p(2), bottom: r.bottom + p(10) }, mix(t.bg, 0, 0.35), rad + p(8));
                 shape(mem, r, t.sep, rad);
                 shape(mem, inset(r, 1), t.card, rad);
                 let saved = SaveDC(mem);

@@ -9,9 +9,9 @@ use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System:
 // The colours come from the WinRust style the topbar gear picks (normal, terminal, dock, tiling): the same palette as the bar.
 pub use winrust_common::style::{pal, ui_face};
 use winrust_common::{lang, Lang, t, tf};
-// sunk surfaces: darker than the window on the dark styles, white on the light one
-pub fn listbg() -> u32 { if winrust_common::style::style().light() { winrust_common::style::card() } else { mix(pal().bg, 0, 0.22) } }
-pub fn pill() -> u32 { if winrust_common::style::style().light() { mix(pal().bg, pal().text, 0.06) } else { mix(pal().bg, 0, 0.35) } }
+// sunk surfaces: darker than the window
+pub fn listbg() -> u32 { mix(pal().bg, 0, 0.22) }
+pub fn pill() -> u32 { mix(pal().bg, 0, 0.35) }
 pub fn off() -> u32 { mix(pal().dim, pal().bg, 0.45) }
 
 pub const CHROME_H: i32 = 88;
@@ -125,8 +125,8 @@ pub fn font(px: i32, weight: i32, face: &str) -> isize {
 pub fn dark_title(h: HWND) {
     unsafe {
         let set = |attr: u32, v: i32| { DwmSetWindowAttribute(h, attr, &v as *const _ as _, 4); };
-        set(20, !winrust_common::style::style().light() as i32); // immersive dark mode, except on the light style
-        set(33, if winrust_common::style::style().square() { 1 } else { 2 }); // round corners, square in the terminal and tiling styles
+        set(20, 1); // immersive dark mode
+        set(33, 2); // round corners
         set(35, pal().bg as i32); // caption
         set(36, pal().text as i32); // caption text
         set(34, pal().line as i32); // border
@@ -464,7 +464,6 @@ pub fn gdiplus_start() {
 
 /// Fills `r` (right / bottom exclusive) in `c`; `rad` > 0 rounds the corners (rad = corner diameter), anti-aliased.
 pub(crate) unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
-    let rad = if winrust_common::style::style().square() { 0 } else { rad };
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let (wd, ht) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
     if wd <= 0.0 || ht <= 0.0 { return; }
@@ -525,7 +524,6 @@ unsafe fn paint_chrome(hwnd: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
-    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
     let l = layout(cr.right, labels.len());
     let hot = HOT.get();
@@ -632,7 +630,6 @@ pub unsafe fn paint_status(h: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &strip, bg);
     DeleteObject(bg);
-    winrust_common::style::backdrop(dc, strip, sc(100) as f32 / 100.0);
     fill(dc, rc(0, strip.top, cr.right, strip.top + 1), pal().line, 0); // hairline above the status line
     let snap = ST.with(|c| {
         c.try_borrow().ok().map(|s| {
@@ -895,7 +892,6 @@ unsafe fn paint_nav(hwnd: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
-    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
     let (f_txt, f_head, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT);
     let of = SelectObject(dc, f_txt);

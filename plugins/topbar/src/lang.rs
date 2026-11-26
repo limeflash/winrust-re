@@ -31,7 +31,7 @@ pub(crate) unsafe fn lang_menu(bar: HWND) {
     }).collect();
     items.push(fly::MItem::new(t!("Языковые параметры", "Language settings", ja: "言語設定", pt: "Configurações de idioma", zh: "语言设置")).sep());
     let head = (null_mut(), "\u{E775}", t!("Язык ввода", "Input language", ja: "入力言語", pt: "Idioma de entrada", zh: "输入语言").to_string(), t!("Win+Пробел — следующий", "Win+Space — next one", ja: "Win+Space — 次の言語", pt: "Win+Espaço — o próximo", zh: "Win+Space — 下一个").to_string());
-    fly::menu(tip_cx(&bar_layout(bar), LANG), Some(head), items, move |i| match list.get(i) {
+    fly::menu(tip_cx(LANG), Some(head), items, move |i| match list.get(i) {
         Some(&k) => set_lang(bar, k),
         None => open(&wide("ms-settings:regionlanguage")),
     });

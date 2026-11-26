@@ -175,11 +175,6 @@ pub(crate) fn bar_idx() -> Vec<usize> {
     let shown = SHOWN.with_borrow(|s| s.clone());
     TAPPS.with_borrow(|t| t.iter().enumerate().filter(|(_, x)| !x.hidden && shown.as_ref().is_some_and(|s| s.contains(&x.key))).map(|(i, _)| i).collect())
 }
-/// Bar slots of the tray: the chevron plus the icons kept on the bar.
-pub(crate) fn tray_count() -> usize {
-    bar_idx().len() + 1
-}
-
 /// Indices into TAPPS of the icons only the flyout shows (everything not kept on the bar).
 pub(crate) fn over_idx() -> Vec<usize> {
     let bar = bar_idx();

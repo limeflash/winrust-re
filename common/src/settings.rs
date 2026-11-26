@@ -268,10 +268,9 @@ fn own_exe() -> Option<std::path::PathBuf> {
 
 /// A second call while the first still waits is harmless.
 pub fn open(uri: &str) {
-    if let (Some(page), Some(exe)) = (own_page(uri), own_exe()) {
-        if Command::new(exe).arg(page).stdin(Stdio::null()).creation_flags(0x0800_0000).spawn().is_ok() {
-            return;
-        }
+    if let (Some(page), Some(exe)) = (own_page(uri), own_exe())
+        && Command::new(exe).arg(page).stdin(Stdio::null()).creation_flags(0x0800_0000).spawn().is_ok() {
+        return;
     }
     let uri = uri.to_string();
     std::thread::spawn(move || run(&uri)); // shortcut: dies with the host process, which is long-lived (reshell, topbar)

@@ -45,7 +45,7 @@ use windows_sys::Win32::{
 
 type Rgb = (u8, u8, u8);
 // Colours of the WinRust style the topbar gear picks (normal, terminal, dock, tiling): the same palette as the bar.
-use winrust_common::style::{pal, style, ui_face};
+use winrust_common::style::{pal, ui_face};
 fn cr(c: u32) -> Rgb {
     (c as u8, (c >> 8) as u8, (c >> 16) as u8)
 }
@@ -448,16 +448,12 @@ unsafe fn apply_style(main: HWND) {
             DeleteObject(f as _);
         }
     }
-    // Windows 11: rounded corners (square in the terminal and tiling styles), dark frame, border colour. Windows 10 rejects the corner attribute.
-    let square = style().square();
-    let (round, dark, border) = (if square { 1i32 } else { 2i32 }, !style().light() as i32, rgb(c_border()) as i32);
+    // Windows 11: rounded corners, dark frame, border colour. Windows 10 rejects the corner attribute: round with a region.
+    let (round, dark, border) = (2i32, 1i32, rgb(c_border()) as i32);
     let hr = DwmSetWindowAttribute(main, 33, &round as *const _ as _, 4);
     DwmSetWindowAttribute(main, 20, &dark as *const _ as _, 4);
     DwmSetWindowAttribute(main, 34, &border as *const _ as _, 4);
-    st(|s| s.round_with_region = hr != 0 && !square);
-    if square {
-        SetWindowRgn(main, null_mut(), 1);
-    }
+    st(|s| s.round_with_region = hr != 0);
 }
 
 unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1413,7 +1409,6 @@ unsafe fn fill(dc: HDC, l: i32, t: i32, r: i32, b: i32, c: Rgb) {
 }
 
 unsafe fn round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb) {
-    let r = if style().square() { 0.5 } else { r }; // a hair of a radius: zero-size arcs would drop the whole shape
     let mut path: *mut GpPath = null_mut();
     GdipCreatePath(FillModeAlternate, &mut path);
     let d = r * 2.0;
