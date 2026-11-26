@@ -41,6 +41,8 @@ mod wins;
 mod render;
 mod pacing;
 mod notify;
+#[allow(dead_code)]
+mod rec;
 use ui::bar::{self as barui, keys::*};
 use {tray::*, status::*, run::*, shot::*, lang::*, settings::*, qs::*, wins::*};
 use windows::{
@@ -2480,6 +2482,12 @@ fn main() {
         if let Some(i) = std::env::args().position(|a| a == "--render-panel") {
             render::render_panel(&std::env::args().skip(i + 1).collect::<Vec<_>>());
             return;
+        }
+        // `topbar --rec-selftest <out.mp4> [mic]`: 3 s of the primary monitor's top-left 640x360 through the real screen-recording path
+        // (and the microphone with `mic`), prints the frame counts (see rec.rs). Opt-in: it records the screen.
+        if let Some(i) = std::env::args().position(|a| a == "--rec-selftest") {
+            SetProcessDPIAware();
+            std::process::exit(if rec::selftest(&std::env::args().skip(i + 1).collect::<Vec<_>>()) { 0 } else { 1 });
         }
         if std::env::args().any(|a| a == "--bench") {
             render::bench();
