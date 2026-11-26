@@ -164,10 +164,15 @@ impl StartPanel {
         Rect::new(GRID.x + 4.0 + col * 102.0 + (p as f32 - page) * GRID.w, GRID.y + row * 112.0, 98.0, 104.0)
     }
 
-    fn dots(&self) -> Vec<Rect> {
+    /// The page dots and the page each stands for: all of them when they fit, else nine around the current page (all apps
+    /// can be thirty pages; the row must stay right of the title).
+    fn dots(&self) -> Vec<(usize, Rect)> {
+        const MAX: usize = 9;
         let n = self.pages();
-        let x0 = 624.0 - (n as f32 * 28.0 + (n as f32 - 1.0) * 4.0);
-        (0..n).map(|i| Rect::new(x0 + i as f32 * 32.0, TITLE_Y + 2.0, 28.0, 28.0)).collect()
+        let shown = n.min(MAX);
+        let first = self.page.saturating_sub(shown / 2).min(n - shown);
+        let x0 = 624.0 - (shown as f32 * 28.0 + (shown as f32 - 1.0) * 4.0);
+        (0..shown).map(|i| (first + i, Rect::new(x0 + i as f32 * 32.0, TITLE_Y + 2.0, 28.0, 28.0))).collect()
     }
 
     fn show_all_rect(&self) -> Rect {
@@ -235,11 +240,20 @@ impl StartPanel {
             t!("Закреплено", "Pinned", ja: "固定済み", pt: "Fixados", zh: "已固定")
         };
         c.text(title, Rect::new(24.0, TITLE_Y, 300.0, 32.0), Font::new(13.0, 600), INK, Align::Start);
-        for (i, r) in self.dots().into_iter().enumerate() {
-            let on = f32::from(i == self.page);
-            let w = f.tween(DOT + i as i32, 1, 6.0 + 12.0 * on, 300, SPRING);
-            let k = f.tween(DOT + i as i32, 2, on, 200, EASE);
-            c.fill(Rect::new(r.cx() - w / 2.0, r.cy() - 3.0, w, 6.0), 3.0, Rgba::white(0.25).mix(accent, k));
+        let dots = self.dots();
+        let (n, last) = (self.pages(), dots.len().saturating_sub(1));
+        for (i, &(p, r)) in dots.iter().enumerate() {
+            let on = f32::from(p == self.page);
+            let w = f.tween(DOT + p as i32, 1, 6.0 + 12.0 * on, 300, SPRING);
+            let k = f.tween(DOT + p as i32, 2, on, 200, EASE);
+            // an end dot with more pages beyond it is smaller
+            let more = (i == 0 && p > 0) || (i == last && p + 1 < n);
+            let ink = Rgba::white(0.25).mix(accent, k);
+            if more && on < 0.5 {
+                c.fill(Rect::new(r.cx() - 2.0, r.cy() - 2.0, 4.0, 4.0), 2.0, ink);
+            } else {
+                c.fill(Rect::new(r.cx() - w / 2.0, r.cy() - 3.0, w, 6.0), 3.0, ink);
+            }
         }
     }
 
@@ -596,7 +610,7 @@ impl Content for StartPanel {
             let i = (0..self.items.len()).filter(|i| i / PER_PAGE == self.page).find(|&i| Self::pin_rect(i, self.page as f32).contains(x, y))?;
             return Some(i as i32);
         }
-        if let Some(k) = self.dots().iter().position(|r| r.contains(x, y)) {
+        if let Some(&(k, _)) = self.dots().iter().find(|(_, r)| r.contains(x, y)) {
             return Some(DOT + k as i32);
         }
         if self.show_all_rect().contains(x, y) {
@@ -620,7 +634,7 @@ impl Content for StartPanel {
             USER => cx.close_then(|| open_str("ms-settings:yourinfo")),
             SETTINGS => cx.close_then(|| open_str("ms-settings:")),
             POWER => cx.close_then(power_menu),
-            n if (DOT..DOT + 20).contains(&n) => self.page = ((n - DOT) as usize).min(self.pages() - 1),
+            n if (DOT..SHOW_ALL).contains(&n) => self.page = ((n - DOT) as usize).min(self.pages() - 1),
             n if (RECENT..RECENT + 4).contains(&n) => {
                 if let Some(path) = self.recent.get((n - RECENT) as usize).map(|r| r.path.clone()) {
                     cx.close_then(move || open_str(&path));

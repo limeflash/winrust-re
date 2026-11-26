@@ -2381,13 +2381,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         SNIP if wp == 2 => clip_notice(hwnd),
         SNIP if wp == 4 => _ = InvalidateRect(hwnd, null(), 0), // the recording's time and dot move
         SNIP => {
-            // Win+Shift+S (0) and Win+Shift+R (3): what is open closes first, so the picture the picker freezes is the desktop
-            ui::tip::hide();
-            if ui::panel::any_open() {
-                ui::panel::close_now();
-                windows_sys::Win32::Graphics::Dwm::DwmFlush();
+            // Win+Shift+S (0): the screen is frozen as it is, an open menu or panel included (taking a picture of a menu is
+            // what the tool is for); they close behind the picker when it takes the focus. Win+Shift+R (3) records the live
+            // screen: what is open closes first.
+            if wp == 3 {
+                ui::tip::hide();
+                if ui::panel::any_open() {
+                    ui::panel::close_now();
+                    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+                }
+                snip::toggle_rec()
+            } else {
+                snip::open(ui::snip::Kind::Shot)
             }
-            if wp == 3 { snip::toggle_rec() } else { snip::open(ui::snip::Kind::Shot) }
         }
         VOLKEY => {
             if wp == 2 { toggle_mute() } else { add_volume(if wp == 0 { 4 } else { -4 }) }
