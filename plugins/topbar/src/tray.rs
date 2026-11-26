@@ -74,7 +74,7 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                     }
                 }
                 if flags & 4 != 0 {
-                    let w: Vec<u16> = d[32..288].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+                    let w: Vec<u16> = d[32..288].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
                     x.tip = String::from_utf16_lossy(&w);
                 }
                 if flags & 8 != 0 && u(292) & 1 != 0 {

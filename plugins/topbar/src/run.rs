@@ -8,7 +8,7 @@ pub(crate) fn run_dialog() {
         let sh = LoadLibraryW(wide("shell32.dll").as_ptr());
         if let Some(f) = GetProcAddress(sh, 61 as *const u8) {
             type RunFileDlg = unsafe extern "system" fn(HWND, HICON, *const u16, *const u16, *const u16, u32);
-            std::mem::transmute::<_, RunFileDlg>(f)(null_mut(), null_mut(), null(), null(), null(), 0);
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, RunFileDlg>(f)(null_mut(), null_mut(), null(), null(), null(), 0);
         }
     });
 }

@@ -301,12 +301,9 @@ impl Live {
     }
 }
 
+/// A state Windows would not tell (`None`) reads as off, as Windows' own quick settings show it.
 fn onoff(b: Option<bool>) -> String {
-    match b {
-        Some(true) => t!("Вкл.", "On", ja: "オン", pt: "Ligado", zh: "开").to_string(),
-        Some(false) => t!("Выкл.", "Off", ja: "オフ", pt: "Desligado", zh: "关").to_string(),
-        None => t!("Нет", "None", ja: "なし", pt: "Nenhum", zh: "无").to_string(),
-    }
+    if b == Some(true) { t!("Вкл.", "On", ja: "オン", pt: "Ligado", zh: "开") } else { t!("Выкл.", "Off", ja: "オフ", pt: "Desligado", zh: "关") }.to_string()
 }
 
 impl qp::Host for Live {
@@ -332,6 +329,8 @@ impl qp::Host for Live {
         let wsub = match (q >= 0, ssid) {
             (true, Some(s)) => s,
             (true, None) => t!("Подключено", "Connected", ja: "接続済み", pt: "Conectado", zh: "已连接").into(),
+            // on a cable the tile says so instead of a bare "not connected"
+            _ if matches!(net(), Link::Cable) => "Ethernet".into(),
             _ if NETS.with_borrow(|n| n.is_empty()) => t!("Выключен", "Off", ja: "オフ", pt: "Desligado", zh: "关").into(),
             _ => t!("Не подключено", "Not connected", ja: "未接続", pt: "Não conectado", zh: "未连接").into(),
         };
