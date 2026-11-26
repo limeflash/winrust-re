@@ -628,6 +628,15 @@ pub fn composing() -> bool {
     COMPOSE.get()
 }
 
+/// The same for the thread that paces the frames: a layered window costs a readback and a copy per frame, so frames for it come
+/// at 60 Hz, not on every tick of the screen.
+static COMPOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[must_use]
+pub fn composed_anywhere() -> bool {
+    COMPOSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Switches the windows to DirectComposition if this machine can (call it before any of them is made, on the UI thread).
 /// `WINRUST_ULW=1` keeps the layered-window path; so does a machine where a DirectComposition target cannot be made.
 pub fn compose_windows() -> bool {
@@ -643,6 +652,7 @@ pub fn compose_windows() -> bool {
         COMPOSE.set(false);
         DEV.set(None);
     }
+    COMPOSED.store(ok, std::sync::atomic::Ordering::Relaxed);
     ok
 }
 

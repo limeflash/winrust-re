@@ -425,11 +425,18 @@ unsafe fn memory(st: &Stage) {
 }
 
 static PAINTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 unsafe extern "system" fn count_paint(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if m == WM_PAINT {
         PAINTS.fetch_add(1, Relaxed);
         ValidateRect(h, null());
+        return 0;
+    }
+    if m == crate::pacing::FRAME {
+        if crate::pacing::received(h as isize) {
+            FRAMES.fetch_add(1, Relaxed);
+        }
         return 0;
     }
     DefWindowProcW(h, m, w, l)
@@ -450,8 +457,11 @@ unsafe fn messages(st: &Stage) {
     pump(100);
     let painted = PAINTS.load(Relaxed) - before;
     crate::pacing::set(w as isize, true);
-    pump(100);
+    let frames = FRAMES.load(Relaxed);
+    pump(500);
+    let frames = FRAMES.load(Relaxed) - frames;
     crate::pacing::set(w as isize, false);
+    st.say(&format!("messages   frames the ticker asked for in 500 ms: {frames} ({})", if gfx::composed_anywhere() { "on every tick of the screen" } else { "60 Hz: the layered windows" }));
     st.say(&format!("messages   WM_PAINT after InvalidateRect on a window without a redirection bitmap: {} ({painted})", if painted > 0 { "ok" } else { "WRONG" }));
     DestroyWindow(w);
 }
