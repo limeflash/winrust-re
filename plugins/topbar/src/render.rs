@@ -10,6 +10,61 @@ use ui::bar::Net;
 use ui::quick_popup as qp;
 use winrust_common::style::{Side, Style};
 
+/// Hidden window and per-frame timings for the same surfaces used by the live UI.
+struct Bench {
+    hwnd: HWND,
+    draw: Vec<f64>,
+    end: Vec<f64>,
+    present: Vec<f64>,
+}
+
+impl Bench {
+    unsafe fn new() -> Self {
+        let hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, wide("STATIC").as_ptr(), null(), WS_POPUP,
+            -5000, -5000, 1, 1, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+        assert!(!hwnd.is_null(), "benchmark window creation failed: {}", GetLastError());
+        Self { hwnd, draw: Vec::new(), end: Vec::new(), present: Vec::new() }
+    }
+
+    fn record(&mut self, elapsed: std::time::Duration, end: std::time::Duration, present: std::time::Duration) {
+        self.draw.push(elapsed.saturating_sub(end).as_secs_f64() * 1000.0);
+        self.end.push(end.as_secs_f64() * 1000.0);
+        self.present.push(present.as_secs_f64() * 1000.0);
+    }
+
+    fn show(&self, surface: &ui::gfx::Surface, alpha: u8) {
+        assert!(surface.present(whwnd(self.hwnd), -5000, -5000, alpha), "UpdateLayeredWindow failed in benchmark");
+    }
+
+    fn report(&mut self, name: &str) {
+        fn stats(v: &mut [f64]) -> (f64, f64, f64) {
+            v.sort_by(f64::total_cmp);
+            (v.iter().sum::<f64>() / v.len() as f64, v[(v.len() * 95).div_ceil(100) - 1], v[v.len() - 1])
+        }
+        let (a, b, c) = (stats(&mut self.draw), stats(&mut self.end), stats(&mut self.present));
+        println!("{name:10} | {:7.3} {:7.3} {:7.3} | {:7.3} {:7.3} {:7.3} | {:7.3} {:7.3} {:7.3}", a.0, a.1, a.2, b.0, b.1, b.2, c.0, c.1, c.2);
+    }
+}
+
+impl Drop for Bench {
+    fn drop(&mut self) { unsafe { DestroyWindow(self.hwnd); } }
+}
+
+pub(crate) unsafe fn bench() {
+    // %TEMP%, not the working directory: %ProgramData% is redirected below and drivers write there too (NVIDIA's umdlogs)
+    let scratch = std::env::temp_dir().join(format!("topbar-bench-{}", std::process::id()));
+    std::fs::create_dir(&scratch).expect("create benchmark scratch directory");
+    // The benchmark is a separate process; all settings writes stay in its private scratch directory.
+    // SAFETY: single-threaded here, before any other thread exists that could read the environment.
+    unsafe { std::env::set_var("ProgramData", &scratch) };
+    i18n::style::set_anim(i18n::style::Anim::Full);
+    println!("surface    | draw mean     p95     max | EndDraw mean    p95     max | present mean    p95     max (ms)");
+    for name in ["bar", "settings", "start", "quick", "search", "taskview", "power-restart"] {
+        render_panel(&["unused.png".into(), name.into(), "width=2560".into(), "height=1440".into(), "bench".into()]);
+    }
+    std::fs::remove_dir_all(scratch).expect("remove benchmark scratch directory");
+}
+
 /// What the mockup's bar holds: name, colour of its indicators, windows, an exe whose icon stands in for the brand's.
 const APPS: [(&str, u32, usize, &str); 8] = [
     ("Claude", 0xe58a66, 1, r"C:\Windows\System32\mspaint.exe"),
@@ -300,6 +355,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     let Some(file) = args.first() else { return };
     let what = args.get(1).map_or("tray", String::as_str).to_string();
+    let benchmarking = args.iter().any(|a| a == "bench");
     let (mut style, mut side, mut scale, mut t, mut hover, mut n_icons, mut real, mut at) = (Style::Classic, Side::Bottom, 1.0f32, 5000u64, None, 6usize, false, 3i32);
     let (mut query, mut page, mut pins) = (String::new(), 0usize, 24usize);
     let (mut screen_w, mut screen_h) = (1440.0f32, 900.0f32);
@@ -353,7 +409,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let sandbox = what.starts_with("settings") || what == "toast";
     if sandbox {
         // SAFETY: single-threaded at this point; the process only ever reads these settings from its own scratch folder.
-        unsafe { std::env::set_var("ProgramData", std::env::temp_dir().join("topbar-render")) };
+        if !benchmarking { unsafe { std::env::set_var("ProgramData", std::env::temp_dir().join("topbar-render")) }; }
         i18n::set_lang(i18n::Lang::parse(lang_arg));
         i18n::style::set_style(style);
         i18n::style::set_side(side);
@@ -409,6 +465,22 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         jump: (what == "jumplist").then_some(at),
         ..Default::default()
     };
+    if benchmarking && what == "bar" {
+        let mut bench = Bench::new();
+        for i in 0..120 {
+            ui::gfx::bench_start();
+            let start = std::time::Instant::now();
+            let p = bar.frame(&view, &barui::Live { now: i * 4, ..lit });
+            let elapsed = start.elapsed();
+            let end = ui::gfx::bench_end();
+            let start = std::time::Instant::now();
+            bench.show(bar.surfaces().0, p.alpha);
+            if p.shadow.is_some() { bench.show(bar.surfaces().1, p.shadow_alpha); }
+            bench.record(elapsed, end, start.elapsed());
+        }
+        bench.report("bar");
+        return;
+    }
     bar.frame(&view, &barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() });
     bar.frame(&view, &lit);
     let p = bar.frame(&view, &barui::Live { now: 110_000, ..lit });
@@ -583,6 +655,23 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         };
         let mut popup = Popup::new(&mut gfx, content, anchor, 0, &mut grab);
         popup.set_hover(hover);
+        if benchmarking {
+            let mut bench = Bench::new();
+            for i in 0..120 {
+                ui::gfx::bench_start();
+                let start = std::time::Instant::now();
+                let shown = popup.frame(&mut gfx, i * 4);
+                let elapsed = start.elapsed();
+                let end = ui::gfx::bench_end();
+                let start = std::time::Instant::now();
+                if let Some((_, alpha)) = shown.scrim { bench.show(popup.scrim_surface(), alpha); }
+                if shown.shadow.2 > 0 && shown.shadow.3 > 0 { bench.show(popup.surfaces().1, shown.shadow_alpha); }
+                bench.show(popup.surfaces().0, shown.alpha);
+                bench.record(elapsed, end, start.elapsed());
+            }
+            bench.report(&what);
+            return;
+        }
         let _ = popup.frame(&mut gfx, 0); // the first frame stamps what opens with the panel (the rising blocks of the first page)
         if let Some(id) = click {
             // the panel at rest, a click on item `id`, then the frame `after` ms later (the ones in between run as the live timer does)
@@ -601,7 +690,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             blend(&mut canvas, (sw, sh), popup.scrim_surface().pixels(), r.2, (r.0, r.1), a);
         }
         blend(&mut canvas, (sw, sh), shade.pixels(), shown.shadow.2, (shown.shadow.0, shown.shadow.1), shown.shadow_alpha);
-        blend(&mut canvas, (sw, sh), panel.pixels(), shown.win.2, (shown.win.0, shown.win.1), 255);
+        blend(&mut canvas, (sw, sh), panel.pixels(), shown.win.2, (shown.win.0, shown.win.1), shown.alpha);
         blend(&mut canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha); // the bar stands above every panel
         if let Some((text, along, top)) = popup.tip() {
             let mut tip = ui::tip::Tip::new(scale, (sw, sh));

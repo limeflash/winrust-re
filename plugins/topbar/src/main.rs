@@ -37,6 +37,7 @@ mod ui;
 mod vdesk;
 mod wins;
 mod render;
+mod pacing;
 use ui::bar::{self as barui, keys::*};
 use {tray::*, status::*, run::*, shot::*, lang::*, settings::*, qs::*, wins::*};
 use windows::{
@@ -1546,7 +1547,7 @@ unsafe fn redraw(hwnd: HWND) {
     if p.gone {
         ShowWindow(hwnd, SW_HIDE); // not just moved away: a hidden bar cannot cover a game
         ShowWindow(shadow, SW_HIDE);
-        KillTimer(hwnd, 4);
+        pacing::set(hwnd as isize, false);
         return;
     }
     UI.with_borrow(|u| {
@@ -1568,11 +1569,7 @@ unsafe fn redraw(hwnd: HWND) {
     } else {
         ShowWindow(shadow, SW_HIDE);
     }
-    if p.busy || live.press != NONE {
-        SetTimer(hwnd, 4, 16, None);
-    } else {
-        KillTimer(hwnd, 4);
-    }
+    pacing::set(hwnd as isize, p.busy || live.press != NONE);
 }
 
 // ---------- input ----------
@@ -2321,7 +2318,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             InvalidateRect(hwnd, null(), 0); // the label shows the new language right away
         }
-        WM_TIMER if wp == 4 => redraw(hwnd), // next animation frame
+        pacing::FRAME => { if pacing::received(hwnd as isize) { redraw(hwnd); } }
         WIN_START => {
             ui::panel::forget_deact(); // a Win press right after Start closed (by losing the focus) must open it again
             start_toggle();
@@ -2442,6 +2439,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAYCHANGE => place(hwnd),
         WM_DESTROY => {
+            pacing::set(hwnd as isize, false);
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
             ab.hWnd = hwnd;
@@ -2476,6 +2474,10 @@ fn main() {
         // `topbar --render-panel <file.png> tray|lang|tip ...`: one popup panel (or the hint over a button) next to the bar, into a PNG
         if let Some(i) = std::env::args().position(|a| a == "--render-panel") {
             render::render_panel(&std::env::args().skip(i + 1).collect::<Vec<_>>());
+            return;
+        }
+        if std::env::args().any(|a| a == "--bench") {
+            render::bench();
             return;
         }
         // `topbar --render-thumbs <file.png>`: whether DWM thumbnails show in the windows the panels are made of (see render.rs)
