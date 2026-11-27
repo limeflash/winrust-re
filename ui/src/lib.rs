@@ -11,3 +11,4 @@ pub mod widgets;
 pub mod render;
 pub mod bench;
 pub mod selftest;
+pub mod probe;

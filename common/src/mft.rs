@@ -113,6 +113,36 @@ impl Drop for Volume {
     }
 }
 
+/// Tells `progress` how far a scan is, about 48 times in all: at the start, after every `step` records, and at the end.
+struct Pace {
+    total: u64,
+    step: u64,
+    next: u64,
+    last: Option<u64>,
+}
+
+impl Pace {
+    fn new(total: u64) -> Self {
+        Self { total, step: total.div_ceil(48).max(1), next: 0, last: None }
+    }
+
+    /// `read` records are done: reports when a step has been passed (`read` may jump over a sparse hole).
+    fn at(&mut self, read: u64, progress: &mut dyn FnMut(u64, u64)) {
+        if read >= self.next {
+            progress(read.min(self.total), self.total);
+            self.last = Some(read.min(self.total));
+            self.next = read.saturating_add(self.step);
+        }
+    }
+
+    /// The scan ended after `read` records: the last report is the whole table, whatever was reported before.
+    fn end(&mut self, read: u64, progress: &mut dyn FnMut(u64, u64)) {
+        if self.last != Some(read.min(self.total)) {
+            progress(read.min(self.total), self.total);
+        }
+    }
+}
+
 pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
     scan_with(drive, &mut |_, _| {})
 }
@@ -136,9 +166,8 @@ pub fn scan_with(drive: char, progress: &mut dyn FnMut(u64, u64)) -> Result<Hash
     // the ioctl already hands back a record with the fixups undone (raw reads below do not)
     let runs = data_runs(&rec0).ok_or_else(|| t!("в записи $MFT нет потоков $DATA", "no $DATA runs in the $MFT record", ja: "$MFT レコードに $DATA のランがありません", pt: "não há runs $DATA no registro $MFT", zh: "$MFT 记录里没有 $DATA 数据运行").to_string())?;
     let total = (vd.MftValidDataLength as u64) / rs as u64;
-    let step = total.div_ceil(48).max(1);
-    let mut next = step;
-    progress(0, total);
+    let mut pace = Pace::new(total);
+    pace.at(0, progress);
     let mut left = vd.MftValidDataLength as u64; // bytes of the table still to read
     let mut recs = HashMap::with_capacity(left as usize / rs / 2);
     let (mut idx, mut buf) = (0u32, vec![0u8; 4 << 20]);
@@ -146,7 +175,7 @@ pub fn scan_with(drive: char, progress: &mut dyn FnMut(u64, u64)) -> Result<Hash
     for (lcn, clusters) in runs {
         let mut len = (clusters * cl).min(left);
         left -= len;
-        if lcn == 0 { idx += (len / rs as u64) as u32; if u64::from(idx) >= next { progress(u64::from(idx).min(total), total); next = u64::from(idx).saturating_add(step); } continue; } // sparse hole
+        if lcn == 0 { idx += (len / rs as u64) as u32; pace.at(u64::from(idx), progress); continue; } // sparse hole
         let mut pos = (lcn * cl) as i64;
         while len > 0 {
             let want = len.min(buf.len() as u64) as usize;
@@ -159,12 +188,12 @@ pub fn scan_with(drive: char, progress: &mut dyn FnMut(u64, u64)) -> Result<Hash
                 parse_slot(&mut recs, idx, c);
                 idx += 1;
             }
-            if u64::from(idx) >= next { progress(u64::from(idx).min(total), total); next = u64::from(idx).saturating_add(step); }
+            pace.at(u64::from(idx), progress);
             pos += want as i64;
             len -= want as u64;
         }
     }
-    if u64::from(idx) < next && u64::from(idx) > 0 { progress(u64::from(idx).min(total), total); }
+    pace.end(u64::from(idx), progress);
     recs.retain(|_, r| !r.name.is_empty()); // no $FILE_NAME anywhere (e.g. attribute list in a record we never saw)
     eprintln!("mft: {seen} slots read, {magic} with FILE magic, {} named", recs.len());
     Ok(recs)
@@ -209,6 +238,32 @@ pub fn totals(recs: &HashMap<u32, Rec>, logical: bool) -> HashMap<u32, u64> {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+    #[test]
+    fn progress_is_about_48_steps_from_nothing_to_the_whole_table() {
+        // a table of 2,050,112 records read in chunks of 4,096, with a sparse hole in the middle
+        let total = 2_050_112u64;
+        let (mut pace, mut seen) = (Pace::new(total), Vec::new());
+        let mut note = |r: u64, t: u64| seen.push((r, t));
+        pace.at(0, &mut note);
+        let mut read = 0u64;
+        while read < total {
+            read = if read == 1_000_000 { 1_300_000 } else { (read + 4096).min(total) };
+            pace.at(read, &mut note);
+        }
+        pace.end(read, &mut note);
+        assert_eq!(seen.first(), Some(&(0, total)));
+        assert_eq!(seen.last(), Some(&(total, total)));
+        assert!((45..=52).contains(&seen.len()), "{} reports", seen.len());
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 == w[1].1), "never goes back");
+        // a table of one record still says where it started and that it ended
+        let (mut pace, mut one) = (Pace::new(1), Vec::new());
+        pace.at(0, &mut |r, t| one.push((r, t)));
+        pace.at(1, &mut |r, t| one.push((r, t)));
+        pace.end(1, &mut |r, t| one.push((r, t)));
+        assert_eq!(one.first(), Some(&(0, 1)));
+        assert_eq!(one.last(), Some(&(1, 1)));
+    }
+
     #[test]
     fn parsed_slots_match_with_and_without_progress() {
         fn run(progress: &mut dyn FnMut(u64, u64)) -> HashMap<u32, Rec> {

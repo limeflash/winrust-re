@@ -1082,6 +1082,7 @@ dependencies = [
  "windows",
  "windows-sys",
  "winrust-common",
+ "winrust-ui",
 ]
 
 [[package]]
