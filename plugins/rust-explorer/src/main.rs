@@ -253,6 +253,11 @@ const MENU_ZIP: u32 = 0x9001;
 const MENU_EXTRACT: u32 = 0x9002;
 const MENU_PIN: u32 = 0x9003;
 const MENU_RENAME: u32 = 0x9004;
+const MENU_OPEN: u32 = 0x9005;
+const MENU_RUNAS: u32 = 0x9006;
+const MENU_COPY_PATH: u32 = 0x9007;
+const MENU_PROPS: u32 = 0x9008;
+const MENU_DELETE: u32 = 0x9009;
 
 /// True while the window shows the inside of a .zip: read-only, its rows are no files on disk.
 fn in_zip() -> bool { zipx::split_zip(&cur_dir()).is_some() }
@@ -358,15 +363,33 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf], key: bool) {
     if zipx::split_zip(dir).is_some() { return zip_menu(h, paths); }
     // the bar draws it (and runs nothing here until it is chosen from); from the keyboard it opens at the selected row
     if shellmenu::offer(h, dir, paths, if key { shellmenu::row_at(selected().0) } else { None }) { return; }
-    let mut extra = vec![(MENU_ZIP, t!("Сжать в ZIP", "Compress to ZIP", ja: "ZIP に圧縮", pt: "Compactar em ZIP", zh: "压缩为 ZIP"))];
-    if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
-        extra.insert(0, (MENU_EXTRACT, t!("Извлечь сюда", "Extract here", ja: "ここに展開", pt: "Extrair aqui", zh: "解压到此处")));
+    // the bar is not there (or does not answer): a small menu of our own rows. Windows' own menu (7-Zip, Send to...) is not built here:
+    // asking the shell for it on this thread can hang the whole desktop, and `shellmenu::offer` is where it is asked, on a worker.
+    let mut extra: Vec<(u32, &str)> = vec![];
+    let one = paths.len() == 1;
+    if one { extra.push((MENU_OPEN, t!("Открыть", "Open", ja: "開く", pt: "Abrir", zh: "打开"))); }
+    if one && paths[0].extension().is_some_and(|e| ["exe", "lnk", "bat", "cmd", "msi"].iter().any(|x| e.eq_ignore_ascii_case(x))) {
+        extra.push((MENU_RUNAS, t!("Запуск от имени администратора", "Run as administrator", ja: "管理者として実行", pt: "Executar como administrador", zh: "以管理员身份运行")));
     }
+    if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
+        extra.push((MENU_EXTRACT, t!("Извлечь сюда", "Extract here", ja: "ここに展開", pt: "Extrair aqui", zh: "解压到此处")));
+    }
+    if !jobs::busy() { extra.push((MENU_ZIP, t!("Сжать в ZIP", "Compress to ZIP", ja: "ZIP に圧縮", pt: "Compactar em ZIP", zh: "压缩为 ZIP"))); }
+    extra.push((MENU_COPY_PATH, t!("Копировать как путь", "Copy as path", ja: "パスのコピー", pt: "Copiar como caminho", zh: "复制文件地址")));
     // the shell menu has no Rename here (it needs the shell's own folder view to answer it): the same edit box as F2
-    if paths.len() == 1 { extra.push((MENU_RENAME, t!("Переименовать", "Rename", ja: "名前の変更", pt: "Renomear", zh: "重命名"))); }
+    if one { extra.push((MENU_RENAME, t!("Переименовать", "Rename", ja: "名前の変更", pt: "Renomear", zh: "重命名"))); }
     if let [p] = paths { if p.is_dir() { extra.push((MENU_PIN, if ui::pins().contains(p) { t!("Открепить от быстрого доступа", "Unpin from Quick access", ja: "クイック アクセスからピン留めを解除", pt: "Desafixar do Acesso rápido", zh: "从快速访问取消固定") } else { t!("Закрепить в быстром доступе", "Pin to Quick access", ja: "クイック アクセスにピン留め", pt: "Fixar no Acesso rápido", zh: "固定到快速访问") })); } }
-    let picked = sh::show(h, paths, if jobs::busy() { &[] } else { &extra }).ok().flatten();
-    match picked {
+    if !in_zip() { extra.push((MENU_DELETE, t!("Удалить", "Delete", ja: "削除", pt: "Excluir", zh: "删除"))); }
+    if one { extra.push((MENU_PROPS, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性"))); }
+    match sh::own_menu(h, &extra) {
+        Some(MENU_OPEN) => unsafe { activate(h, paths[0].clone(), paths[0].is_dir()) },
+        Some(MENU_RUNAS) => unsafe {
+            let dir = paths[0].parent().map(|d| w(&d.to_string_lossy()));
+            ShellExecuteW(h, w("runas").as_ptr(), w(&paths[0].to_string_lossy()).as_ptr(), ptr::null(), dir.as_ref().map_or(ptr::null(), |d| d.as_ptr()), SW_SHOWNORMAL);
+        },
+        Some(MENU_COPY_PATH) => shellmenu::copy_paths_text(h, paths),
+        Some(MENU_PROPS) => properties(&paths[0]),
+        Some(MENU_DELETE) => { let _ = sh::fileop(h, sh::Op::Delete, paths, &dir.to_path_buf()); reload(h); }
         Some(MENU_PIN) => ui::toggle_pin(&paths[0]),
         Some(MENU_RENAME) => unsafe {
             let (list, ..) = selected();
@@ -814,7 +837,7 @@ fn search_focus() {
 
 /// Shell integration through COM (windows crate): file operations, context menu, drag and drop.
 mod sh {
-    use std::{cell::RefCell, ffi::c_void, os::windows::ffi::OsStrExt, path::PathBuf};
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::PathBuf};
     use windows::{core::*, Win32::{Foundation::*, System::{Com::*, DataExchange::RegisterClipboardFormatW, Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock}, Ole::*, SystemServices::MODIFIERKEYS_FLAGS}, UI::{Shell::{Common::ITEMIDLIST, *}, WindowsAndMessaging::*}}};
 
     #[derive(Clone, Copy)]
@@ -946,41 +969,11 @@ mod sh {
         }
     }
 
-    thread_local! { static CM2: RefCell<Option<IContextMenu2>> = const { RefCell::new(None) }; }
-
-    /// Forwards owner-draw / init-popup menu messages so submenus like "Send to" get filled in.
-    pub fn menu_msg(m: u32, wp: usize, lp: isize) -> bool {
-        CM2.with_borrow(|c| c.as_ref().is_some_and(|c| unsafe { c.HandleMenuMsg(m, WPARAM(wp), LPARAM(lp)).is_ok() }))
-    }
-
-    /// The real shell context menu for `paths`, so 7-Zip/Git/etc. entries show up. `extra` = our own items on top
-    /// (ids above the shell's range); returns the one picked, None when the shell handled the pick or nothing was picked.
     /// The name Windows shows for its own "Send to > Compressed (zipped) folder": the stem of the .ZFSendToTarget file in SendTo.
     pub(crate) fn system_zip_name() -> Option<String> {
         let dir = PathBuf::from(std::env::var_os("APPDATA")?).join(r"Microsoft\Windows\SendTo");
         let f = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ZFSendToTarget")))?;
         f.file_stem().map(|s| s.to_string_lossy().into_owned())
-    }
-
-    /// Takes Windows' own zip entry out of the menu: our "Compress to ZIP" is the one. (Menus of other zip tools, 7-Zip etc., stay.)
-    unsafe fn hide_system_zip(cm: &IContextMenu, menu: HMENU) {
-        use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, GetMenuItemCount, GetMenuStringW, GetSubMenu, MF_BYPOSITION};
-        let Some(name) = system_zip_name() else { return };
-        // WM_INITMENUPOPUP: the Send to submenu fills itself only when it is opened
-        if let Ok(c2) = cm.cast::<IContextMenu2>() { let _ = unsafe { c2.HandleMenuMsg(0x0117, WPARAM(menu.0 as usize), LPARAM(0)) }; }
-        unsafe fn strip(m: HMENU, name: &str) { unsafe {
-            for i in (0..GetMenuItemCount(Some(m)).max(0)).rev() {
-                let mut b = [0u16; 256];
-                let n = GetMenuStringW(m, i as u32, Some(&mut b), MF_BYPOSITION);
-                if String::from_utf16_lossy(&b[..n.max(0) as usize]).replace('&', "").eq_ignore_ascii_case(name) {
-                    let _ = DeleteMenu(m, i as u32, MF_BYPOSITION);
-                    continue;
-                }
-                let sub = GetSubMenu(m, i);
-                if !sub.is_invalid() { strip(sub, name); }
-            }
-        } }
-        unsafe { strip(menu, &name) };
     }
 
     unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> BOOL {
@@ -1019,72 +1012,22 @@ mod sh {
         });
     }
 
-    pub fn show(h: *mut c_void, paths: &[PathBuf], extra: &[(u32, &str)]) -> Result<Option<u32>> {
+    /// A small popup of our own rows (`extra`: id, text), at the pointer: the id picked, None when nothing was. It never asks the
+    /// shell for a context menu, which can hang (see `shellmenu`).
+    pub fn own_menu(h: *mut c_void, extra: &[(u32, &str)]) -> Option<u32> {
         unsafe {
             let hwnd = HWND(h);
-            let cm: IContextMenu = ui(hwnd, paths)?;
-            let menu = CreatePopupMenu()?;
-            cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
-            hide_system_zip(&cm, menu);
-            if !extra.is_empty() {
-                let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
-                for (id, text) in extra.iter().rev() {
-                    let t: Vec<u16> = text.encode_utf16().chain([0]).collect();
-                    let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, *id as usize, PCWSTR(t.as_ptr()));
-                }
+            let menu = CreatePopupMenu().ok()?;
+            for (id, text) in extra {
+                let t: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                let _ = AppendMenuW(menu, MF_STRING, *id as usize, PCWSTR(t.as_ptr()));
             }
-            CM2.set(cm.cast::<IContextMenu2>().ok());
             let mut pt = POINT::default();
-            GetCursorPos(&mut pt)?;
+            let _ = GetCursorPos(&mut pt);
             let id = TrackPopupMenuEx(menu, TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0, pt.x, pt.y, hwnd, None).0;
-            CM2.set(None);
-            if extra.iter().any(|e| e.0 as i32 == id) {
-                DestroyMenu(menu)?;
-                return Ok(Some(id as u32));
-            }
-            if id > 0 {
-                // ptInvoke: without it dialogs the shell opens ("Open with" > choose another app) land off screen
-                let ci = CMINVOKECOMMANDINFOEX {
-                    cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                    fMask: CMIC_MASK_PTINVOKE,
-                    hwnd,
-                    lpVerb: PCSTR((id - 1) as usize as *const u8),
-                    nShow: SW_SHOWNORMAL.0,
-                    ptInvoke: pt,
-                    ..Default::default()
-                };
-                let before = top_windows();
-                cm.InvokeCommand(&ci as *const _ as *const CMINVOKECOMMANDINFO)?;
-                keep_on_screen(before);
-            }
-            DestroyMenu(menu)?;
-            Ok(None)
+            let _ = DestroyMenu(menu);
+            u32::try_from(id).ok().filter(|i| *i > 0)
         }
-    }
-
-    #[cfg(test)]
-    pub fn menu_dump(paths: &[PathBuf]) -> Vec<String> {
-        use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID, GetMenuStringW, GetSubMenu, MF_BYPOSITION};
-        fn walk(m: HMENU, depth: usize, out: &mut Vec<String>) {
-            unsafe {
-                for i in 0..GetMenuItemCount(Some(m)).max(0) as u32 {
-                    let mut b = [0u16; 256];
-                    let n = GetMenuStringW(m, i, Some(&mut b), MF_BYPOSITION);
-                    out.push(format!("{}{} (id {})", "  ".repeat(depth), String::from_utf16_lossy(&b[..n.max(0) as usize]), GetMenuItemID(m, i as i32)));
-                    let sub = GetSubMenu(m, i as i32);
-                    if !sub.is_invalid() { walk(sub, depth + 1, out); }
-                }
-            }
-        }
-        let mut out = vec![];
-        unsafe {
-            let cm: IContextMenu = ui(HWND::default(), paths).unwrap();
-            let menu = CreatePopupMenu().unwrap();
-            cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok().unwrap();
-            hide_system_zip(&cm, menu);
-            walk(menu, 0, &mut out);
-        }
-        out
     }
 
     /// Starts an OLE drag of `paths` (blocks until dropped).
@@ -1355,8 +1298,6 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_DRAWITEM | WM_MEASUREITEM if menu::message(h, m, lp) => 1,
-            WM_INITMENUPOPUP if sh::menu_msg(m, wp, lp) => 0,
-            WM_DRAWITEM | WM_MEASUREITEM if sh::menu_msg(m, wp, lp) => 1,
             WM_NOTIFY => {
                 let nm = &*(lp as *const NMHDR);
                 let list = ST.with_borrow(|st| st.list);
@@ -1723,21 +1664,6 @@ mod tests {
         assert!(zip_names(&[z.join("top.txt"), d.join("f.txt")]).is_none(), "mixed selections are not archive selections");
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(real[0].parent().unwrap());
-    }
-
-    /// By hand (needs the real shell): `cargo test -p rust-explorer system_zip -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn system_zip_is_not_in_the_menu() {
-        sh::init();
-        let f = std::env::temp_dir().join("rx-menu-dump.txt");
-        std::fs::write(&f, "x").unwrap();
-        let menu = sh::menu_dump(&[f.clone()]);
-        let _ = std::fs::remove_file(f);
-        println!("{}", menu.join("
-"));
-        assert!(menu.iter().any(|l| l.contains("Se&nd to") || l.contains("Send to") || l.contains("&Delete") || l.contains("Delete")), "the menu is there");
-        if let Some(n) = sh::system_zip_name() { assert!(!menu.iter().any(|l| l.trim().starts_with(&n)), "{n} should be gone"); }
     }
 
     use super::*;
