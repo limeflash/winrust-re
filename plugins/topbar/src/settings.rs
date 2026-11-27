@@ -125,7 +125,7 @@ fn act(a: Act) {
     unsafe {
         match a {
             Act::Relook => relook(),
-            Act::Language => _ = InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0),
+            Act::Language => bars::invalidate_all(),
             Act::Tile => tile_windows(),
             Act::OpenLog => open_log(),
             Act::Restart => restart_bar(),
