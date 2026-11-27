@@ -4,7 +4,8 @@
 //! A card can be swiped away to the right, answered inline (if its source takes an answer) and has the buttons of its note.
 //!
 //! [`Stack`] is the windowless core (layout, painting into two surfaces, hit tests, the pointer and the keys); the functions at
-//! the bottom bind it to two real windows: one for the cards, which takes the mouse and never the focus (but for a reply being
+//! the bottom bind it to two real windows, both composed (DirectComposition, or layered with `WINRUST_ULW=1`): one for the cards,
+//! which takes the mouse over the cards only (it is cut to them, [`Stack::shape`]) and never the focus (but for a reply being
 //! typed), and under it one that holds the shadows and lets every click through.
 
 use std::cell::RefCell;
@@ -14,13 +15,13 @@ use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, KillTimer, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetTimer, SetWindowPos,
-    ShowWindow, WM_ACTIVATE, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER, WM_USER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    ShowWindow, WM_ACTIVATE, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER, WM_USER, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use winrust_common::style::{self, Side};
 
 use super::anim::{CubicBezier, EASE, POP, SPRING, lerp, timing};
-use super::gfx::{Align, Canvas, Font, Gfx, Picture, Rect, Rgba, Surface};
+use super::gfx::{self, Align, Canvas, Font, Gfx, Picture, Rect, Rgba, Rgn, Surface};
 use super::notice::{self as nc, Flavour, Hit, Measure, Parts, Tw, Tween};
 use super::panel::{Anchor, Cx};
 use crate::notify::{self, Note, Pop};
@@ -87,6 +88,8 @@ pub struct Stack {
     tw: Tw,
     surf: Surface,
     shade: Surface,
+    /// What of the cards' window catches the mouse (and shows): the cards as they are posed, device pixels in the window.
+    shape: Vec<Rgn>,
     /// What was behind the cards when they came up, until it is blurred; and the blurred picture with its device origin.
     cap: Option<Capture>,
     glass: Option<(Picture, i32, i32)>,
@@ -111,8 +114,9 @@ impl Stack {
             scale,
             anchor,
             tw: Tw::new(),
-            surf: Surface::new(),
-            shade: Surface::new(),
+            surf: Surface::composed(),
+            shade: Surface::composed(),
+            shape: Vec::new(),
             cap: None,
             glass: None,
             win: (0, 0, 0, 0),
@@ -136,6 +140,12 @@ impl Stack {
     #[must_use]
     pub const fn surfaces(&self) -> (&Surface, &Surface) {
         (&self.surf, &self.shade)
+    }
+
+    /// The click region of the cards' window: outside the cards it lets the mouse through to what is under it.
+    #[must_use]
+    pub fn shape(&self) -> &[Rgn] {
+        &self.shape
     }
 
     #[must_use]
@@ -189,6 +199,7 @@ impl Stack {
             self.hits.clear();
             self.glass = None;
             self.cap = None;
+            self.shape.clear();
             self.hover = None;
             self.parts.clear();
             self.pics.clear();
@@ -287,6 +298,15 @@ impl Stack {
             let r = c.rect;
             Rect::new(r.cx() + (r.x - r.cx()) * p.2 + p.1, r.cy() + (r.y - r.cy()) * p.2, r.w * p.2, r.h * p.2)
         };
+        self.shape = cards
+            .iter()
+            .zip(&posed)
+            .map(|(c, p)| {
+                let r = posed_rect(c, *p);
+                let dev = |v: f32| (v * s).round() as i32;
+                Rgn { x: dev(r.x), y: dev(r.y), w: dev(r.w), h: dev(r.h), r: dev(RADIUS) }
+            })
+            .collect();
         let _ = g.paint(&mut self.shade, shade_win.2, shade_win.3, |c| {
             for (card, p) in cards.iter().zip(&posed) {
                 let r = posed_rect(card, *p).shift(sh_pad.0, sh_pad.1);
@@ -526,11 +546,12 @@ pub fn init(hi: HINSTANCE, scale: f32, anchor: Anchor) -> bool {
     let (name, shade_name): (Vec<u16>, Vec<u16>) = ("topbar_notice\0".encode_utf16().collect(), "topbar_notice_shadow\0".encode_utf16().collect());
     super::panel::register_class(hi, &name, Some(proc), true);
     super::panel::register_class(hi, &shade_name, Some(DefWindowProcW), false);
-    let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+    let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | gfx::window_ex();
+    let through = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | gfx::window_ex_through();
     // SAFETY: window creation with live, NUL-terminated class names.
     let (wnd, shade) = unsafe {
         let make = |ex: u32, class: &[u16]| CreateWindowExW(ex, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null());
-        (make(ex, &name), make(ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, &shade_name))
+        (make(ex, &name), make(through, &shade_name))
     };
     if wnd.is_null() || shade.is_null() {
         // SAFETY: our own windows, whichever of the two was made.
@@ -541,6 +562,7 @@ pub fn init(hi: HINSTANCE, scale: f32, anchor: Anchor) -> bool {
         }
         return false;
     }
+    gfx::through(super::panel::whwnd(shade));
     HOST.set(Some(Host { stack: Stack::new(scale, anchor), gfx, wnd, shade, grab: Surface::new(), up: false, timer: false, last_win: (0, 0, 0, 0) }));
     true
 }
@@ -586,7 +608,10 @@ impl Host {
             let (surf, shade) = self.stack.surfaces();
             let s = super::panel::whwnd(self.shade);
             let _ = shade.present(s, shown.shade.0, shown.shade.1, 255);
+            // the cards' window is cut to the cards before the frame that shows them
+            gfx::shape(super::panel::whwnd(self.wnd), Some(self.stack.shape()));
             let _ = surf.present(super::panel::whwnd(self.wnd), shown.win.0, shown.win.1, 255);
+            gfx::commit();
             if !self.up {
                 self.up = true;
                 self.raise();
@@ -777,6 +802,12 @@ mod tests {
         assert!(st.surfaces().0.pixels().iter().any(|p| p >> 24 != 0) && st.surfaces().1.pixels().iter().any(|p| p >> 24 != 0));
         let settled = st.frame(&mut g, 4000, &mut grab);
         assert!(settled.visible && !settled.busy, "at rest they only wait for their time");
+        // the window catches the mouse over the cards only: one rounded part each, the cards' own boxes once they stand still
+        assert_eq!(st.shape().len(), 3);
+        for (part, c) in st.shape().iter().zip(&st.cards) {
+            assert_eq!((part.x, part.y, part.w, part.h), (c.rect.x.round() as i32, c.rect.y.round() as i32, c.rect.w.round() as i32, c.rect.h.round() as i32));
+            assert!(part.r > 0 && part.x + part.w <= settled.win.2 && part.y + part.h <= settled.win.3);
+        }
         // the x of the lowest card sends it off; a moment later it is gone and the others stay
         let last = ids[3];
         notify::with(|s| s.pop_off(last, 4000));
@@ -788,6 +819,41 @@ mod tests {
         assert_eq!(st.cards.len(), 2);
         notify::with(|s| ids.iter().for_each(|&i| s.dismiss(i, 5000)));
         assert!(!st.frame(&mut g, 5000, &mut grab).visible, "nothing left to show");
+        assert!(st.shape().is_empty());
+        notify::with(|s| *s = notify::Store::new());
+    }
+
+    #[test]
+    fn the_composed_cards_window_is_cut_to_the_cards() {
+        use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion};
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        if !gfx::compose_windows() {
+            return; // no DirectComposition on this machine: the layered path is the one that runs
+        }
+        let mut g = Gfx::new(1.0).unwrap();
+        notify::with(|s| *s = notify::Store::new());
+        notify::with(|s| s.push(note("n"), 1000));
+        let mut st = Stack::new(1.0, anchor());
+        let mut grab = |_x: i32, _y: i32, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
+        let shown = st.frame(&mut g, 4000, &mut grab);
+        // SAFETY: a popup that is never shown, destroyed again below.
+        unsafe {
+            let hw = CreateWindowExW(gfx::window_ex(), "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!hw.is_null());
+            assert!(st.surfaces().0.present(super::super::panel::whwnd(hw), shown.win.0, shown.win.1, 255), "the cards did not reach the window's visual");
+            gfx::shape(super::super::panel::whwnd(hw), Some(st.shape()));
+            gfx::commit();
+            assert!(st.surfaces().0.pixels().is_empty(), "a composed frame lives on the GPU, not in a DIB");
+            let rgn = CreateRectRgn(0, 0, 0, 0);
+            assert!(GetWindowRgn(hw, rgn) > 1, "the window has a region");
+            let c = st.cards[0].rect;
+            assert!(PtInRegion(rgn, (c.x + c.w / 2.0) as i32, (c.y + c.h / 2.0) as i32) != 0, "a card catches the mouse");
+            assert!(PtInRegion(rgn, 2, 2) == 0 && PtInRegion(rgn, (c.x + c.w + 40.0) as i32, (c.y + c.h / 2.0) as i32) == 0, "the room round the cards lets it through");
+            DeleteObject(rgn);
+            DestroyWindow(hw);
+        }
+        gfx::compose_off();
         notify::with(|s| *s = notify::Store::new());
     }
 
