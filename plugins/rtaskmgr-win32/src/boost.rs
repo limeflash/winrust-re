@@ -42,6 +42,7 @@ impl Id {
             Id::Dns => "dns",
         }
     }
+    #[cfg_attr(not(test), allow(dead_code))] // only the test of the keys reads it
     pub fn from_key(k: &str) -> Option<Id> {
         ALL.iter().copied().find(|i| i.key() == k)
     }

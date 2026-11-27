@@ -109,6 +109,13 @@ impl ResCache {
         Self { map, tx, generic_icon }
     }
 
+    /// Puts what is known of a file in (the made-up apps of the demo): `get` answers at once and reads nothing.
+    pub fn seed(&self, path: &str, r: Res) {
+        if let Ok(mut g) = self.map.lock() {
+            g.insert(path.to_lowercase(), Some(r));
+        }
+    }
+
     /// Готовые данные или None (и запрос в очередь, если ещё не запрашивали).
     pub fn get(&self, path: &str) -> Option<Res> {
         let key = path.to_lowercase();
