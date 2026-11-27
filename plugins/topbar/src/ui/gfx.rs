@@ -76,14 +76,18 @@ use windows::core::{HSTRING, IUnknown, Interface, Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
 use super::svg::{self, Seg};
+use winrust_common::style;
 
-/// A straight-alpha colour (D2D premultiplies for the target).
+/// A straight-alpha colour (D2D premultiplies for the target). A colour written as one of the design's dark literals (`css`, `hex`)
+/// or as the ink (`white`) also remembers which colour token it is: while light mode is on, it is drawn as the token's light value
+/// (`style::TOKENS`), with its own alpha. `r`, `g`, `b` are always the dark-mode value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgba {
     pub r: f32,
     pub g: f32,
     pub b: f32,
     pub a: f32,
+    tok: u8,
 }
 
 impl Rgba {
@@ -91,19 +95,20 @@ impl Rgba {
 
     #[must_use]
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
+        Self { r, g, b, a, tok: 0 }
     }
 
     /// `0xRRGGBB` as written in the design.
     #[must_use]
     pub const fn hex(rgb: u32) -> Self {
-        Self::new(((rgb >> 16) & 255) as f32 / 255.0, ((rgb >> 8) & 255) as f32 / 255.0, (rgb & 255) as f32 / 255.0, 1.0)
+        let c = Self::new(((rgb >> 16) & 255) as f32 / 255.0, ((rgb >> 8) & 255) as f32 / 255.0, (rgb & 255) as f32 / 255.0, 1.0);
+        Self { tok: style::token((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8), ..c }
     }
 
     /// CSS `rgba(r, g, b, a)` as written in the design.
     #[must_use]
     pub const fn css(r: u8, g: u8, b: u8, a: f32) -> Self {
-        Self::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a)
+        Self { tok: style::token(r, g, b), ..Self::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a) }
     }
 
     /// A GDI `COLORREF` (`0x00BBGGRR`, what `winrust_common::style::pal()` hands out).
@@ -112,9 +117,21 @@ impl Rgba {
         Self::new((c & 255) as f32 / 255.0, ((c >> 8) & 255) as f32 / 255.0, ((c >> 16) & 255) as f32 / 255.0, 1.0)
     }
 
-    /// White at `a`: every hover and pressed fill of the design is `rgba(255,255,255,a)`.
+    /// The ink at `a`: every hover and pressed fill of the design is `rgba(var(--ink),a)`, white in dark mode, near-black in light.
     #[must_use]
     pub const fn white(a: f32) -> Self {
+        Self { tok: style::INK_TOKEN, ..Self::new(1.0, 1.0, 1.0, a) }
+    }
+
+    /// Selected labels: white in dark mode, `--t1` in light (the design's `#fff` that became a text token).
+    #[must_use]
+    pub const fn strong(a: f32) -> Self {
+        Self { tok: style::STRONG_TOKEN, ..Self::new(1.0, 1.0, 1.0, a) }
+    }
+
+    /// White that stays white in both modes (`#fff` on an accent fill, the recording's red): the design's few literal whites.
+    #[must_use]
+    pub const fn pure_white(a: f32) -> Self {
         Self::new(1.0, 1.0, 1.0, a)
     }
 
@@ -129,15 +146,33 @@ impl Rgba {
         Self { a: self.a * k.clamp(0.0, 1.0), ..self }
     }
 
-    /// Linear blend; `t = 0` is `self`.
+    /// Linear blend of what is drawn (the mode's values); `t = 0` is `self`.
     #[must_use]
     pub fn mix(self, o: Rgba, t: f32) -> Self {
+        let (s, o) = (self.themed(), o.themed());
         let l = |a: f32, b: f32| a + (b - a) * t;
-        Self::new(l(self.r, o.r), l(self.g, o.g), l(self.b, o.b), l(self.a, o.a))
+        Self::new(l(s.r, o.r), l(s.g, o.g), l(s.b, o.b), l(s.a, o.a))
+    }
+
+    /// The colour as it is drawn now: a token's value in the current mode, the colour itself when it has none; no token left.
+    #[must_use]
+    pub fn themed(self) -> Self {
+        if style::light() { self.in_light() } else { Self { tok: 0, ..self } }
+    }
+
+    /// The colour in light mode (what `themed` gives while it is on).
+    #[must_use]
+    pub fn in_light(self) -> Self {
+        if self.tok == 0 {
+            return self;
+        }
+        let v = style::TOKENS[self.tok as usize - 1].1;
+        Self::new(((v >> 16) & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, (v & 255) as f32 / 255.0, self.a)
     }
 
     fn d2d(self) -> D2D1_COLOR_F {
-        D2D1_COLOR_F { r: self.r, g: self.g, b: self.b, a: self.a }
+        let c = self.themed();
+        D2D1_COLOR_F { r: c.r, g: c.g, b: c.b, a: c.a }
     }
 }
 
@@ -1748,6 +1783,7 @@ impl Canvas<'_> {
 
     /// CSS `box-shadow: 0 <dy>px <blur>px <c>` under a rounded rectangle. The blurred shape is cached per size.
     pub fn shadow(&mut self, r: Rect, radius: f32, dy: f32, blur: f32, c: Rgba) {
+        let c = c.themed(); // the cache below is keyed by the colour that is drawn
         if c.a <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
@@ -2236,9 +2272,27 @@ mod tests {
     fn frame(g: &mut Gfx, s: &mut Surface) {
         g.paint(s, 64, 32, |c| {
             c.fill(Rect::new(4.0, 4.0, 40.0, 20.0), 6.0, Rgba::hex(0x3366cc).alpha(0.8));
-            c.text("Ab", Rect::new(6.0, 4.0, 40.0, 20.0), Font::new(13.0, 600), Rgba::white(1.0), Align::Start);
+            c.text("Ab", Rect::new(6.0, 4.0, 40.0, 20.0), Font::new(13.0, 600), Rgba::pure_white(1.0), Align::Start);
         })
         .expect("a frame");
+    }
+
+    #[test]
+    fn a_dark_literal_becomes_its_light_token_and_keeps_its_alpha() {
+        let near = |a: Rgba, b: Rgba| (a.r - b.r).abs() < 0.002 && (a.g - b.g).abs() < 0.002 && (a.b - b.b).abs() < 0.002 && a.a == b.a;
+        assert!(near(Rgba::css(236, 238, 244, 0.5).in_light(), Rgba::css(27, 29, 35, 0.5)), "--t1");
+        assert!(near(Rgba::hex(0x2c2d34).in_light(), Rgba::hex(0xe6e7e9)), "--h2c2d34");
+        assert!(near(Rgba::css(16, 17, 24, 0.9).in_light(), Rgba::css(243, 244, 246, 0.9)), "--s16_17_24");
+        assert!(near(Rgba::white(0.1).in_light(), Rgba::css(20, 22, 30, 0.1)), "the ink");
+        assert!(near(Rgba::strong(1.0).in_light(), Rgba::css(27, 29, 35, 1.0)), "white that is --t1");
+        // literals stay: shadows, white on accent fills, the accent, text on it, colours of the system
+        for c in [Rgba::css(0, 0, 0, 0.5), Rgba::pure_white(1.0), Rgba::hex(0xffffff), Rgba::hex(0x62a0ea), Rgba::css(11, 18, 32, 1.0), Rgba::colorref(0x00_f1_f2_f4)] {
+            assert_eq!(c.in_light(), c);
+        }
+        // a colour that kept its token through `alpha` and `fade`, and loses it when mixed (the blend is of what is drawn)
+        assert!(near(Rgba::white(1.0).alpha(0.3).fade(0.5).in_light(), Rgba::css(20, 22, 30, 0.15)));
+        // dark mode draws the literal itself
+        assert_eq!(Rgba::css(236, 238, 244, 0.5).themed(), Rgba::new(236.0 / 255.0, 238.0 / 255.0, 244.0 / 255.0, 0.5));
     }
 
     #[test]

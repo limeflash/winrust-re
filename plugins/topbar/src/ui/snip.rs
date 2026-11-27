@@ -941,8 +941,8 @@ impl Snip {
             && m.rect.contains(p)
         {
                 let (x, y) = ((p.0 - m.rect.l) as f32 / m.scale, (p.1 - m.rect.t) as f32 / m.scale);
-                c.fill(Rect::new(0.0, y, w, 1.0), 0.0, Rgba::white(0.35));
-                c.fill(Rect::new(x, 0.0, 1.0, h), 0.0, Rgba::white(0.35));
+                c.fill(Rect::new(0.0, y, w, 1.0), 0.0, Rgba::pure_white(0.35));
+                c.fill(Rect::new(x, 0.0, 1.0, h), 0.0, Rgba::pure_white(0.35));
                 let text = format!("{} , {}", p.0 - m.rect.l, p.1 - m.rect.t);
                 let tw = c.measure(&text, F_COORD) + 16.0;
                 let r = Rect::new((x + 14.0).min(w - 110.0), (y + 14.0).min(h - 30.0), tw, 22.0);
@@ -956,7 +956,7 @@ impl Snip {
                 // `inset:-3px; border: 3px solid accent; border-radius: 17px`
                 c.ring(r.inset(-3.0), 17.0, 3.0, acc);
             } else {
-                c.dashed_rect(r.inset(-0.25), 1.5, 3.0, 2.0, Rgba::white(0.9));
+                c.dashed_rect(r.inset(-0.25), 1.5, 3.0, 2.0, Rgba::pure_white(0.9));
             }
             if self.editable() {
                 for (_, fx, fy) in HANDLES {
@@ -964,14 +964,14 @@ impl Snip {
                     let hr = Rect::new(hx - 5.0, hy - 5.0, 10.0, 10.0);
                     c.outside(hr, 3.0, |c| c.shadow(hr, 3.0, 2.0, 6.0, Rgba::css(0, 0, 0, 0.4)));
                     c.fill(hr.inset(-1.5), 4.0, acc);
-                    c.fill(hr, 3.0, Rgba::white(1.0));
+                    c.fill(hr, 3.0, Rgba::pure_white(1.0));
                 }
             }
             if let Some(at) = self.flash {
                 let t = prog(at, now, 320);
                 // `shFlash`: 0 -> .75 -> 0, `ease` for each part
                 let a = if t < 0.25 { EASE.ease(t / 0.25) * 0.75 } else { 0.75 * (1.0 - EASE.ease((t - 0.25) / 0.75)) };
-                c.fill(r, if window_look { 14.0 } else { 0.0 }, Rgba::white(a));
+                c.fill(r, if window_look { 14.0 } else { 0.0 }, Rgba::pure_white(a)); // `.shflash`: #fff
             }
             if let Some(l) = lay.label {
                 c.fill(l, 7.0, PLATE);
@@ -1036,14 +1036,14 @@ impl Snip {
         }
         if let Some(r) = lay.rect_of(Ctl::Go) {
             let hov = self.val(Ani::Hover(Ctl::Go), now);
-            let ink = if self.opts.kind == Kind::Rec { Rgba::white(1.0) } else { Rgba::hex(0x0b1220) };
+            let ink = if self.opts.kind == Kind::Rec { Rgba::pure_white(1.0) } else { Rgba::hex(0x0b1220) };
             let bg = if self.opts.kind == Kind::Rec { RED } else { acc };
             c.fill(r, 9.0, bg);
             if hov > 0.001 {
                 c.fill(r, 9.0, Rgba::white(0.10 * hov)); // `filter: brightness(1.1)`
             }
             if self.opts.kind == Kind::Rec {
-                c.circle(r.x + 10.0 + 5.0, r.cy(), 5.0, Rgba::white(1.0));
+                c.circle(r.x + 10.0 + 5.0, r.cy(), 5.0, Rgba::pure_white(1.0));
                 c.text(rec_label(), Rect::new(r.x + 10.0 + 10.0 + 8.0, r.y, r.w, r.h), F_GO, ink, Align::Start);
                 enter(c, r, Rgba::css(0, 0, 0, 0.2), ink);
             } else {
@@ -1065,7 +1065,7 @@ impl Snip {
         c.fill(kt, 9.0, if self.opts.kind == Kind::Rec { RED } else { Rgba::white(0.12) });
         for k in KINDS {
             let Some(r) = lay.rect_of(Ctl::Kind(k)) else { continue };
-            let ink = DIM_INK.mix(Rgba::white(1.0), self.val(Ani::Tint(Ctl::Kind(k)), now));
+            let ink = DIM_INK.mix(if k == Kind::Rec { Rgba::pure_white(1.0) } else { Rgba::strong(1.0) }, self.val(Ani::Tint(Ctl::Kind(k)), now));
             if k == Kind::Shot {
                 c.icon(I_SHOT, (r.cx(), r.cy()), 17.0, 1.9, ink, 0.0);
             } else {
@@ -1083,7 +1083,7 @@ impl Snip {
         c.inset_edge(mt, 9.0, 1.0, Rgba::white(0.1));
         for md in MODES {
             let Some(r) = lay.rect_of(Ctl::Mode(md)) else { continue };
-            let ink = DIM_INK.mix(Rgba::white(1.0), self.val(Ani::Tint(Ctl::Mode(md)), now));
+            let ink = DIM_INK.mix(Rgba::strong(1.0), self.val(Ani::Tint(Ctl::Mode(md)), now));
             let label = mode_label(md);
             let tw = c.measure(label, F_MODE);
             let x = r.cx() - (15.0 + 7.0 + tw) / 2.0;
@@ -1126,7 +1126,7 @@ impl Snip {
             let k = self.ani.get(&Ani::Switch(n)).map_or(f32::from(on), |t| t.value(now));
             let track = Rect::new(r.x + r.w - 10.0 - 34.0, r.cy() - 10.0, 34.0, 20.0);
             c.fill(track, 10.0, Rgba::white(0.16).mix(acc, k));
-            c.circle(track.x + 2.0 + 8.0 + 14.0 * k, track.cy(), 8.0, Rgba::white(1.0));
+            c.circle(track.x + 2.0 + 8.0 + 14.0 * k, track.cy(), 8.0, Rgba::pure_white(1.0));
         }
         let rows = self.opts.switches().len() as f32;
         let dy = pop.y + 32.0 + 44.0 * rows;
@@ -1141,7 +1141,7 @@ impl Snip {
             if on {
                 c.fill(r, 7.0, Rgba::white(0.14));
             }
-            c.text(wait_label(n, self.opts.kind), r, F_SEG, if on { Rgba::white(1.0) } else { DIM_INK }, Align::Center);
+            c.text(wait_label(n, self.opts.kind), r, F_SEG, if on { Rgba::strong(1.0) } else { DIM_INK }, Align::Center);
         }
         // the shortcut footer
         let fy = dy + 44.0 + 4.0;
@@ -1222,7 +1222,7 @@ pub fn paint_count(c: &mut Canvas<'_>, size: f32, n: u32, since: u64, now: u64) 
     c.faded(a, |c| {
         c.transformed(r.cx(), r.cy(), k, 0.0, 0.0, |c| {
             c.fill(r, 60.0, Rgba::css(12, 13, 18, 0.7));
-            c.text(&n.to_string(), r, Font::new(56.0, 600), Rgba::white(1.0), Align::Center);
+            c.text(&n.to_string(), r, Font::new(56.0, 600), Rgba::pure_white(1.0), Align::Center);
         });
     });
 }
@@ -1337,8 +1337,8 @@ fn pill(c: &mut Canvas<'_>, v: &RecView, now: u64) {
                 if v.hot > 0.001 {
                     c.fill(stop, 16.0, Rgba::white(0.10 * v.hot));
                 }
-                c.fill(Rect::new(stop.x + 10.0, stop.cy() - 5.0, 10.0, 10.0), 2.5, Rgba::white(1.0));
-                c.text(stop_label(), Rect::new(stop.x + 27.0, stop.y, stop.w, stop.h), F_GO, Rgba::white(1.0), Align::Start);
+                c.fill(Rect::new(stop.x + 10.0, stop.cy() - 5.0, 10.0, 10.0), 2.5, Rgba::pure_white(1.0));
+                c.text(stop_label(), Rect::new(stop.x + 27.0, stop.y, stop.w, stop.h), F_GO, Rgba::pure_white(1.0), Align::Start);
             });
         });
     });

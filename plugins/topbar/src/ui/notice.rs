@@ -252,7 +252,7 @@ pub fn app_icon(c: &mut Canvas<'_>, icon: &AppIcon, r: Rect, opacity: f32) {
         }
         AppIcon::Plate(d, from, to) => {
             c.gradient_diagonal(r, r.w * 0.25, Rgba::hex(*from).fade(opacity), Rgba::hex(*to).fade(opacity));
-            c.icon(d, (r.cx(), r.cy()), r.w * 0.72, 2.0, Rgba::white(opacity), 0.0);
+            c.icon(d, (r.cx(), r.cy()), r.w * 0.72, 2.0, Rgba::pure_white(opacity), 0.0); // `stroke="#fff"` on a coloured plate
         }
         AppIcon::Exe(path) => {
             let ic = exe_icon(path);
@@ -384,7 +384,7 @@ pub fn parts(n: &Note, flavour: Flavour, w: f32, replying: bool, now: u64, m: &m
 /// The round letter (`.avatar`).
 pub fn avatar(c: &mut Canvas<'_>, a: &notify::Avatar, r: Rect, size: f32) {
     c.gradient_diagonal(r, r.w / 2.0, Rgba::hex(a.from), Rgba::hex(a.to));
-    c.text(&a.letter.to_string(), r, Font::new(size, 600), Rgba::white(1.0), Align::Center);
+    c.text(&a.letter.to_string(), r, Font::new(size, 600), Rgba::pure_white(1.0), Align::Center);
 }
 
 /// The unread dot and the title, nowrap with an ellipsis.
@@ -432,12 +432,12 @@ pub fn picture(c: &mut Canvas<'_>, pics: &Pictures, path: &str, r: Rect) {
 pub fn video_badge(c: &mut Canvas<'_>, n: &Note, r: Rect) {
     let Some(len) = n.video.as_deref() else { return };
     c.fill(Rect::new(r.cx() - 17.0, r.cy() - 17.0, 34.0, 34.0), 17.0, Rgba::css(12, 13, 18, 0.72));
-    c.glyph("M8 5v14l11-7z", (r.cx(), r.cy()), 13.0, Rgba::white(1.0));
+    c.glyph("M8 5v14l11-7z", (r.cx(), r.cy()), 13.0, Rgba::pure_white(1.0));
     let f = Font::new(11.0, 600).tabular();
     let w = c.measure(len, f) + 12.0;
     let chip = Rect::new(r.x + r.w - 6.0 - w, r.y + r.h - 6.0 - 18.0, w, 18.0);
     c.fill(chip, 5.0, Rgba::css(12, 13, 18, 0.78));
-    c.text(len, chip, f, Rgba::white(1.0), Align::Center);
+    c.text(len, chip, f, Rgba::pure_white(1.0), Align::Center);
 }
 
 /// `.ncr`: the field an answer is typed in, with the caret and the send button.
@@ -467,7 +467,7 @@ pub fn reply_field(c: &mut Canvas<'_>, tw: &mut dyn Tween, hov: Option<Hit>, id:
             let full = !text.trim().is_empty();
             let down = hot(tw, hov, Hit::Send(id), 0, 160);
             let bg = Rgba::white(0.08).mix(accent(), f32::from(full));
-            c.fill(send, 8.0, bg.mix(Rgba::white(bg.a.max(0.2)), 0.12 * down * f32::from(full)));
+            c.fill(send, 8.0, bg.mix(Rgba::pure_white(bg.a.max(0.2)), 0.12 * down * f32::from(full)));
             c.icon(SEND, (send.cx(), send.cy()), 14.0, 2.2, if full { ON_ACCENT } else { NUMB }, 0.0);
         });
     });

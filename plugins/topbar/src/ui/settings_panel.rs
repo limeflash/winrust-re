@@ -535,9 +535,9 @@ impl SettingsPanel {
             b.put(COLOR_ROW + i as i32, Rect::new(PAD, y, CW, 40.0), K::ColorRow { i, open });
             if open {
                 for (k, &hex) in CHIPS.iter().take(11).enumerate() {
-                    b.put(CHIP + (i * 20 + k) as i32, Rect::new(50.0 + k as f32 * 30.0, y + 42.0, 24.0, 24.0), K::Chip { i, hex });
+                    b.put(CHIP + (i * 20 + k) as i32, Rect::new(50.0 + k as f32 * 30.0, y + 42.0, 24.0, 24.0), K::Chip { i, hex: chip(hex) });
                 }
-                b.put(CHIP + (i * 20 + 11) as i32, Rect::new(50.0, y + 72.0, 24.0, 24.0), K::Chip { i, hex: CHIPS[11] });
+                b.put(CHIP + (i * 20 + 11) as i32, Rect::new(50.0, y + 72.0, 24.0, 24.0), K::Chip { i, hex: chip(CHIPS[11]) });
                 let theme = t!("Как в теме", "Theme", ja: "テーマ", pt: "Tema", zh: "主题");
                 let w = m(theme, Font::new(11.0, 400)).ceil() + 16.0;
                 b.put(CHIP + (i * 20 + 12) as i32, Rect::new(80.0, y + 72.0, w, 24.0), K::ChipReset(theme));
@@ -787,6 +787,15 @@ fn colorref(hex: u32) -> u32 {
     ((hex >> 16) & 255) | (hex & 0xff00) | ((hex & 255) << 16)
 }
 
+/// A swatch as it is in the current mode: the design's dark literals are colour tokens, so in light mode the first swatches
+/// are the light surfaces and the text shades (and what a click stores is what is shown).
+fn chip(hex: u32) -> u32 {
+    match style::token((hex >> 16) as u8, (hex >> 8) as u8, hex as u8) {
+        0 => hex,
+        t => style::token_rgb(t),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // painting
 
@@ -912,9 +921,9 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
             c.faded(e.0, |c| {
                 c.transformed(cx, cy, k, 0.0, 0.0, |c| {
                     if sel {
-                        c.ring(Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), 11.0, 1.5, Rgba::white(1.0));
+                        c.ring(Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), 11.0, 1.5, Rgba::pure_white(1.0));
                     }
-                    c.circle(cx, cy, 8.0, Rgba::hex(*hex));
+                    c.circle(cx, cy, 8.0, Rgba::colorref(colorref(*hex))); // already the mode's value (see `chip`)
                     c.ring(Rect::new(cx - 8.0, cy - 8.0, 16.0, 16.0), 8.0, 0.75, Rgba::white(0.2));
                 });
             });
@@ -993,7 +1002,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
                 if *red {
                     let k = 1.0 + 0.15 * hot;
                     c.fill(r, 12.0, Rgba::new((RED.r * k).min(1.0), (RED.g * k).min(1.0), (RED.b * k).min(1.0), 1.0));
-                    c.text(label, r, Font::new(13.0, 600), Rgba::white(1.0), Align::Center);
+                    c.text(label, r, Font::new(13.0, 600), Rgba::pure_white(1.0), Align::Center);
                 } else {
                     c.fill(r, 12.0, Rgba::white(0.07).mix(Rgba::white(0.09), hot));
                     c.text(label, r, MEDIUM, INK, Align::Center);
@@ -1148,7 +1157,7 @@ fn switch(c: &mut Canvas<'_>, f: &mut Frame<'_>, key: i32, (x, y): (f32, f32), o
     let k = f.tween(key, 1, f32::from(on), 160, EASE);
     let slide = f.tween(key, 2, f32::from(on), 180, SPRING);
     c.fill(Rect::new(x, y, 36.0, 20.0), 10.0, Rgba::white(0.16).mix(accent, k));
-    c.circle(x + 2.0 + 8.0 + 16.0 * slide, y + 10.0, 8.0, Rgba::white(1.0));
+    c.circle(x + 2.0 + 8.0 + 16.0 * slide, y + 10.0, 8.0, Rgba::pure_white(1.0));
 }
 
 fn draw_preview(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, d: &Dc<'_>) {
@@ -1385,7 +1394,7 @@ impl Content for SettingsPanel {
             }
             i if (CHIP..CHIP + 140).contains(&i) => {
                 let (row, k) = (((i - CHIP) / 20) as usize, ((i - CHIP) % 20) as usize);
-                style::set_custom_color(row, CHIPS.get(k).map(|&h| colorref(h)));
+                style::set_custom_color(row, CHIPS.get(k).map(|&h| colorref(chip(h))));
                 self.relook(cx);
             }
             i if (OPACITY..OPACITY + 5).contains(&i) => {
