@@ -426,7 +426,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut screen_w, mut screen_h) = (1440.0f32, 900.0f32);
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
-    let mut dir_arg = "";
+    let (mut dir_arg, mut mode_arg) = ("", "auto"); // `mode=light|dark|auto`: what the Appearance row shows (the picture itself is `light` or not)
     let (mut apps_on, mut other_bars, mut one_display) = (String::new(), String::new(), false); // the bar page's monitor rows
     let (mut click, mut after, mut busy, mut per_monitor) = (None::<i32>, 0u64, false, false);
     // the notification centre (`calendar`) and the pop-ups (`popups`): what is in the store
@@ -454,6 +454,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("op", v)) => opacity = v.parse().unwrap_or(85),
             Some(("accent", v)) => accent = Box::leak(v.to_string().into_boxed_str()),
             Some(("dir", v)) => dir_arg = Box::leak(v.to_string().into_boxed_str()),
+            Some(("mode", v)) => mode_arg = Box::leak(v.to_string().into_boxed_str()),
             Some(("appson", v)) => apps_on = v.to_string(),
             Some(("other", v)) => other_bars = v.to_string(),
             Some(("hover", v)) => hover = v.parse().ok(),
@@ -508,6 +509,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         i18n::style::set_autohide(hide);
         i18n::style::set_align_left(alignl);
         i18n::style::set_accent(i18n::style::Accent::parse(accent));
+        i18n::style::set_mode_pref(i18n::style::ModePref::parse(mode_arg));
+        i18n::style::set_light(args.iter().any(|a| a == "light")); // the pick above followed Windows: the picture is what `light` says
         i18n::style::set_bar_on_all_displays(!one_display);
         i18n::style::set_apps_on(i18n::style::AppsOn::parse(&apps_on));
         i18n::style::set_other_bars(i18n::style::OtherBars::parse(&other_bars));

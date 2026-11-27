@@ -48,7 +48,8 @@ const MENU: i32 = 90; // 90.. the items of the context menu
 const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
 const DIM: Rgba = Rgba::css(163, 169, 184, 1.0);
 const DIM2: Rgba = Rgba::css(138, 144, 162, 1.0);
-const ON_ACCENT: Rgba = Rgba::css(11, 18, 32, 1.0);
+/// Text on an accent fill (the design's `onA`): ink on the dark style, white on the light one.
+const ON_ACCENT: Rgba = Rgba::pair(0x0b1220, 0xffffff);
 const MUTED: Rgba = Rgba::css(255, 154, 154, 1.0);
 const RED: Rgba = Rgba::css(255, 69, 58, 1.0);
 const GREEN: Rgba = Rgba::css(48, 209, 88, 1.0);
@@ -721,11 +722,12 @@ impl QuickPanel {
                 // `.fill`: a circle of the accent that grows from the chip, `clip-path` .35s spring, opacity .4 to 1; in the row
                 // it is `circle(30px at 18px 18px)`, enough to fill the whole 36 px square
                 let origin = (r.x + anim::lerp(27.0, 18.0, t), r.y + anim::lerp(26.0, 18.0, t));
-                c.fill_disc_in(*r, radius, origin, anim::lerp(140.0, 30.0, t) * reveal, brighter(accent, 1.0 + 0.12 * hot).alpha(0.4 + 0.6 * op_t));
+                c.fill_disc_in(*r, radius, origin, anim::lerp(140.0, 30.0, t) * reveal, brighter(accent.accent_fill(), 1.0 + 0.12 * hot).alpha(0.4 + 0.6 * op_t));
                 // the chip: in the grid at the left, in the row the icon alone in the middle (its plate goes at once)
                 let chip = (if compact { r.cx() } else { r.x + 11.0 + 16.0 }, r.y + g.pad_top[i] + 16.0);
                 if !compact {
-                    c.circle(chip.0, chip.1, 16.0, Rgba::white(0.09).mix(Rgba::css(11, 18, 32, 0.14), chip_t));
+                    let on_chip = if style::light() { Rgba::pure_white(0.2) } else { Rgba::css(11, 18, 32, 0.14) }; // the chip of a tile that is on
+                    c.circle(chip.0, chip.1, 16.0, Rgba::white(0.09).mix(on_chip, chip_t));
                 }
                 // two icons on the chip: the off one turns away and shrinks, the on one turns in
                 let ic = &ICONS[i];
@@ -773,7 +775,7 @@ impl QuickPanel {
         let (icon, name) = self.current_output().map_or((Kind::Speakers.icon(), "\u{2014}"), |d| (d.kind.icon(), d.name.as_str()));
         let font = Font::new(12.0, 500);
         let name = fit(c, name, font, g.device.w - 8.0 - 14.0 - 7.0 - 7.0 - 11.0 - 8.0);
-        c.icon(icon, (g.device.x + 8.0 + 7.0, g.device.cy()), 14.0, 2.0, accent, 0.0);
+        c.icon(icon, (g.device.x + 8.0 + 7.0, g.device.cy()), 14.0, 2.0, accent.accent_text(), 0.0);
         c.text(&name, Rect::new(g.device.x + 8.0 + 14.0 + 7.0, g.device.y, g.device.w, g.device.h), font, INK, Align::Start);
         let turn = f.tween(DEVICE, 3, f32::from(self.slide.open), 250, SPRING);
         c.icon(CHEVRON_DOWN, (g.device.x + g.device.w - 8.0 - 5.5, g.device.cy()), 11.0, 2.6, DIM, 180.0 * (1.0 - turn));
@@ -785,7 +787,7 @@ impl QuickPanel {
         c.fill(g.mute, 8.0, Rgba::white(0.08 * hot));
         let icon = if shown == 0 { SPEAKER_0 } else if shown < 40 { SPEAKER_1 } else { SPEAKER_2 };
         c.icon(icon, (g.mute.cx(), g.mute.cy()), 19.0, 2.0, INK.mix(MUTED, mute_t), 0.0);
-        let fill = accent.mix(Rgba::white(0.18), mute_t);
+        let fill = accent.accent_fill().mix(Rgba::white(0.18), mute_t);
         slider(c, f, VOL, g.vol, shown as f32 / 100.0, fill);
         let num = if muted { t!("Выкл.", "Muted", ja: "ミュート", pt: "Mudo", zh: "静音").to_string() } else { format!("{vol}%") };
         c.text(&num, g.vol_num, Font::new(13.0, 600).tabular(), DIM.mix(MUTED, mute_t), Align::End);
@@ -863,7 +865,7 @@ impl QuickPanel {
                                     c.fill(r, 10.0, Rgba::white(0.07 * hot));
                                     let on = f.tween(id, 1, f32::from(d.current), 250, EASE);
                                     let plate = Rect::new(r.x + 6.0, r.y + 6.0, 28.0, 28.0);
-                                    c.fill(plate, 8.0, Rgba::white(0.08).mix(accent, on));
+                                    c.fill(plate, 8.0, Rgba::white(0.08).mix(accent.accent_fill(), on));
                                     c.icon(d.kind.icon(), (plate.cx(), plate.cy()), 15.0, 2.0, DIM.mix(ON_ACCENT, on), 0.0);
                                     let w = r.w - 6.0 - 28.0 - 10.0 - 10.0 - 14.0 - 6.0;
                                     let (nf, sf) = (Font::new(13.0, 500), Font::new(11.5, 400));
@@ -1024,7 +1026,7 @@ impl QuickPanel {
                 let hot = f.hover(MENU + j as i32, 140, SPRING);
                 let danger = *act == 2;
                 c.fill(*r, 8.0, if danger { RED.alpha(0.14 * hot) } else { Rgba::white(0.09 * hot) });
-                c.text(text, Rect::new(r.x + 12.0, r.y, r.w - 24.0, r.h), Font::new(13.0, 400), if danger { Rgba::css(255, 138, 143, 1.0) } else { INK }, Align::Start);
+                c.text(text, Rect::new(r.x + 12.0, r.y, r.w - 24.0, r.h), Font::new(13.0, 400), if danger { Rgba::pair(0xff8a8f, 0xc8333a) } else { INK }, Align::Start);
             }
         }
     }

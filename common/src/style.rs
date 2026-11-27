@@ -264,6 +264,7 @@ pub fn reload() {
     store(Style::parse(&name.unwrap_or_default()));
     ACCENT.forget();
     ANIM.forget();
+    MODE.forget();
 }
 
 /// The current style. The file is read again at most once a second, so a program that missed the broadcast still follows.
@@ -411,8 +412,9 @@ pub fn msg() -> u32 {
     }
 }
 
-/// Light or dark: one flag per process, dark until a program sets it. The topbar follows Windows (`follow_system` at start and on
-/// the "ImmersiveColorSet" `WM_SETTINGCHANGE`); `pal()` and the colour tokens below read it, so one switch repaints everything.
+/// Light or dark: one flag per process, dark until a program sets it. The topbar follows Windows or the user's pick
+/// (`follow_system` at start and on the "ImmersiveColorSet" `WM_SETTINGCHANGE`); `pal()` and the colour tokens below read it,
+/// so one switch repaints everything.
 static LIGHT: AtomicU8 = AtomicU8::new(0);
 
 pub fn light() -> bool {
@@ -431,23 +433,85 @@ pub fn light_from(dword: Option<u32>) -> bool {
     dword == Some(1)
 }
 
-/// Reads Windows' choice into this process (once at start, and again on the "ImmersiveColorSet" broadcast); true when it changed.
-pub fn follow_system() -> bool {
-    set_light(light_from(crate::reg::get_dword(PERSONALIZE, "SystemUsesLightTheme")))
+/// The bar's Appearance row (%ProgramData%\WinRust\mode.txt): `auto` follows Windows (the default, as the bar always did),
+/// `light` and `dark` keep the bar in that mode whatever Windows says, and leave Windows' own setting alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ModePref {
+    #[default]
+    Auto,
+    Light,
+    Dark,
 }
 
-/// Switches this process now and Windows after it: writes `SystemUsesLightTheme` and `AppsUseLightTheme` (apps follow, like the
-/// system switch) and broadcasts "ImmersiveColorSet" from a thread of its own (the broadcast waits for every window).
+impl ModePref {
+    pub const ALL: [ModePref; 3] = [ModePref::Light, ModePref::Dark, ModePref::Auto];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ModePref::Auto => "auto",
+            ModePref::Light => "light",
+            ModePref::Dark => "dark",
+        }
+    }
+    /// Unknown or empty text (no file yet, a hand edit) is `Auto`.
+    pub fn parse(s: &str) -> ModePref {
+        ModePref::ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or_default()
+    }
+}
+
+static MODE: Choice = Choice::new("mode.txt");
+
+pub fn mode_pref() -> ModePref {
+    match MODE.get(|s| ModePref::parse(s) as usize) {
+        1 => ModePref::Light,
+        2 => ModePref::Dark,
+        _ => ModePref::Auto,
+    }
+}
+
+/// Whether the bar is light, given what the user picked and what Windows says (`SystemUsesLightTheme`).
+pub fn light_for(pref: ModePref, system: Option<u32>) -> bool {
+    match pref {
+        ModePref::Auto => light_from(system),
+        ModePref::Light => true,
+        ModePref::Dark => false,
+    }
+}
+
+/// Reads the pick and Windows' choice into this process (once at start, and again on the "ImmersiveColorSet" broadcast and
+/// when the pick changes); true when the mode changed.
+pub fn follow_system() -> bool {
+    set_light(light_for(mode_pref(), crate::reg::get_dword(PERSONALIZE, "SystemUsesLightTheme")))
+}
+
+/// The Appearance row: writes the pick, tells the other WinRust windows, and applies it here; true when the mode changed.
+pub fn set_mode_pref(p: ModePref) -> bool {
+    MODE.set(p as usize, p.name());
+    follow_system()
+}
+
+/// Switches Windows after this process: writes `SystemUsesLightTheme` and `AppsUseLightTheme` (apps follow, like the system
+/// switch) and broadcasts "ImmersiveColorSet" from a thread of its own (the broadcast waits for every window). The bar itself
+/// follows only while its pick is `auto`.
 pub fn set_system_light(on: bool) {
-    set_light(on);
     crate::reg::set_dword(PERSONALIZE, "SystemUsesLightTheme", on as u32);
     crate::reg::set_dword(PERSONALIZE, "AppsUseLightTheme", on as u32);
+    follow_system();
     std::thread::spawn(|| {
         use windows_sys::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
         let what: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
         // SAFETY: `what` outlives the call, which waits (at most 200 ms per window) for the receivers.
         unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 200, std::ptr::null_mut()) };
     });
+}
+
+/// The "Dark style" tile, consistent with the Appearance row: while the bar follows Windows it is Windows' own switch (system
+/// and apps, as before); once the user picked Light or Dark it flips that pick (the bar only, Windows is left alone).
+pub fn toggle_dark_style() {
+    match mode_pref() {
+        ModePref::Auto => set_system_light(!light()),
+        _ => _ = set_mode_pref(if light() { ModePref::Dark } else { ModePref::Light }),
+    }
 }
 
 /// True when the `WM_SETTINGCHANGE` a window got says "ImmersiveColorSet" (`lparam` is a wide string, or null).
@@ -757,9 +821,51 @@ pub fn card() -> u32 {
     mix(pal().bg, pal().text, 0.06)
 }
 
-/// Text and glyphs drawn on an accent fill.
+/// Text and glyphs drawn on an accent fill: ink on the dark style, white on the light one (the design's `onA`).
 pub fn on_accent() -> u32 {
-    rgb(11, 18, 32)
+    if light() { rgb(255, 255, 255) } else { rgb(11, 18, 32) }
+}
+
+/// sRGB (components 0..1) as Oklab `[L, a, b]`.
+fn oklab(c: [f32; 3]) -> [f32; 3] {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let (r, g, b) = (lin(c[0]), lin(c[1]), lin(c[2]));
+    let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s, 1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s, 0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s]
+}
+
+/// `color-mix(in oklab, a, b t)` of two sRGB colours (components 0..1): `t` of the way from `a` to `b`, clipped back into sRGB.
+pub fn mix_oklab(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    let enc = |v: f32| (if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }).clamp(0.0, 1.0);
+    let (x, y) = (oklab(a), oklab(b));
+    let [l0, a0, b0] = [x[0] + (y[0] - x[0]) * t, x[1] + (y[1] - x[1]) * t, x[2] + (y[2] - x[2]) * t];
+    let l = (l0 + 0.396_337_78 * a0 + 0.215_803_76 * b0).powi(3);
+    let m = (l0 - 0.105_561_35 * a0 - 0.063_854_17 * b0).powi(3);
+    let s = (l0 - 0.089_484_18 * a0 - 1.291_485_5 * b0).powi(3);
+    [
+        enc(4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s),
+        enc(-1.268_438 * l + 2.609_757_4 * m - 0.341_319_4 * s),
+        enc(-0.004_196_086 * l - 0.703_418_6 * m + 1.707_614_7 * s),
+    ]
+}
+
+/// What the light style mixes into the accent to make it read on paper (`#0c1a3c`): 22 % for a fill (the design's `aF`), 38 % for
+/// text and icons (`aT`); the dark style uses the accent itself. `rgb` is the accent, components 0..1.
+pub fn accent_light(rgb: [f32; 3], text: bool) -> [f32; 3] {
+    mix_oklab(rgb, [12.0 / 255.0, 26.0 / 255.0, 60.0 / 255.0], if text { 0.38 } else { 0.22 })
+}
+
+/// The surface tokens (`--s16_17_24`.. in `TOKENS`, 1-based 12..=21; the scrim `--s5_7_12` after them is not one) get
+/// `--pAdd` = .1 more opacity in light mode: the glass of the light style is denser than the dark one.
+pub const fn is_surface_token(tok: u8) -> bool {
+    tok >= 12 && tok <= 21
+}
+
+/// A surface's alpha in light mode: `a + .1`, faded in below .3 so that a surface on its way out (alpha near 0) leaves no ghost.
+pub fn lifted_alpha(a: f32) -> f32 {
+    (a + 0.1 * (a / 0.3).min(1.0)).min(1.0)
 }
 
 /// `a` moved toward `b` by `t` (0..1), per channel.
@@ -865,6 +971,48 @@ mod tests {
         assert_eq!(token_rgb(STRONG_TOKEN), 0xffffff);
         assert_eq!(pal().text, BASE.text);
         set_light(was);
+    }
+
+    #[test]
+    fn the_appearance_pick_wins_over_windows_only_when_it_is_not_auto() {
+        assert_eq!([ModePref::parse("light"), ModePref::parse(" DARK
+"), ModePref::parse("auto"), ModePref::parse(""), ModePref::parse("sepia")], [ModePref::Light, ModePref::Dark, ModePref::Auto, ModePref::Auto, ModePref::Auto]);
+        for (pref, system, want) in [
+            (ModePref::Auto, Some(1), true),
+            (ModePref::Auto, Some(0), false),
+            (ModePref::Auto, None, false),
+            (ModePref::Light, Some(0), true),
+            (ModePref::Light, None, true),
+            (ModePref::Dark, Some(1), false),
+        ] {
+            assert_eq!(light_for(pref, system), want, "{pref:?} with Windows saying {system:?}");
+        }
+        assert_eq!(ModePref::ALL.map(ModePref::name), ["light", "dark", "auto"]);
+    }
+
+    #[test]
+    fn the_accent_on_paper_is_the_designs_colour_mix() {
+        // read from the mockup's `color-mix(in oklab, #62a0ea 78%, #0c1a3c)` and 62% (computed style), Oklab L, a, b
+        let blue = [0x62 as f32 / 255.0, 0xa0 as f32 / 255.0, 0xea as f32 / 255.0];
+        for (text, want) in [(false, [0.592_699, -0.029_006_7, -0.110_193]), (true, [0.517_904, -0.024_348_6, -0.101_541])] {
+            let got = oklab(accent_light(blue, text));
+            // the result is rounded to 8 bits per channel by whoever draws it: a few thousandths of Oklab are that
+            assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 0.004), "{got:?} for {want:?}");
+        }
+        assert_eq!(mix_oklab(blue, [0.0; 3], 0.0).map(|v| (v * 255.0).round()), [98.0, 160.0, 234.0]);
+    }
+
+    #[test]
+    fn the_surface_tokens_are_the_glass_ones_and_light_makes_them_denser() {
+        assert_eq!(TOKENS[11].0, 0x0c0d12, "--s12_13_18 is the first surface");
+        assert_eq!(TOKENS[20].0, 0x0a0b10, "--s10_11_16 is the last one the lift covers");
+        assert_eq!(TOKENS[21].0, 0x05070c, "--s5_7_12, the scrim, is not covered");
+        assert!(is_surface_token(token(27, 28, 34)) && is_surface_token(token(10, 11, 16)));
+        assert!(!is_surface_token(token(5, 7, 12)) && !is_surface_token(token(0x0b, 0x0d, 0x14)) && !is_surface_token(0));
+        assert!((lifted_alpha(0.72) - 0.82).abs() < 1e-6 && (lifted_alpha(0.86) - 0.96).abs() < 1e-6);
+        assert_eq!(lifted_alpha(0.94), 1.0);
+        assert_eq!(lifted_alpha(0.0), 0.0, "a surface faded out stays gone");
+        assert!(lifted_alpha(0.15) < 0.2, "and fades in smoothly");
     }
 
     #[test]

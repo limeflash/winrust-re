@@ -994,7 +994,7 @@ fn button(c: &mut Canvas<'_>, it: &Item, lay: &Layout, v: &View, live: &Live, m:
                 let u = 20.0 / 24.0;
                 for (x, y) in icons::START_SQUARES {
                     let (sx, sy) = (cx - 10.0 + x * u, cy - 10.0 + y * u);
-                    c.fill(Rect::new(sx, sy, icons::START_SQUARE * u, icons::START_SQUARE * u), icons::START_RADIUS * u, pal.accent);
+                    c.fill(Rect::new(sx, sy, icons::START_SQUARE * u, icons::START_SQUARE * u), icons::START_RADIUS * u, pal.accent.accent_text());
                 }
             });
         }
@@ -1126,8 +1126,8 @@ fn badge(c: &mut Canvas<'_>, at: Rect, v: &View, pal: &Palette, t: f32) {
         let k = if t < 0.6 { SPRING.ease(t / 0.6) * 1.25 } else { 1.25 - 0.25 * SPRING.ease((t - 0.6) / 0.4) };
         let r = Rect::new(at.x + at.w - w, at.y, w, at.h);
         c.transformed(r.cx(), r.cy(), k, 0.0, 0.0, |c| {
-            c.fill(r, r.h / 2.0, pal.accent);
-            c.text(&label, r, font, Rgba::css(11, 18, 32, 1.0), Align::Center);
+            c.fill(r, r.h / 2.0, pal.accent.accent_fill());
+            c.text(&label, r, font, Rgba::pair(0x0b1220, 0xffffff), Align::Center); // `aF` and `onA`
         });
     }
 }
@@ -1185,8 +1185,15 @@ fn indicators(c: &mut Canvas<'_>, r: Rect, a: &AppView, vert: bool, left: bool) 
     let ws: Vec<f32> = (0..n).map(|i| if i == 0 && a.active { 8.0 } else { rad * 2.0 }).collect();
     let total = ws.iter().sum::<f32>() + gap * (n - 1) as f32;
     let mut pos = -total / 2.0;
+    // on paper the indicator is the app's colour darkened (`color-mix(in oklab, c 62%, #3a3f4c)`), so it still reads
+    let base = if winrust_common::style::light() {
+        let [r, g, b] = winrust_common::style::mix_oklab([a.color.r, a.color.g, a.color.b], [58.0 / 255.0, 63.0 / 255.0, 76.0 / 255.0], 0.38);
+        Rgba::new(r, g, b, a.color.a)
+    } else {
+        a.color
+    };
     for (i, w) in ws.iter().enumerate() {
-        let col = a.color.fade(if i == 0 { 1.0 } else { 0.35 });
+        let col = base.fade(if i == 0 { 1.0 } else { 0.35 });
         let pill = if vert {
             // on the edge facing the screen border, running along the bar
             let x = if left { r.x + 4.0 } else { r.x + r.w - 4.0 };

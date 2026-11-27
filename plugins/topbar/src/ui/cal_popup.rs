@@ -39,7 +39,8 @@ const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
 const DIM: Rgba = Rgba::css(163, 169, 184, 1.0);
 const WEEKEND: Rgba = Rgba::css(138, 144, 162, 1.0);
 const OTHER_MONTH: Rgba = Rgba::css(111, 116, 134, 1.0);
-const ON_ACCENT: Rgba = Rgba::css(11, 18, 32, 1.0);
+/// Text on an accent fill (the design's `onA`): ink on the dark style, white on the light one.
+const ON_ACCENT: Rgba = Rgba::pair(0x0b1220, 0xffffff);
 
 const CHEVRON_LEFT: &str = "M15 6l-6 6 6 6";
 const CHEVRON_RIGHT: &str = "M9 6l6 6-6 6";
@@ -423,7 +424,7 @@ impl CalPanel {
             } else {
                 OTHER_MONTH
             };
-            c.circle(r.cx(), r.cy(), CELL / 2.0, accent.fade(lit));
+            c.circle(r.cx(), r.cy(), CELL / 2.0, accent.accent_fill().fade(lit));
             // a hovered today stays itself (the mockup paints it grey under dark ink), brighter by a tenth
             c.circle(r.cx(), r.cy(), CELL / 2.0, Rgba::white(if is_today { 0.1 } else { 0.12 } * hot));
             if d == self.sel && !is_today {

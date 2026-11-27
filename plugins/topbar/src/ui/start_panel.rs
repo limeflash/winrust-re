@@ -346,7 +346,7 @@ impl StartPanel {
     }
 
     fn draw_bottom(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, accent: Rgba) {
-        c.fill(Rect::new(0.0, BOTTOM_Y, W, H - BOTTOM_Y), 0.0, Rgba::css(0, 0, 0, 0.2));
+        c.fill(Rect::new(0.0, BOTTOM_Y, W, H - BOTTOM_Y), 0.0, if winrust_common::style::light() { Rgba::white(0.035) } else { Rgba::css(0, 0, 0, 0.2) }); // `--footBg`
         c.fill(Rect::new(0.0, BOTTOM_Y, W, 1.0), 0.0, Rgba::white(0.06));
         let cy = BOTTOM_Y + 1.0 + 30.0;
 
@@ -361,13 +361,14 @@ impl StartPanel {
         let face = Rect::new(bx - 16.0, by - 16.0, 32.0, 32.0);
         let picture = apps::avatar();
         if picture.is_invalid() {
-            c.circle(bx, by, 16.0, accent.alpha(0.2));
+            // the initial on a solid accent fill (`aF`, `onA`), no ring
+            c.circle(bx, by, 16.0, accent.accent_fill());
             let initial: String = name.chars().next().into_iter().flat_map(char::to_uppercase).collect();
-            c.text(&initial, face, Font::new(13.0, 600), accent, Align::Center);
+            c.text(&initial, face, Font::new(13.0, 600), Rgba::pair(0x0b1220, 0xffffff), Align::Center);
         } else {
             c.hicon(picture, face, 1.0);
+            c.ring(face, 16.0, 1.0, accent.alpha(0.4));
         }
-        c.ring(face, 16.0, 1.0, accent.alpha(0.4));
         let tx = r.x + 6.0 + 32.0 + 12.0;
         c.text_fit(name, Rect::new(tx, cy - 15.6, tw, 15.7), nf, INK, Align::Start);
         // the footer's own line (a file was pinned) takes the second line for a moment

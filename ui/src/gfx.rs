@@ -185,7 +185,30 @@ impl Rgba {
             return self;
         }
         let v = style::TOKENS[self.tok as usize - 1].1;
-        Self::new(((v >> 16) & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, (v & 255) as f32 / 255.0, self.a)
+        // the glass surfaces are denser in light mode (`--pAdd`)
+        let a = if style::is_surface_token(self.tok) { style::lifted_alpha(self.a) } else { self.a };
+        Self::new(((v >> 16) & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, (v & 255) as f32 / 255.0, a)
+    }
+
+    /// The accent (this colour) as a fill, the design's `aF`: itself on the dark style, darkened towards navy on the light one
+    /// (`color-mix(in oklab, a 78%, #0c1a3c)`) so that white on it reads.
+    #[must_use]
+    pub fn accent_fill(self) -> Self {
+        self.on_paper(false)
+    }
+
+    /// The accent as text or an icon on a surface, the design's `aT` (62 % of it in light mode).
+    #[must_use]
+    pub fn accent_text(self) -> Self {
+        self.on_paper(true)
+    }
+
+    fn on_paper(self, text: bool) -> Self {
+        if !style::light() {
+            return self;
+        }
+        let [r, g, b] = style::accent_light([self.r, self.g, self.b], text);
+        Self { r, g, b, ..self }
     }
 
     fn d2d(self) -> D2D1_COLOR_F {
@@ -2665,7 +2688,10 @@ mod tests {
         let near = |a: Rgba, b: Rgba| (a.r - b.r).abs() < 0.002 && (a.g - b.g).abs() < 0.002 && (a.b - b.b).abs() < 0.002 && a.a == b.a;
         assert!(near(Rgba::css(236, 238, 244, 0.5).in_light(), Rgba::css(27, 29, 35, 0.5)), "--t1");
         assert!(near(Rgba::hex(0x2c2d34).in_light(), Rgba::hex(0xe6e7e9)), "--h2c2d34");
-        assert!(near(Rgba::css(16, 17, 24, 0.9).in_light(), Rgba::css(243, 244, 246, 0.9)), "--s16_17_24");
+        assert!(near(Rgba::css(16, 17, 24, 0.9).in_light(), Rgba::css(243, 244, 246, 1.0)), "--s16_17_24, and .1 denser (--pAdd)");
+        assert!(near(Rgba::css(16, 17, 24, 0.72).in_light(), Rgba::css(243, 244, 246, 0.82)), "the Start panel's glass");
+        assert!(near(Rgba::css(5, 7, 12, 0.5).in_light(), Rgba::css(236, 238, 244, 0.5)), "the scrim keeps its alpha");
+        assert!(near(Rgba::css(27, 28, 34, 0.94).fade(0.0).in_light(), Rgba::css(238, 239, 241, 0.0)), "a surface faded out does not come back");
         assert!(near(Rgba::white(0.1).in_light(), Rgba::css(20, 22, 30, 0.1)), "the ink");
         assert!(near(Rgba::strong(1.0).in_light(), Rgba::css(27, 29, 35, 1.0)), "white that is --t1");
         // literals stay: shadows, white on accent fills, the accent, text on it, colours of the system

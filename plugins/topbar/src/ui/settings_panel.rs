@@ -10,8 +10,9 @@
 //! Layout is built as a list of [`Item`]s (geometry and content, no drawing), so the same numbers serve the size, the hit test
 //! and the painting. Every number is the mockup's own, measured from its DOM.
 
-use winrust_common::style::{self, Accent, Anim, Side, Style, Theme, pal};
+use winrust_common::style::{self, Accent, Anim, ModePref, Side, Style, Theme, pal};
 use winrust_common::{Lang, lang};
+use winrust_ui::widgets::look;
 
 use super::anim::{self, EASE, SNAP, SPRING};
 use super::gfx::{Align, Canvas, Font, Gfx, Picture, Rect, Rgba};
@@ -23,17 +24,20 @@ const PAD: f32 = 8.0;
 /// The width of what sits inside the panel's padding.
 const CW: f32 = W - 2.0 * PAD;
 /// Height of the main page: the panel opens on it (the reveal's clip is measured from it).
-const MAIN_H: f32 = 656.0;
+const MAIN_H: f32 = 700.0;
 
 const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
 const DIM: Rgba = Rgba::css(138, 144, 162, 1.0);
 const SOFT: Rgba = Rgba::css(163, 169, 184, 1.0);
-const BAD: Rgba = Rgba::css(255, 138, 143, 1.0);
+/// The text of a destructive row (`--dangerT`): pink on the dark style, a deep red on the light one.
+const BAD: Rgba = Rgba::pair(0xff8a8f, 0xc8333a);
 const RED: Rgba = Rgba::css(229, 72, 77, 1.0);
 const GREEN: Rgba = Rgba::css(76, 195, 138, 1.0);
-const GREEN_INK: Rgba = Rgba::css(127, 224, 173, 1.0);
+const GREEN_INK: Rgba = Rgba::pair(0x7fe0ad, 0x18804d); // the green of "Up to date": lighter on dark, deeper on light
 
 const BODY: Font = Font::new(13.0, 400);
+/// The Appearance control: 2 px padding and three 76 px options.
+const APPEARANCE_W: f32 = 4.0 + 3.0 * 76.0;
 const MEDIUM: Font = Font::new(13.0, 500);
 const SMALL: Font = Font::new(12.0, 400);
 const LABEL: Font = Font::new(12.0, 500);
@@ -87,6 +91,7 @@ const DELETE: i32 = 451;
 const LANG: i32 = 500;
 const SIDE: i32 = 600;
 const SIZE: i32 = 610;
+const APPEARANCE: i32 = 670; // + 0 light, 1 dark, 2 auto
 const BEHAVIOR: i32 = 620;
 const SHOW_ALL: i32 = 640;
 const APPS_ON: i32 = 650; // + 0 all bars, 1 where the window is
@@ -144,6 +149,8 @@ pub enum Act {
     Relook,
     /// The language changed.
     Language,
+    /// Light, dark or auto was picked: the bar and whatever is open are painted again in the mode.
+    Mode,
     /// Tile the open windows.
     Tile,
     OpenLog,
@@ -261,6 +268,8 @@ enum K {
     Rule(Rgba),
     Theme(Style),
     Dot(Accent),
+    /// The Appearance row's three-way control (Light, Dark, Auto); its options are `K::Hit` areas.
+    Appearance,
     Row(Row),
     Back,
     ColorRow { i: usize, open: bool },
@@ -499,10 +508,17 @@ impl SettingsPanel {
             b.put(ACCENT + i as i32, Rect::new(220.0 + i as f32 * 32.0, 188.0, 30.0, 30.0), K::Dot(*a));
         }
         b.stage = 4;
-        b.put(0, Rect::new(18.0, 230.0, 356.0, 1.0), K::Rule(Rgba::white(0.07)));
+        // Appearance: Light / Dark / Auto, a 232 x 32 control at the row's right (the design's `apRow`)
+        b.text(Rect::new(18.0, 238.0, 120.0, 16.0), t!("Оформление", "Appearance", ja: "外観", pt: "Aparência", zh: "外观"), MEDIUM, Tone::Ink);
+        let ap = Rect::new(W - PAD - 6.0 - APPEARANCE_W, 230.0, APPEARANCE_W, 32.0);
+        b.put(0, ap, K::Appearance);
+        for k in 0..3 {
+            b.put(APPEARANCE + k, Rect::new(ap.x + 2.0 + k as f32 * 76.0, ap.y + 2.0, 76.0, 28.0), K::Hit);
+        }
         b.stage = 5;
+        b.put(0, Rect::new(18.0, 274.0, 356.0, 1.0), K::Rule(Rgba::white(0.07)));
         let n = self.themes.len();
-        let mut y = 237.0;
+        let mut y = 281.0;
         y = Self::row(b, GO_COLORS, y, Row::new(PALETTE, t!("Цвета и прозрачность", "Colors and transparency", ja: "色と透明度", pt: "Cores e transparência", zh: "颜色与透明度")).val(Val::Palette)) + 1.0;
         y = Self::row(b, GO_TEMPLATES, y, Row::new(GRID, t!("Шаблоны", "Templates", ja: "テンプレート", pt: "Modelos", zh: "模板")).val(Val::Text(if n > 0 { n.to_string() } else { String::new() }))) + 1.0;
         y = Self::row(b, GO_LANG, y, Row::new(GLOBE, t!("Язык", "Language", ja: "言語", pt: "Idioma", zh: "语言")).val(Val::Text(lang().name().to_string())));
@@ -827,10 +843,12 @@ struct Dc<'a> {
     themes: Vec<Theme>,
 }
 
-/// What the mockup puts under its previews: `#0b0d14` with the user's wallpaper over it at `opacity` (.6 on the cards and
-/// thumbnails, .55 on the bar preview), cut to the rounded box. Without a wallpaper file a dark gradient stands in.
-fn wallpaper(c: &mut Canvas<'_>, r: Rect, radius: f32, pic: Option<&Picture>, opacity: f32) {
-    c.fill(r, radius, Rgba::css(11, 13, 20, 1.0));
+/// What the mockup puts under its previews: `#0b0d14` with the user's wallpaper over it at `opacity` (.92 on the cards, .6 on
+/// the thumbnails, .85 on the bar preview), cut to the rounded box. The cards and the bar preview keep that dark base in both
+/// modes (`base` = false: a literal), so the picture reads as it is on paper too; the thumbnails' base is the token `--h0b0d14`.
+/// Without a wallpaper file a dark gradient stands in.
+fn wallpaper(c: &mut Canvas<'_>, r: Rect, radius: f32, pic: Option<&Picture>, opacity: f32, token_base: bool) {
+    c.fill(r, radius, if token_base { Rgba::css(11, 13, 20, 1.0) } else { Rgba::new(11.0 / 255.0, 13.0 / 255.0, 20.0 / 255.0, 1.0) });
     match pic {
         Some(p) => c.picture_cover(p, r, radius, opacity),
         None => c.gradient(r, radius, Rgba::css(36, 48, 92, 0.6), Rgba::css(10, 12, 22, 0.6)),
@@ -860,7 +878,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
         K::Header => {
             let tile = Rect::new(r.x + 8.0, r.y + 8.0, 40.0, 40.0);
             c.fill(tile, 12.0, d.accent.fade(0.2));
-            c.icon(icons::GEAR, (tile.cx(), tile.cy()), 20.0, 1.8, d.accent, 0.0);
+            c.icon(icons::GEAR, (tile.cx(), tile.cy()), 20.0, 1.8, d.accent.accent_text(), 0.0);
             c.text(t!("Настройки панели", "Bar settings", ja: "バーの設定", pt: "Configurações da barra", zh: "任务栏设置"), Rect::new(r.x + 60.0, r.y + 10.0, 300.0, 19.0), Font::new(15.0, 600), INK, Align::Start);
             c.text(t!("Вид панели и программ WinRust:RE", "Look of the bar and the WinRust:RE programs", ja: "バーと WinRust:RE プログラムの外観", pt: "Aparência da barra e dos programas da WinRust:RE", zh: "任务栏与 WinRust:RE 程序的外观"), Rect::new(r.x + 60.0, r.y + 31.0, 300.0, 15.0), SMALL, DIM, Align::Start);
         }
@@ -870,7 +888,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
             let on = *st == style::style();
             let hot = f.hover(it.id, 160, EASE);
             let prev = Rect::new(r.x, r.y, r.w, 64.0);
-            wallpaper(c, prev, 10.0, d.walls.and_then(|w| w.card.as_ref()), 0.6);
+            wallpaper(c, prev, 10.0, d.walls.and_then(|w| w.card.as_ref()), 0.92, false);
             let (l, bottom, rad) = match st {
                 Style::Classic => (0.0, 0.0, 0.0),
                 Style::Floating => (5.0, 5.0, 4.0),
@@ -907,6 +925,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
                 c.circle(cx, cy, if on { 7.0 } else { 9.0 }, col);
             });
         }
+        K::Appearance => draw_appearance(c, f, r),
         K::Row(row) => draw_row(c, f, it, row, d),
         K::Back => {
             let hot = f.hover(it.id, 140, SPRING);
@@ -978,7 +997,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
             let thumb = Rect::new(r.x + 10.0, r.cy() - 14.0, 44.0, 28.0);
             let bg = if thm.colors[0] != u32::MAX { thm.colors[0] } else { style::BASE.bg };
             let acc = if thm.colors[4] != u32::MAX { thm.colors[4] } else { thm.accent.color() };
-            wallpaper(c, thumb, 6.0, d.walls.and_then(|w| w.thumb.as_ref()), 0.6);
+            wallpaper(c, thumb, 6.0, d.walls.and_then(|w| w.thumb.as_ref()), 0.6, true);
             c.clipped(Rect::new(thumb.x, thumb.y + 21.0, 44.0, 7.0), |c| c.fill(Rect::new(thumb.x, thumb.y + 8.0, 44.0, 20.0), 6.0, Rgba::colorref(bg)));
             c.fill(Rect::new(thumb.x + 19.0, thumb.y + 28.0 - 2.0 - 3.0, 6.0, 3.0), 1.0, Rgba::colorref(acc));
             c.text(name, Rect::new(r.x + 66.0, r.y + 8.0, 250.0, 16.0), MEDIUM, INK, Align::Start);
@@ -995,7 +1014,8 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
             let hov = if *ink == Tone::Bad { Rgba::css(229, 72, 77, 0.14) } else { Rgba::white(0.09) };
             c.fill(r, 10.0, hov.fade(hot));
             c.icon(icon, (r.x + 19.0, r.y + h / 2.0), 18.0, 1.8, ink.rgba(d.accent), 0.0);
-            c.text(label, Rect::new(r.x + 40.0, r.y, r.w - 50.0, *h), if *ink == Tone::Accent { MEDIUM } else { BODY }, ink.rgba(d.accent), Align::Start);
+            let (font, text) = if *ink == Tone::Accent { (MEDIUM, d.accent.accent_text()) } else { (BODY, ink.rgba(d.accent)) }; // the label is `aT`, the plus stays the accent
+            c.text(label, Rect::new(r.x + 40.0, r.y, r.w - 50.0, *h), font, text, Align::Start);
         }
         K::LangRow { code, name, on } => {
             let hot = f.hover(it.id, 140, SPRING);
@@ -1057,7 +1077,7 @@ fn draw_item(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, d: &Dc<'_>) {
             let tw = c.measure(t!("Что нового", "What's new"), Font::new(13.0, 600)).ceil();
             let badge = Rect::new(r.x + tw + 8.0, r.y, c.measure(&d.version, Font::new(11.0, 600)).ceil() + 14.0, 20.0);
             c.fill(badge, 6.0, d.accent.fade(0.2));
-            c.text(&d.version, badge, Font::new(11.0, 600), d.accent, Align::Center);
+            c.text(&d.version, badge, Font::new(11.0, 600), d.accent.accent_text(), Align::Center);
         }
         K::News { icon, title, sub, first } => {
             if !first {
@@ -1150,22 +1170,43 @@ fn draw_row(c: &mut Canvas<'_>, f: &mut Frame<'_>, it: &Item, row: &Row, d: &Dc<
 }
 
 fn draw_seg(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, labels: &[String], cur: usize, base: i32) {
-    c.fill(r, 10.0, Rgba::css(0, 0, 0, 0.28));
-    c.fill(Rect::new(r.x + 3.0, r.y, r.w - 6.0, 1.0), 0.0, Rgba::css(0, 0, 0, 0.3));
-    c.fill(Rect::new(r.x + 2.0, r.y + 1.0, r.w - 4.0, 1.0), 0.0, Rgba::css(0, 0, 0, 0.12));
+    look::seg_track(c, r, 10.0);
     let n = labels.len();
     let w = (r.w - 6.0) / n as f32;
     let pos = f.tween(base, 7, cur as f32, 320, SNAP);
     let thumb = Rect::new(r.x + 3.0 + pos * w, r.y + 3.0, w, 28.0);
-    c.outside(thumb, 7.0, |c| c.shadow(thumb, 7.0, 1.0, 3.0, Rgba::css(0, 0, 0, 0.45)));
-    c.gradient(thumb, 7.0, Rgba::white(0.16), Rgba::white(0.1));
-    c.fill(Rect::new(thumb.x + 3.0, thumb.y, thumb.w - 6.0, 1.0), 0.0, Rgba::white(0.14));
+    look::seg_thumb(c, thumb, 7.0);
     for (k, l) in labels.iter().enumerate() {
         let id = base + k as i32;
         let sel = f.tween(id, 8, f32::from(k == cur), 200, EASE);
         let hot = f.hover(id, 200, EASE);
         let col = DIM.mix(INK, sel.max(hot));
         c.text(l, Rect::new(r.x + 3.0 + k as f32 * w, r.y + 3.0, w, 28.0), LABEL, col, Align::Center);
+    }
+}
+
+/// The Appearance control (`apRow`): Light, Dark and Auto in a 232×32 trough, the chosen one on a `--segOn` thumb that glides
+/// (`.3s`); each option an icon and a label, `--t1` when chosen and `--t2` otherwise.
+fn draw_appearance(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect) {
+    const SUN: &str = "M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4";
+    const MOON: &str = "M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5z";
+    const AUTO: &str = "M12 3a9 9 0 1 0 0 18 9 9 0 1 0 0-18zM12 3v18M12 7.5h4.5M12 12h6M12 16.5h4.5";
+    c.fill(r, 10.0, Rgba::white(0.07));
+    let cur = ModePref::ALL.iter().position(|&p| p == style::mode_pref()).unwrap_or(2);
+    let pos = f.tween(APPEARANCE, 7, cur as f32, 300, SNAP);
+    let thumb = Rect::new(r.x + 2.0 + pos * 76.0, r.y + 2.0, 76.0, 28.0);
+    c.outside(thumb, 8.0, |c| c.shadow(thumb, 8.0, 1.0, 3.0, Rgba::css(0, 0, 0, 0.18)));
+    c.fill(thumb, 8.0, if style::light() { Rgba::pure_white(1.0) } else { Rgba::pure_white(0.14) }); // `--segOn`
+    c.ring(thumb, 8.0, 0.5, Rgba::white(0.08));
+    let options = [(SUN, t!("Светлое", "Light", ja: "ライト", pt: "Claro", zh: "浅色")), (MOON, t!("Тёмное", "Dark", ja: "ダーク", pt: "Escuro", zh: "深色")), (AUTO, t!("Авто", "Auto", ja: "自動", pt: "Auto", zh: "自动"))];
+    for (k, (icon, label)) in options.into_iter().enumerate() {
+        let sel = f.tween(APPEARANCE + k as i32, 8, f32::from(k == cur), 200, EASE);
+        let col = SOFT.mix(INK, sel);
+        let b = Rect::new(r.x + 2.0 + k as f32 * 76.0, r.y + 2.0, 76.0, 28.0);
+        let tw = c.measure(label, LABEL).ceil();
+        let x = b.cx() - (14.0 + 6.0 + tw) / 2.0;
+        c.icon(icon, (x + 7.0, b.cy()), 14.0, 2.0, col, 0.0);
+        c.text(label, Rect::new(x + 20.0, b.y, tw + 4.0, b.h), LABEL, col, Align::Start);
     }
 }
 
@@ -1198,7 +1239,7 @@ fn draw_preview(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, d: &Dc<'_>) {
     let (x0, y0, x1, y1) = (g(0, x0), g(1, y0), g(2, x1), g(3, y1));
     let rad = f.tween(PREVIEW, 4, rad, 350, EASE);
     let o = f.tween(PREVIEW, 5, if style::autohide() { 0.35 } else { 1.0 }, 300, EASE);
-    wallpaper(c, r, 12.0, d.walls.and_then(|w| w.preview.as_ref()), 0.55);
+    wallpaper(c, r, 12.0, d.walls.and_then(|w| w.preview.as_ref()), 0.85, false);
     let bar = Rect::new(r.x + x0, r.y + y0, x1 - x0, y1 - y0);
     let bg = Rgba::colorref(pal().bg).alpha(f32::from(style::bar_opacity()) / 100.0);
     c.clipped(r, |c| {
@@ -1392,6 +1433,12 @@ impl Content for SettingsPanel {
             i if (ACCENT..ACCENT + 5).contains(&i) => {
                 style::set_accent(Accent::ALL[(i - ACCENT) as usize]);
                 self.relook(cx);
+            }
+            i if (APPEARANCE..APPEARANCE + 3).contains(&i) => {
+                // the bar's own pick; Windows' setting stays as it is (Auto follows it)
+                if style::set_mode_pref(ModePref::ALL[(i - APPEARANCE) as usize]) {
+                    cx.run(move || act(Act::Mode));
+                }
             }
             GO_COLORS => self.go(Page::Colors, true),
             GO_TEMPLATES => self.go(Page::Templates, true),
