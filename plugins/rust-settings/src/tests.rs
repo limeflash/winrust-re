@@ -1480,7 +1480,7 @@ fn default_apps_list_what_windows_has_and_a_pick_opens_windows_own_chooser() {
     assert_eq!(items.iter().position(|m| m.radio == Some(true)), Some(0));
     let mut cx = Cx::default();
     s.command(TAG_PICK, 2, &mut cx);
-    assert_eq!(d.log(), vec!["assoc_pick .jpg 2".to_string(), "assoc_dialog TEMP/WinRust/defaults/Sample.jpg flags=3".to_string()], "the sample file and Explorer's flags (register ext, no force, no exec)");
+    assert_eq!(d.log(), vec!["assoc_pick .jpg 2".to_string(), "assoc_dialog TEMP/WinRust/defaults/Sample.jpg flags=7".to_string()], "the sample file and Explorer's flags (register ext, exec, no force)");
     assert_eq!(toasts(&cx).len(), 1, "the toast says Windows asks to confirm");
     assert_eq!(photos(&s), "Paint", "read again after the dialog");
     // the rows that are WinRust's own do nothing
@@ -1540,9 +1540,14 @@ fn the_apps_page_shows_size_and_date_and_sorts_by_them() {
 
 #[test]
 fn the_chooser_is_asked_the_way_explorer_asks_it() {
-    // flags: register the extension, nothing else (no force: Windows 11 refuses it; no exec: nothing is run)
-    assert_eq!(more::CHOOSER_FLAGS, 1 | 2);
-    assert_eq!(more::CHOOSER_FLAGS & (4 | 8), 0);
+    // flags: register the extension and open the sample (without exec Windows shows only "go to Settings"); no force: refused as well
+    assert_eq!(more::CHOOSER_FLAGS, 1 | 2 | 4);
+    assert_eq!(more::CHOOSER_FLAGS & 8, 0);
+    // the sample holds something the chosen app can open
+    assert!(more::sample_bytes(".jpg").starts_with(&[0xFF, 0xD8]) && more::sample_bytes(".JPEG").starts_with(&[0xFF, 0xD8]));
+    assert!(more::sample_bytes(".png").starts_with(b"\x89PNG") && more::sample_bytes(".gif").starts_with(b"GIF8"));
+    assert!(more::sample_bytes(".pdf").starts_with(b"%PDF-") && more::sample_bytes(".txt") == b"WinRust sample\n");
+    assert!(more::sample_bytes(".mkv").is_empty());
     // the sample: a real file name of that type under the temp folder, only for plain extensions
     let t = std::path::Path::new("T");
     let p = more::sample_path(t, ".pdf").unwrap();

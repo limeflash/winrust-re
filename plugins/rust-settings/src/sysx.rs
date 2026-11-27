@@ -733,8 +733,9 @@ pub fn assoc_apps(a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
     (apps, cur)
 }
 
-/// Opens Windows' own chooser for `a` the way Explorer's "Open with > Choose another app" does: the dialog is pointed at a real, empty sample file
-/// of that type (never opened) with the registration flags only, so the user ticks "Always use this app" and Windows records the choice itself
+/// Opens Windows' own chooser for `a` the way Explorer's "Open with > Choose another app" does: the dialog is pointed at a sample file of that
+/// type, which the chosen app then opens (without OAIF_EXEC Windows shows no chooser, only "go to Settings"), so the user ticks "Always use this
+/// app" and Windows records the choice itself
 /// (nothing here writes UserChoice). When it closes the default is read again and `done` gets a line for the toast: the new default, or a hint
 /// when nothing changed. A link scheme cannot be chosen there: it opens Windows' own settings page (which lends Explorer while it is open).
 pub fn assoc_pick(a: &Assoc, owner: isize, done: Note) {
@@ -749,20 +750,20 @@ pub fn assoc_pick(a: &Assoc, owner: isize, done: Note) {
         use windows::Win32::{
             Foundation::HWND,
             System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
-            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_REGISTER_EXT, OPEN_AS_INFO_FLAGS, OPENASINFO, SHOpenWithDialog},
+            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPEN_AS_INFO_FLAGS, OPENASINFO, SHOpenWithDialog},
         };
         use windows::core::HSTRING;
-        // an empty file of that type, made when it is not there; it is only a name for the dialog
-        if sample.parent().is_none_or(|p| std::fs::create_dir_all(p).is_err()) || (!sample.is_file() && std::fs::write(&sample, b"").is_err()) {
+        // a file of that type with something in it: the app chosen in the dialog opens it (written each time: an older build left empty ones)
+        if sample.parent().is_none_or(|p| std::fs::create_dir_all(p).is_err()) || std::fs::write(&sample, crate::more::sample_bytes(&a.name)).is_err() {
             return done(t!("Не удалось подготовить образец файла", "Could not prepare the sample file").into());
         }
         let (listed, cur0) = assoc_apps(&a);
         let before = cur0.and_then(|c| listed.get(c)).map(|x| x.exe.clone());
         let name = HSTRING::from(sample.as_os_str());
         let flags = OPEN_AS_INFO_FLAGS(crate::more::CHOOSER_FLAGS as i32);
-        debug_assert_eq!(flags, OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT);
+        debug_assert_eq!(flags, OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC);
         let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: flags };
-        // SAFETY: a modal shell dialog on this thread, over our window; the sample is an empty file that is never opened (no OAIF_EXEC).
+        // SAFETY: a modal shell dialog on this thread, over our window; the app chosen opens the sample (OAIF_EXEC).
         let shown = unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             SHOpenWithDialog(Some(HWND(owner as *mut _)), &info)
