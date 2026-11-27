@@ -88,6 +88,8 @@ pub struct Rgba {
     pub b: f32,
     pub a: f32,
     tok: u8,
+    /// `0x0100_0000 | 0xRRGGBB`: the light-mode value an app wrote beside the dark one ([`Rgba::pair`]); 0 = none.
+    light: u32,
 }
 
 impl Rgba {
@@ -95,7 +97,19 @@ impl Rgba {
 
     #[must_use]
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a, tok: 0 }
+        Self { r, g, b, a, tok: 0, light: 0 }
+    }
+
+    /// An app's own colour as the mockup's CSS writes it: the dark value and the light one (`[data-theme=light]{--win:..}`),
+    /// `0xRRGGBB` each. It needs no entry in `style::TOKENS`, so apps do not touch the bar's table.
+    #[must_use]
+    pub const fn pair(dark: u32, light: u32) -> Self {
+        let c = Self::hex_plain(dark);
+        Self { light: 0x0100_0000 | (light & 0x00ff_ffff), ..c }
+    }
+
+    const fn hex_plain(rgb: u32) -> Self {
+        Self::new(((rgb >> 16) & 255) as f32 / 255.0, ((rgb >> 8) & 255) as f32 / 255.0, (rgb & 255) as f32 / 255.0, 1.0)
     }
 
     /// `0xRRGGBB` as written in the design.
@@ -157,12 +171,16 @@ impl Rgba {
     /// The colour as it is drawn now: a token's value in the current mode, the colour itself when it has none; no token left.
     #[must_use]
     pub fn themed(self) -> Self {
-        if style::light() { self.in_light() } else { Self { tok: 0, ..self } }
+        if style::light() { self.in_light() } else { Self { tok: 0, light: 0, ..self } }
     }
 
     /// The colour in light mode (what `themed` gives while it is on).
     #[must_use]
     pub fn in_light(self) -> Self {
+        if self.light != 0 {
+            let v = self.light;
+            return Self::new(((v >> 16) & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, (v & 255) as f32 / 255.0, self.a);
+        }
         if self.tok == 0 {
             return self;
         }
@@ -448,6 +466,45 @@ impl Surface {
             )
             .is_ok()
         }
+    }
+
+    /// Puts the last painted frame on a window that is not moved by it (an application window: its size is the user's, the
+    /// surface follows it): only the visual's content is set. A DirectComposition target's origin is the window's client area,
+    /// so a frame of the client's size fits. What reaches the screen is cut by the next [`commit`]. False for a DIB surface
+    /// (see [`Surface::blit`]) or a lost device.
+    pub fn show(&self, hwnd: HWND) -> bool {
+        let Some(c) = self.comp.as_ref().filter(|_| self.composed) else { return false };
+        let Some(dev) = current_dev().filter(|d| d.epoch == c.epoch) else { return false };
+        let key = hwnd.0 as isize;
+        let mut targets = dev.targets.borrow_mut();
+        let tgt = match targets.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => match make_target(&dev, hwnd) {
+                Ok(t) => v.insert(t),
+                Err(_) => return false,
+            },
+        };
+        let mut ok = true;
+        // SAFETY: calls on our own visual; the surface is alive for the whole call.
+        unsafe {
+            let id = c.surf.as_raw() as usize;
+            if tgt.content != id {
+                ok &= tgt.visual.SetContent(&c.surf).is_ok();
+                tgt.content = id;
+            }
+        }
+        c.bound.set(Some(key));
+        ok
+    }
+
+    /// Copies the last painted DIB frame to a window's device context at `(x, y)` (the fallback without DirectComposition:
+    /// a `WM_PAINT` of an ordinary window).
+    pub fn blit(&self, hdc: HDC, x: i32, y: i32) -> bool {
+        if self.dc.is_invalid() {
+            return false;
+        }
+        // SAFETY: `self.dc` holds a live DIB of `w` by `h` pixels; `hdc` is the caller's.
+        unsafe { BitBlt(hdc, x, y, self.w, self.h, Some(self.dc), 0, 0, SRCCOPY).is_ok() }
     }
 
     fn present_comp(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) -> bool {
@@ -961,6 +1018,15 @@ impl Gfx {
     #[must_use]
     pub const fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// The window moved to a screen of another DPI: the next frame is drawn at the new scale. What was made for the old one (the
+    /// device context, the bitmaps cached for it) goes; layouts and paths are in DIPs and stay.
+    pub fn set_scale(&mut self, scale: f32) {
+        if (self.scale - scale).abs() > f32::EPSILON {
+            self.scale = scale;
+            self.dev = None;
+        }
     }
 
     /// Drops every cached icon bitmap (a panel that drew icons it does not own, whose handles may be reused).
@@ -1550,6 +1616,52 @@ impl Canvas<'_> {
             if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
                 rt.FillRoundedRectangle(&rr, &b);
             }
+        }
+    }
+
+    /// Like [`Canvas::gradient_diagonal`] with any number of stops (position 0..1, colour): CSS
+    /// `linear-gradient(135deg, a, b 55%, c)` of a square.
+    pub fn gradient_diagonal_stops(&mut self, r: Rect, radius: f32, stops: &[(f32, Rgba)]) {
+        if r.w <= 0.0 || r.h <= 0.0 || stops.len() < 2 {
+            return;
+        }
+        let rt = self.rt();
+        let stops: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|&(position, c)| D2D1_GRADIENT_STOP { position, color: c.d2d() }).collect();
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe {
+            let Some(coll) = self.stops(&stops) else { return };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.x, Y: r.y }, endPoint: Vector2 { X: r.x + r.w, Y: r.y + r.h } };
+            if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
+                rt.FillRoundedRectangle(&rr, &b);
+            }
+        }
+    }
+
+    /// Makes what lies outside the rounded rectangle `r` (inside the box `r`) transparent, antialiased: the round corners of a
+    /// window drawn square. `r` is where the corners are; nothing outside the box is touched.
+    pub fn round_corners(&mut self, r: Rect, radius: f32) {
+        if radius <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let f = &self.g.factory;
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+        // SAFETY: plain geometry work on the factory; the result is filled inside BeginDraw/EndDraw, the blend mode restored.
+        unsafe {
+            let corners = (|| -> Result<ID2D1PathGeometry> {
+                let (all, round) = (f.CreateRectangleGeometry(&r.d2d())?, f.CreateRoundedRectangleGeometry(&rr)?);
+                let path = f.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                all.CombineWithGeometry(&round, D2D1_COMBINE_MODE_EXCLUDE, None, 0.1, &sink)?;
+                sink.Close()?;
+                path.cast()
+            })();
+            let Ok(shape) = corners else { return };
+            let ctx = self.dev().cur.clone();
+            let b = self.brush(Rgba::TRANSPARENT);
+            ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            ctx.FillGeometry(&shape, &b, None);
+            ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
         }
     }
 
@@ -2306,6 +2418,52 @@ mod tests {
         assert!(near(Rgba::white(1.0).alpha(0.3).fade(0.5).in_light(), Rgba::css(20, 22, 30, 0.15)));
         // dark mode draws the literal itself
         assert_eq!(Rgba::css(236, 238, 244, 0.5).themed(), Rgba::new(236.0 / 255.0, 238.0 / 255.0, 244.0 / 255.0, 0.5));
+    }
+
+    #[test]
+    fn an_apps_own_pair_is_the_dark_value_and_its_light_twin_with_the_alpha_kept() {
+        let near = |a: Rgba, b: Rgba| (a.r - b.r).abs() < 0.002 && (a.g - b.g).abs() < 0.002 && (a.b - b.b).abs() < 0.002 && a.a == b.a;
+        let win = Rgba::pair(0x16171b, 0xf7f7f9);
+        assert!(near(win, Rgba::hex(0x16171b)), "dark is what it was written as");
+        assert!(near(win.in_light(), Rgba::hex(0xf7f7f9)));
+        assert!(near(win.alpha(0.4).in_light(), Rgba::hex(0xf7f7f9).alpha(0.4)), "through alpha and fade it keeps its twin");
+        assert!(near(win.fade(0.5).in_light(), Rgba::hex(0xf7f7f9).alpha(0.5)));
+        // a pair of black: the light value 0 is a colour, not "none"
+        assert!(near(Rgba::pair(0xffffff, 0x000000).in_light(), Rgba::new(0.0, 0.0, 0.0, 1.0)));
+        // the bar's literals are untouched by it: no token, no pair
+        assert_eq!(Rgba::new(0.5, 0.5, 0.5, 1.0).in_light(), Rgba::new(0.5, 0.5, 0.5, 1.0));
+    }
+
+    #[test]
+    fn round_corners_cut_the_four_corners_and_nothing_else() {
+        let mut g = gfx();
+        let mut s = Surface::new();
+        g.paint(&mut s, 60, 40, |c| {
+            c.fill(Rect::new(0.0, 0.0, 60.0, 40.0), 0.0, Rgba::hex(0x3366cc));
+            c.round_corners(Rect::new(0.0, 0.0, 60.0, 40.0), 16.0);
+        })
+        .expect("a frame");
+        let a = |x: usize, y: usize| s.pixels()[y * 60 + x] >> 24;
+        assert_eq!((a(0, 0), a(59, 0), a(0, 39), a(59, 39)), (0, 0, 0, 0), "the corners are transparent");
+        assert_eq!((a(30, 0), a(0, 20), a(59, 20), a(30, 39), a(30, 20)), (255, 255, 255, 255, 255), "the edges and the middle are not");
+        let rim = (0..16).map(|i| a(i, 15 - i)).filter(|&v| v != 0 && v != 255).count();
+        assert!(rim > 0, "the rim of the corner is antialiased, not a hard cut");
+    }
+
+    #[test]
+    fn a_new_scale_draws_the_next_frame_at_the_new_size() {
+        let mut g = gfx();
+        let mut s = Surface::new();
+        let draw = |g: &mut Gfx, s: &mut Surface| g.paint(s, 20, 20, |c| c.fill(Rect::new(0.0, 0.0, 10.0, 10.0), 0.0, Rgba::hex(0xff0000))).expect("a frame");
+        draw(&mut g, &mut s);
+        let filled = |s: &Surface| s.pixels().iter().filter(|&&p| p >> 24 == 255).count();
+        assert_eq!(filled(&s), 100, "10 x 10 DIPs at scale 1");
+        g.set_scale(2.0);
+        draw(&mut g, &mut s);
+        assert_eq!(filled(&s), 400, "20 x 20 pixels at scale 2");
+        assert_eq!(g.scale(), 2.0);
+        // a DIB surface has no visual to show
+        assert!(!s.show(HWND(std::ptr::null_mut())));
     }
 
     #[test]
