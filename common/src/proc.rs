@@ -156,6 +156,118 @@ pub fn elevated() -> bool {
     }
 }
 
+/// Whether process `pid` runs elevated; None when its token cannot be read.
+fn process_elevated(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::{Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation}, System::Threading::{OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION}};
+    unsafe {
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return None;
+        }
+        let (mut t, mut e, mut n) = (null_mut(), TOKEN_ELEVATION { TokenIsElevated: 0 }, 0u32);
+        let ok = OpenProcessToken(p, TOKEN_QUERY, &mut t) != 0 && GetTokenInformation(t, TokenElevation, &mut e as *mut _ as _, size_of::<TOKEN_ELEVATION>() as u32, &mut n) != 0;
+        if !t.is_null() {
+            CloseHandle(t);
+        }
+        CloseHandle(p);
+        ok.then_some(e.TokenIsElevated != 0)
+    }
+}
+
+/// A process started by [`spawn_as_user`]: wait for it, or let it go (the handle is closed on drop).
+pub struct Started(*mut c_void);
+
+impl Started {
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        // SAFETY: our own process handle.
+        unsafe { windows_sys::Win32::System::Threading::GetProcessId(self.0) }
+    }
+
+    /// Waits up to `ms` for the process to end: true when it has.
+    #[must_use]
+    pub fn wait_for(&self, ms: u32) -> bool {
+        // SAFETY: our own process handle.
+        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, ms) == 0 }
+    }
+
+    /// Ends the process.
+    pub fn kill(&self) {
+        // SAFETY: our own process handle.
+        unsafe { TerminateProcess(self.0, 1) };
+    }
+
+    /// Waits until the process ends.
+    pub fn wait(&self) {
+        // SAFETY: our own process handle.
+        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, u32::MAX) };
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        // SAFETY: closed once, here.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Starts `exe args` with the user's normal token. From an elevated process (the bar, WinRust Settings) the child is made a
+/// child of a normal-rights process of this session, rs-shell or else the desktop, and gets its token
+/// (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS): a full normal token, unlike `runas /trustlevel`, whose restricted windows other
+/// normal windows cannot even send a WM_COPYDATA. Not elevated, or no such process: a plain start (the caller's own token).
+pub fn spawn_as_user(exe: &std::path::Path, args: &[String]) -> std::io::Result<Started> {
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, PROCESS_CREATE_PROCESS, PROCESS_INFORMATION, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    };
+    use std::os::windows::ffi::OsStrExt;
+    let quote = |s: &str| if s.is_empty() || s.contains([' ', '\t', '"']) { format!("\"{}\"", s.replace('"', "\\\"")) } else { s.to_string() };
+    let mut cmd: Vec<u16> = std::iter::once(quote(&exe.to_string_lossy())).chain(args.iter().map(|a| quote(a))).collect::<Vec<_>>().join(" ").encode_utf16().chain([0]).collect();
+    let app: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let parent = if elevated() {
+        ["rs-shell.exe", "rust-explorer.exe"].iter().flat_map(|n| pids(n)).find(|&p| process_elevated(p) == Some(false))
+    } else {
+        None
+    };
+    // SAFETY: the attribute list lives in a buffer of the size Windows asked for, until CreateProcessW has used it; every handle is closed.
+    unsafe {
+        let mut si: STARTUPINFOEXW = std::mem::zeroed();
+        si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut parent_h = null_mut();
+        let mut flags = 0;
+        if let Some(p) = parent {
+            parent_h = OpenProcess(PROCESS_CREATE_PROCESS, 0, p);
+        }
+        if !parent_h.is_null() {
+            let mut size = 0usize;
+            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+            buf.resize(size, 0);
+            let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            if InitializeProcThreadAttributeList(list, 1, 0, &mut size) != 0
+                && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize, (&raw const parent_h).cast(), size_of::<*mut c_void>(), null_mut(), null_mut()) != 0
+            {
+                si.lpAttributeList = list;
+                flags = EXTENDED_STARTUPINFO_PRESENT;
+            }
+        }
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessW(app.as_ptr(), cmd.as_mut_ptr(), null_mut(), null_mut(), 0, flags, null_mut(), null_mut(), &si.StartupInfo, &mut pi) != 0;
+        let err = std::io::Error::last_os_error();
+        if !si.lpAttributeList.is_null() {
+            DeleteProcThreadAttributeList(si.lpAttributeList);
+        }
+        if !parent_h.is_null() {
+            CloseHandle(parent_h);
+        }
+        if !ok {
+            return Err(err);
+        }
+        CloseHandle(pi.hThread);
+        Ok(Started(pi.hProcess))
+    }
+}
+
 /// Starts Explorer as the shell with the user's normal token. Started straight from an unelevated process: under the
 /// `runas /trustlevel` token it is a shell that never shows a Store app (Settings stays a blue splash, its window cloaked).
 /// That token is only for an elevated caller, which must not hand Explorer its admin rights.
@@ -190,6 +302,19 @@ mod tests {
         let name = super::exe_name(me).unwrap();
         assert!(name.to_lowercase().ends_with(".exe") && !name.contains('\\'), "{name}");
         assert!(super::list().iter().any(|(p, n)| *p == me && n.eq_ignore_ascii_case(&name)));
+    }
+
+    /// Elevated with a normal-rights rs-shell or desktop around (the live machine): the child gets the normal token. Anywhere
+    /// else it is a plain start that runs and is waited for.
+    #[test]
+    fn a_process_started_as_the_user_runs_with_normal_rights() {
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
+        let p = super::spawn_as_user(&cmd, &["/c".into(), "ping -n 3 127.0.0.1 >nul".into()]).expect("started");
+        let normal_parent = ["rs-shell.exe", "rust-explorer.exe"].iter().flat_map(|n| super::pids(n)).any(|q| super::process_elevated(q) == Some(false));
+        if super::elevated() && normal_parent {
+            assert_eq!(super::process_elevated(p.pid()), Some(false), "the child of an elevated caller has the user's normal token");
+        }
+        p.wait();
     }
 
     #[test]

@@ -823,7 +823,8 @@ fn the_page_signature_notices_a_change() {
 #[test]
 fn the_source_files_of_the_window_never_call_the_system_but_through_os() {
     // the window's own files may name the types of the logic modules and use their pure helpers; every other call goes through `os()`
-    const PURE: [&str; 10] = ["display::resolutions", "display::with_res", "display::rates_at", "display::snap", "wifi::reason_text", "ext::valid_proxy", "ext::valid_pac", "ext::night_helper", "power::size", "net::speed_text"];
+    // (night_helper and choose_helper are the entry points of the background copies main.rs starts, not calls of the window)
+    const PURE: [&str; 11] = ["display::resolutions", "display::with_res", "display::rates_at", "display::snap", "wifi::reason_text", "ext::valid_proxy", "ext::valid_pac", "ext::night_helper", "sysx::choose_helper", "power::size", "net::speed_text"];
     let modules = ["audio", "bt", "display", "ext", "net", "power", "sys", "sysx", "wifi", "wu"];
     for (file, text) in [("main.rs", include_str!("main.rs")), ("app.rs", include_str!("app.rs")), ("draw.rs", include_str!("draw.rs")), ("search.rs", include_str!("search.rs")), ("more.rs", include_str!("more.rs"))] {
         for m in modules {

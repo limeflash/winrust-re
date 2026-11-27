@@ -747,31 +747,20 @@ pub fn assoc_pick(a: &Assoc, owner: isize, done: Note) {
     let Some(sample) = crate::more::sample_path(&std::env::temp_dir(), &a.name) else { return };
     let a = a.clone();
     std::thread::spawn(move || {
-        use windows::Win32::{
-            Foundation::HWND,
-            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
-            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPEN_AS_INFO_FLAGS, OPENASINFO, SHOpenWithDialog},
-        };
-        use windows::core::HSTRING;
         // a file of that type with something in it: the app chosen in the dialog opens it (written each time: an older build left empty ones)
         if sample.parent().is_none_or(|p| std::fs::create_dir_all(p).is_err()) || std::fs::write(&sample, crate::more::sample_bytes(&a.name)).is_err() {
             return done(t!("Не удалось подготовить образец файла", "Could not prepare the sample file").into());
         }
         let (listed, cur0) = assoc_apps(&a);
         let before = cur0.and_then(|c| listed.get(c)).map(|x| x.exe.clone());
-        let name = HSTRING::from(sample.as_os_str());
-        let flags = OPEN_AS_INFO_FLAGS(crate::more::CHOOSER_FLAGS as i32);
-        debug_assert_eq!(flags, OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC);
-        let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: flags };
-        // SAFETY: a modal shell dialog on this thread, over our window; the app chosen opens the sample (OAIF_EXEC).
-        let shown = unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            SHOpenWithDialog(Some(HWND(owner as *mut _)), &info)
-        };
+        // elevated (started by the bar), the dialog of Windows' OpenWith.exe, which runs with normal rights, cannot be owned by our
+        // window: it came up unowned, 61 px tall (its buttons only) and centred on the screen's corner. A copy of us with normal
+        // rights puts an owner of the same rights over this window and shows it from there.
+        let shown = if winrust_common::proc::elevated() { chooser_as_user(owner, &sample).unwrap_or_else(|| chooser(owner, &sample)) } else { chooser(owner, &sample) };
         if let Ok(mut c) = handlers_cache().lock() {
             c.clear(); // what it was is read again
         }
-        if shown.is_err() {
+        if !shown {
             // the dialog would not open for this type on this Windows: Windows' own settings page is the way
             winrust_common::settings::open_windows("ms-settings:defaultapps");
             return done(t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there").into());
@@ -783,6 +772,83 @@ pub fn assoc_pick(a: &Assoc, owner: isize, done: Note) {
             _ => t!("Отметьте «Всегда использовать это приложение», чтобы оно стало основным", "Tick \u{2018}Always use this app\u{2019} to make it the default").into(),
         });
     });
+}
+
+/// Windows' "Open with" for `sample`, owned by `owner`, on this thread: false when it would not open.
+fn chooser(owner: isize, sample: &std::path::Path) -> bool {
+    use windows::Win32::{
+        Foundation::HWND,
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+        UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPEN_AS_INFO_FLAGS, OPENASINFO, SHOpenWithDialog},
+    };
+    let name = windows::core::HSTRING::from(sample.as_os_str());
+    let flags = OPEN_AS_INFO_FLAGS(crate::more::CHOOSER_FLAGS as i32);
+    debug_assert_eq!(flags, OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC);
+    let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: flags };
+    // SAFETY: a modal shell dialog on this thread, over `owner`; the app chosen opens the sample (OAIF_EXEC).
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        SHOpenWithDialog((owner != 0).then(|| HWND(owner as *mut _)), &info).is_ok()
+    }
+}
+
+/// [`chooser`] in a copy of us with the user's normal rights (`--choose`), placed over `owner`; waits for it. None when that copy
+/// could not be started.
+fn chooser_as_user(owner: isize, sample: &std::path::Path) -> Option<bool> {
+    use windows_sys::Win32::{Foundation::RECT, UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetWindowRect}};
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: a query on our own window into a local.
+    unsafe { GetWindowRect(owner as _, &mut r) };
+    let exe = std::env::current_exe().ok()?;
+    let args = ["--choose".to_string(), sample.to_string_lossy().into_owned(), r.left.to_string(), r.top.to_string(), r.right.to_string(), r.bottom.to_string()];
+    let p = winrust_common::proc::spawn_as_user(&exe, &args).ok()?;
+    // SAFETY: lets the copy (and the dialog it brings up) come to the front; we have the foreground now.
+    unsafe { AllowSetForegroundWindow(p.pid()) };
+    // Windows' dialog (class "Open With", in OpenWith.exe) must come up within a few seconds; if it does not, the copy is ended
+    // and the caller opens Windows' own Default apps page instead of leaving the user with nothing
+    let up = || {
+        let class: Vec<u16> = "Open With\0".encode_utf16().collect();
+        // SAFETY: a lookup by class name.
+        !unsafe { windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null()) }.is_null()
+    };
+    for _ in 0..40 {
+        if p.wait_for(200) {
+            return Some(true); // done already (a choice made at once, or nothing to choose)
+        }
+        if up() {
+            p.wait();
+            return Some(true);
+        }
+    }
+    p.kill();
+    Some(false)
+}
+
+/// `rust-settings --choose <sample> <left> <top> <right> <bottom>`: the copy [`chooser_as_user`] starts. An invisible window
+/// over the Settings window owns the dialog, so Windows sizes it and centres it there, as over Explorer.
+pub fn choose_helper(args: &[String]) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, LWA_ALPHA, SW_SHOWNOACTIVATE, SetLayeredWindowAttributes, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    };
+    let [sample, l, t, r, b] = args else { return 2 };
+    let n = |s: &String| s.parse::<i32>().unwrap_or(0);
+    let (l, t, r, b) = (n(l), n(t), n(r), n(b));
+    let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    // SAFETY: a window of our own, created, shown and destroyed on this thread; the text pointers live for the call.
+    let owner = unsafe {
+        let h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, class.as_ptr(), [0u16].as_ptr(), WS_POPUP, l, t, (r - l).max(1), (b - t).max(1), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+        if !h.is_null() {
+            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA); // there, but nothing of it shows and clicks go through
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        h
+    };
+    let shown = chooser(owner as isize, std::path::Path::new(sample));
+    if !owner.is_null() {
+        // SAFETY: ours, made above.
+        unsafe { DestroyWindow(owner) };
+    }
+    i32::from(!shown)
 }
 
 /// What WinRust's own file manager and terminal are on this PC: not a Windows setting, what is installed.

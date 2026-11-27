@@ -1378,6 +1378,9 @@ fn main() {
     if args.first().map(String::as_str) == Some("--nightlight") {
         return ext::night_helper(); // the colour filter's background process, see ext.rs
     }
+    if args.first().map(String::as_str) == Some("--choose") {
+        winrust_ui::window::quit(sysx::choose_helper(&args[1..]) as u32); // Default apps' chooser with normal rights, see sysx.rs
+    }
     if let Some(code) = demo::cli(&args) {
         winrust_ui::window::quit(code as u32);
     }
