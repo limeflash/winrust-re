@@ -1647,7 +1647,7 @@ mod tests {
     fn pages_are_as_tall_as_the_mockups() {
         let mut g = gfx();
         // measured from the mockup's DOM: the pages whose height does not depend on a setting or on how a text wraps
-        for (page, themes, h) in [(Page::Main, 0, 656.0), (Page::Colors, 0, 532.0), (Page::Templates, 0, 240.0), (Page::Lang, 0, 326.0), (Page::Reset, 0, 230.0), (Page::Rollback, 0, 230.0)] {
+        for (page, themes, h) in [(Page::Main, 0, 700.0), (Page::Colors, 0, 532.0), (Page::Templates, 0, 240.0), (Page::Lang, 0, 326.0), (Page::Reset, 0, 230.0), (Page::Rollback, 0, 230.0)] {
             assert_eq!(panel(page, themes).size(&mut g), (392.0, h), "{page:?}");
         }
         // two templates: rows of 48 with a gap replace the empty note (56 + 8), and "delete a template" joins the save row (41)
@@ -1659,11 +1659,14 @@ mod tests {
         let mut g = gfx();
         let mut p = panel(Page::Main, 0);
         p.size(&mut g);
-        assert_eq!(p.hit(100.0, 257.0), Some(GO_COLORS));
-        assert_eq!(p.hit(366.0, 628.0), Some(GO_RESET));
-        assert_eq!(p.hit(10.0, 300.0), Some(GO_TEMPLATES)); // the row reaches the panel's padding
+        assert_eq!(p.hit(100.0, 301.0), Some(GO_COLORS));
+        assert_eq!(p.hit(366.0, 672.0), Some(GO_RESET));
+        assert_eq!(p.hit(10.0, 344.0), Some(GO_TEMPLATES)); // the row reaches the panel's padding
         assert_eq!(p.hit(100.0, 100.0), Some(THEME)); // the first theme card
-        assert_eq!(p.hit(200.0, 230.5), None); // the rule
+        assert_eq!(p.hit(100.0, 274.5), None); // the rule
+        // the Appearance row: Light, Dark, Auto in a 232 px control that ends 6 px short of the panel's padding
+        assert_eq!([150.0, 226.0, 302.0].map(|x| p.hit(x, 246.0)), [Some(APPEARANCE), Some(APPEARANCE + 1), Some(APPEARANCE + 2)]);
+        assert_eq!(p.hit(140.0, 246.0), None);
         assert_eq!(p.nav(None, Dir::Down), Some(THEME));
         assert_eq!(p.nav(Some(GO_RESET), Dir::Down), Some(GO_RESET));
     }
@@ -1677,10 +1680,10 @@ mod tests {
         let mut p = Popup::new(&mut g, Box::new(panel(Page::Main, 0)), anchor, 0, &mut grab);
         let shown = p.frame(&mut g, 0);
         let (x, y, w, h) = p.rect();
-        assert_eq!((w, h, y + h), (392, 656, 846 - 12)); // 12 above the bar, as the mockup's `bottom: var(--pb)`
+        assert_eq!((w, h, y + h), (392, 700, 846 - 12)); // 12 above the bar, as the mockup's `bottom: var(--pb)`
         assert_eq!(x, 12);
         // a click on "Colors and transparency" (client coordinates: the room m around the box is in the window)
-        p.button(x - shown.win.0 + 100, y - shown.win.1 + 257, Button::Left);
+        p.button(x - shown.win.0 + 100, y - shown.win.1 + 301, Button::Left);
         p.frame(&mut g, 16);
         let (x2, y2, w2, h2) = p.rect();
         assert_eq!((x2, w2, h2), (12, 392, 532));

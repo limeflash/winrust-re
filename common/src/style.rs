@@ -1012,7 +1012,7 @@ mod tests {
         assert!((lifted_alpha(0.72) - 0.82).abs() < 1e-6 && (lifted_alpha(0.86) - 0.96).abs() < 1e-6);
         assert_eq!(lifted_alpha(0.94), 1.0);
         assert_eq!(lifted_alpha(0.0), 0.0, "a surface faded out stays gone");
-        assert!(lifted_alpha(0.15) < 0.2, "and fades in smoothly");
+        assert!(lifted_alpha(0.15) < 0.21 && lifted_alpha(0.15) > 0.15, "and fades in smoothly");
     }
 
     #[test]

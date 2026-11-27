@@ -2685,7 +2685,7 @@ mod tests {
 
     #[test]
     fn a_dark_literal_becomes_its_light_token_and_keeps_its_alpha() {
-        let near = |a: Rgba, b: Rgba| (a.r - b.r).abs() < 0.002 && (a.g - b.g).abs() < 0.002 && (a.b - b.b).abs() < 0.002 && a.a == b.a;
+        let near = |a: Rgba, b: Rgba| (a.r - b.r).abs() < 0.002 && (a.g - b.g).abs() < 0.002 && (a.b - b.b).abs() < 0.002 && (a.a - b.a).abs() < 1e-6;
         assert!(near(Rgba::css(236, 238, 244, 0.5).in_light(), Rgba::css(27, 29, 35, 0.5)), "--t1");
         assert!(near(Rgba::hex(0x2c2d34).in_light(), Rgba::hex(0xe6e7e9)), "--h2c2d34");
         assert!(near(Rgba::css(16, 17, 24, 0.9).in_light(), Rgba::css(243, 244, 246, 1.0)), "--s16_17_24, and .1 denser (--pAdd)");

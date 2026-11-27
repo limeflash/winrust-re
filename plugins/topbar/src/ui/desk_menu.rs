@@ -263,16 +263,12 @@ impl DeskPanel {
 /// A segmented control (`role=radiogroup`): the track, the thumb gliding to the chosen option (`.sthumb`, .32 s) and what
 /// `content` draws in each option in the colour it gets (the muted one, the ink for the chosen and the hovered).
 fn segments(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, base: i32, cur: usize, mut content: impl FnMut(&mut Canvas<'_>, Rect, usize, Rgba)) {
-    c.fill(r, 10.0, Rgba::css(0, 0, 0, 0.28));
-    c.fill(Rect::new(r.x + 3.0, r.y, r.w - 6.0, 1.0), 0.0, Rgba::css(0, 0, 0, 0.3));
-    c.fill(Rect::new(r.x + 2.0, r.y + 1.0, r.w - 4.0, 1.0), 0.0, Rgba::css(0, 0, 0, 0.12));
+    winrust_ui::widgets::look::seg_track(c, r, 10.0); // `--segTrack`
     let cells = options(r);
     let w = cells[0].w;
     let pos = f.tween(base, 7, cur as f32, 320, SNAP);
     let thumb = Rect::new(r.x + 3.0 + pos * w, r.y + 3.0, w, r.h - 6.0);
-    c.outside(thumb, 7.0, |c| c.shadow(thumb, 7.0, 1.0, 3.0, Rgba::css(0, 0, 0, 0.45)));
-    c.gradient(thumb, 7.0, Rgba::white(0.16), Rgba::white(0.1));
-    c.fill(Rect::new(thumb.x + 3.0, thumb.y, thumb.w - 6.0, 1.0), 0.0, Rgba::white(0.14));
+    winrust_ui::widgets::look::seg_thumb(c, thumb, 7.0); // `--segThumb`
     for (k, cell) in cells.iter().enumerate() {
         let id = base + k as i32;
         let sel = f.tween(id, 8, f32::from(k == cur), 200, EASE);
