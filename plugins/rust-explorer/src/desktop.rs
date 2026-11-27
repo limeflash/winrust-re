@@ -7,11 +7,12 @@ thread_local! { static WALL: std::cell::Cell<(isize, i32, i32)> = const { std::c
 pub(crate) fn virt() -> (i32, i32, i32, i32) {
     unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) }
 }
-/// The desktop's icon list stays on the primary monitor (at screen 0,0, i.e. -vx, -vy inside the desktop window), between the bar's strips.
+/// The desktop's icon list covers the whole desktop window, every monitor, so marquee selection, drops and icon drags work
+/// wherever the pointer is (and over the gaps between monitors of different sizes, where no icon can stand). Where icons may
+/// stand is `desk::Grid`: a work area per monitor.
 pub(crate) fn place_desk_list(list: HWND) {
-    let (vx, vy, ..) = virt();
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    unsafe { MoveWindow(list, -vx, -vy + desk_top(), sw, (sh - desk_top() - desk_bottom()).max(0), 1) };
+    let (_, _, vw, vh) = virt();
+    unsafe { MoveWindow(list, 0, 0, vw, vh, 1) };
 }
 /// Renders the wallpaper for the current monitor layout (at start and when monitors change), freeing the old one.
 pub(crate) fn reload_wall() {
@@ -30,20 +31,42 @@ pub(crate) fn wallpaper_changed(h: HWND) {
         if made { unsafe { PostMessageW(h as HWND, WM_WALL, 0, 0) }; }
     });
 }
-/// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
-fn work_strips() -> (i32, i32) {
-    let mut r: RECT = unsafe { std::mem::zeroed() };
-    if unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0) } == 0 { return (0, 0); }
-    (r.top.max(0), (unsafe { GetSystemMetrics(SM_CYSCREEN) } - r.bottom).max(0))
+/// Where icons may stand on one monitor (screen pixels): the monitor's rectangle and its icon area, the work area the bar left
+/// less a small margin. A bar that reserves a strip gets a gap past it; the dock style reserves nothing but floats over the
+/// bottom edge, so it gets a fixed gap while topbar runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Area { pub rect: (i32, i32, i32, i32), pub work: (i32, i32, i32, i32) }
+
+/// The icon area of a monitor from its rectangle and its work area (`rcWork`, which the bar sets per monitor).
+pub(crate) fn area_of(rect: (i32, i32, i32, i32), work: (i32, i32, i32, i32), dock_floats: bool) -> Area {
+    let reserved = rect.3 - work.3;
+    let bottom = if reserved > 0 { reserved + ui::sc(4) } else if dock_floats { ui::sc(52) } else { ui::sc(8) };
+    Area { rect, work: (work.0, work.1 + ui::sc(8), work.2, rect.3 - bottom) }
 }
-/// Margins of the desktop's icon list, from the bar's real size: its reserved strip (any height, top or bottom).
-/// The dock style reserves nothing but floats over the bottom edge, so it gets a fixed gap while topbar runs.
-fn desk_top() -> i32 { work_strips().0 + ui::sc(8) }
-fn desk_bottom() -> i32 {
-    let reserved = work_strips().1;
-    if reserved > 0 { return reserved + ui::sc(4); }
-    let bar_up = unsafe { !FindWindowW(w("topbar").as_ptr(), ptr::null()).is_null() };
-    if bar_up && winrust_common::style::style() == winrust_common::style::Style::Dock { ui::sc(52) } else { ui::sc(8) }
+
+/// Every monitor's icon area, the primary first (it is where icons start, and where "arrange automatically" fills), the others
+/// left to right.
+pub(crate) fn areas() -> Vec<Area> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+    unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, lp: isize) -> i32 {
+        let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        if unsafe { GetMonitorInfoW(m, &mut mi) } != 0 {
+            let (r, k) = (mi.rcMonitor, mi.rcWork);
+            unsafe { (*(lp as *mut Vec<(bool, Area)>)).push((mi.dwFlags & 1 != 0 /* MONITORINFOF_PRIMARY */, Area { rect: (r.left, r.top, r.right, r.bottom), work: (k.left, k.top, k.right, k.bottom) })) };
+        }
+        1
+    }
+    let mut v: Vec<(bool, Area)> = Vec::new();
+    unsafe { EnumDisplayMonitors(ptr::null_mut(), ptr::null(), Some(each), &mut v as *mut _ as isize) };
+    let dock = unsafe { !FindWindowW(w("topbar").as_ptr(), ptr::null()).is_null() } && winrust_common::style::style() == winrust_common::style::Style::Dock;
+    v.sort_by_key(|&(primary, a)| (!primary, a.rect.0, a.rect.1));
+    let mut out: Vec<Area> = v.into_iter().map(|(_, a)| area_of(a.rect, a.work, dock)).collect();
+    if out.is_empty() { // no answer: the primary screen alone
+        let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        out.push(area_of((0, 0, sw, sh), (0, 0, sw, sh), dock));
+    }
+    out
 }
 /// "Hide desktop icons" is a marker file, so it survives restarts.
 pub(crate) fn icons_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"WinRust\desktop-icons-hidden.txt") }
@@ -139,7 +162,8 @@ pub(crate) fn drive_of(p: &Path) -> Option<char> {
 /// `false` (no bar, or one that cannot) = the caller shows its own GDI menu.
 pub(crate) fn ask_bar() -> bool {
     let mut pt = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut pt) };
+    unsafe { GetCursorPos(&mut pt) }; // screen pixels: the bar opens the menu on the monitor this point is on
+    desk::clicked((pt.x, pt.y));
     let v = view();
     let drive = tool("wiztree").and_then(|_| drive_of(&cur_dir()));
     deskmenu::ask(&Request { at: (pt.x, pt.y), sort: v.sort, size: v.size, auto: v.auto, shown: !icons_hidden(), drive })
@@ -150,9 +174,10 @@ pub(crate) fn command(h: HWND, cmd: Cmd) {
     let (list, dir, mut v) = (ST.with_borrow(|st| st.list), cur_dir(), view());
     let drop_cells = || { let _ = fs::remove_file(desk::pos_file()); }; // the next load lays every icon out again
     match cmd {
-        Cmd::NewFolder => new_entry(&dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
-        Cmd::NewText => new_entry(&dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false),
-        Cmd::Paste => paste(h, &dir),
+        // the new icons appear where the menu was opened, on whichever monitor that was
+        Cmd::NewFolder => { desk::want_near_click(); new_entry(&dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true) }
+        Cmd::NewText => { desk::want_near_click(); new_entry(&dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false) }
+        Cmd::Paste => { desk::want_near_click(); paste(h, &dir) }
         Cmd::Sort(s) => { v.sort = s; set_view(v); SORT_COL.store(sort_col(s), Relaxed); SORT_ASC.store(true, Relaxed); drop_cells(); }
         Cmd::Size(s) => { v.size = s; set_view(v); unsafe { apply_icon_size(list) }; drop_cells(); } // the grid changes with the size
         Cmd::Auto(on) => {
@@ -295,7 +320,7 @@ pub(crate) mod wall {
 pub(crate) mod desk {
     #![allow(unsafe_op_in_unsafe_fn)]
     use super::*;
-    use std::{cell::Cell, collections::{HashMap, HashSet}};
+    use std::{cell::{Cell, RefCell}, collections::{HashMap, HashSet}, time::Instant};
     use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, HDC, ScreenToClient};
 
     pub const SPAWN_WORKERW: u32 = 0x052C; // what wallpaper apps send to "Progman" to get a window behind the icons
@@ -306,6 +331,11 @@ pub(crate) mod desk {
         static DROP_AT: Cell<Option<(i32, i32)>> = const { Cell::new(None) }; // ...and where it was dropped (screen coords)
         static WORKERW: Cell<isize> = const { Cell::new(0) };
         static LIVE: Cell<bool> = const { Cell::new(false) }; // a live wallpaper is running in WORKERW
+        /// The layout the icons were last put on: the virtual screen's top left (list coordinates start there) and every
+        /// monitor's icon area. What the saved positions are relative to, and what a change of monitors or bar carries icons from.
+        static LAST: RefCell<((i32, i32), Vec<Area>)> = const { RefCell::new(((0, 0), Vec::new())) };
+        static CLICK: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // where the desktop menu was last opened (screen coords)
+        static WANT: Cell<Option<((i32, i32), Instant)>> = const { Cell::new(None) }; // where the next new icons should appear
     }
 
     /// The live-wallpaper window follows the desktop's size (monitors added, removed or resized).
@@ -320,24 +350,50 @@ pub(crate) mod desk {
         PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\desktop-icons.txt")
     }
 
-    /// Saved icon positions: name -> (x, y) in list pixels.
-    fn saved() -> HashMap<String, (i32, i32)> {
-        fs::read_to_string(pos_file()).unwrap_or_default().lines().filter_map(|l| {
+    /// Where the desktop menu was opened: what "New folder" and the others from it are placed near.
+    pub fn clicked(at: (i32, i32)) { CLICK.set(at); }
+    pub fn want_near_click() { want_near(CLICK.get()); }
+    /// The icons that appear next (dropped files, new items) go to the free cells nearest to `at` (screen coords), whichever
+    /// monitor it is on. Good for a few seconds: a drop whose files never come must not place something unrelated later.
+    pub fn want_near(at: (i32, i32)) { WANT.set(Some((at, Instant::now()))); }
+    fn wanted() -> Option<(i32, i32)> { WANT.get().filter(|(_, t)| t.elapsed().as_secs() < 15).map(|(p, _)| p) }
+
+    /// Saved icon positions: name -> (x, y) in pixels from the primary monitor's icon area corner (so the file written before
+    /// there was a second monitor still means the same cells; a monitor left of or above the primary has negative ones).
+    fn saved() -> HashMap<String, (i32, i32)> { parse_saved(&fs::read_to_string(pos_file()).unwrap_or_default()) }
+
+    fn parse_saved(text: &str) -> HashMap<String, (i32, i32)> {
+        text.lines().filter_map(|l| {
             let mut p = l.splitn(3, '\t');
             Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?, p.next()?.to_string()))
         }).map(|(x, y, n): (i32, i32, String)| (n, (x, y))).collect()
     }
 
+    fn saved_text<'a>(items: impl Iterator<Item = (&'a str, (i32, i32))>) -> String {
+        items.map(|(n, (x, y))| format!("{x}\t{y}\t{n}\n")).collect()
+    }
+
     fn names() -> Vec<String> { ST.with_borrow(|st| st.rows.iter().map(|r| r.name.clone()).collect()) }
 
+    /// The primary monitor's icon area corner of the last layout: the zero of the saved positions.
+    fn origin() -> (i32, i32) { LAST.with_borrow(|l| l.1.first().map_or((0, 0), |a| (a.work.0, a.work.1))) }
+
+    /// Icon i's position in screen coordinates (the list's own start at the virtual screen's top left).
     fn pos(list: HWND, i: usize) -> (i32, i32) {
+        let (x, y) = raw_pos(list, i);
+        let (vx, vy, ..) = virt();
+        (x + vx, y + vy)
+    }
+
+    fn raw_pos(list: HWND, i: usize) -> (i32, i32) {
         let mut p = POINT { x: 0, y: 0 };
         put(list, LVM_GETITEMPOSITION, i, &mut p as *mut _ as isize);
         (p.x, p.y)
     }
 
     fn set_pos(list: HWND, i: usize, (x, y): (i32, i32)) {
-        let p = POINT { x, y };
+        let (vx, vy, ..) = virt();
+        let p = POINT { x: x - vx, y: y - vy };
         put(list, LVM_SETITEMPOSITION32, i, &p as *const _ as isize);
     }
 
@@ -345,41 +401,86 @@ pub(crate) mod desk {
     /// sort order, so the positions from before stay put for when it is switched off (which writes them anew).
     pub fn save(list: HWND) {
         if view().auto { return; }
-        let lines: String = names().iter().enumerate().map(|(i, n)| { let (x, y) = pos(list, i); format!("{x}\t{y}\t{n}\n") }).collect();
+        let (ox, oy) = origin();
+        let names = names();
+        let lines = saved_text(names.iter().enumerate().map(|(i, n)| { let (x, y) = pos(list, i); (n.as_str(), (x - ox, y - oy)) }));
         let f = pos_file();
         let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
         let _ = fs::write(f, lines);
     }
 
-    /// The icon grid: cell size, and how many columns / rows fit.
-    struct Grid { cx: i32, cy: i32, cols: i32, rows: i32 }
+    /// A grid cell (slot): monitor (index into the grid's monitors), column, row.
+    type Slot = (usize, i32, i32);
+
+    /// One monitor's part of the grid: its icon area and how many cells fit in it.
+    struct Mon { area: Area, cols: i32, rows: i32 }
+
+    /// The icon grid: one cell size for all (the list has one DPI, the primary's), and per monitor a block of cells from the
+    /// top left of its icon area, so an icon stands on a monitor (never in the gap between two) and the primary comes first.
+    struct Grid { cx: i32, cy: i32, mons: Vec<Mon> }
+
+    /// Squared distance from a point to a rectangle (0 inside it).
+    fn gap2(r: (i32, i32, i32, i32), (x, y): (i32, i32)) -> i64 {
+        let (dx, dy) = ((r.0 - x).max(0).max(x - r.2) as i64, (r.1 - y).max(0).max(y - r.3) as i64);
+        dx * dx + dy * dy
+    }
+    fn d2(a: (i32, i32), b: (i32, i32)) -> i64 { let (dx, dy) = ((a.0 - b.0) as i64, (a.1 - b.1) as i64); dx * dx + dy * dy }
 
     impl Grid {
+        /// The grid for the monitors as they are now; remembers them as the layout in force (see `LAST`).
         fn of(list: HWND) -> Grid {
             let s = put(list, LVM_GETITEMSPACING, 0, 0) as u32;
             let (cx, cy) = (((s & 0xFFFF) as i32).max(1), ((s >> 16) as i32).max(1));
-            let mut r: RECT = unsafe { std::mem::zeroed() };
-            unsafe { GetClientRect(list, &mut r) };
-            if r.bottom <= 0 {
-                // the first fill runs in WM_CREATE, before WM_SIZE gives the list its size: the size it is about to get
-                r = unsafe { RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) - desk_top() - desk_bottom() } };
-            }
-            Grid { cx, cy, cols: (r.right / cx).max(1), rows: (r.bottom / cy).max(1) }
+            let (vx, vy, ..) = virt();
+            let areas = areas();
+            LAST.replace(((vx, vy), areas.clone()));
+            Grid::new(cx, cy, &areas)
         }
-        /// Nearest cell to a position; None if it is off the grid (screen got smaller).
-        fn cell(&self, (x, y): (i32, i32)) -> Option<(i32, i32)> {
-            let c = ((x + self.cx / 2).div_euclid(self.cx), (y + self.cy / 2).div_euclid(self.cy));
-            (c.0 >= 0 && c.1 >= 0 && c.0 < self.cols && c.1 < self.rows).then_some(c)
+        fn new(cx: i32, cy: i32, areas: &[Area]) -> Grid {
+            let mons = areas.iter().map(|&area| {
+                let w = area.work;
+                Mon { area, cols: ((w.2 - w.0) / cx).max(1), rows: ((w.3 - w.1) / cy).max(1) }
+            }).collect();
+            Grid { cx, cy, mons }
         }
-        fn at(&self, (c, r): (i32, i32)) -> (i32, i32) { (c * self.cx, r * self.cy) }
-        /// Free cell nearest to `want`; with no wish the first free one going down the columns, like Windows.
-        fn free(&self, taken: &HashSet<(i32, i32)>, want: Option<(i32, i32)>) -> (i32, i32) {
-            let all = (0..self.cols).flat_map(|c| (0..self.rows).map(move |r| (c, r))).filter(|c| !taken.contains(c));
+        fn all(&self) -> impl Iterator<Item = Slot> + '_ {
+            self.mons.iter().enumerate().flat_map(|(m, mo)| (0..mo.cols).flat_map(move |c| (0..mo.rows).map(move |r| (m, c, r))))
+        }
+        fn at(&self, (m, c, r): Slot) -> (i32, i32) { let w = self.mons[m].area.work; (w.0 + c * self.cx, w.1 + r * self.cy) }
+        /// The cell nearest to a position, free or not: on the monitor it is on, else on the nearest one (a gap between
+        /// monitors of different sizes, a monitor that is gone), at its nearest edge cell.
+        fn snap(&self, (x, y): (i32, i32)) -> Slot {
+            let cell = |m: usize, mo: &Mon| {
+                let w = mo.area.work;
+                (m, (x - w.0 + self.cx / 2).div_euclid(self.cx).clamp(0, mo.cols - 1), (y - w.1 + self.cy / 2).div_euclid(self.cy).clamp(0, mo.rows - 1))
+            };
+            self.mons.iter().enumerate().map(|(m, mo)| cell(m, mo)).min_by_key(|&c| d2(self.at(c), (x, y))).unwrap_or((0, 0, 0))
+        }
+        /// The cell a position is on (within half a cell of it); None if it is off every monitor's cells.
+        fn on(&self, p: (i32, i32)) -> Option<Slot> {
+            let c = self.snap(p);
+            let a = self.at(c);
+            ((a.0 - p.0).abs() * 2 <= self.cx && (a.1 - p.1).abs() * 2 <= self.cy).then_some(c)
+        }
+        /// Free cell nearest to `want`; with no wish the first free one: the primary monitor's, going down the columns, like
+        /// Windows (the next monitor's only when the primary is full).
+        fn free(&self, taken: &HashSet<Slot>, want: Option<(i32, i32)>) -> Slot {
+            let all = self.all().filter(|c| !taken.contains(c));
             match want {
-                Some((wc, wr)) => all.min_by_key(|&(c, r)| (c - wc).pow(2) + (r - wr).pow(2)),
+                Some(p) => all.min_by_key(|&c| d2(self.at(c), p)),
                 None => all.min(),
             }
-            .unwrap_or((0, 0))
+            .unwrap_or((0, 0, 0))
+        }
+        /// Where an icon at `p` of the layout `old` goes when the layout is this one: with its monitor's icon area, so the
+        /// bar coming or growing keeps every icon on its cell. A monitor that is gone or changed size (no monitor of this
+        /// grid has its rectangle) leaves the position as it is, for `snap` to put on the nearest cell.
+        fn carry(&self, old: &[Area], p: (i32, i32)) -> (i32, i32) {
+            let Some(o) = old.iter().min_by_key(|a| gap2(a.work, p)) else { return p };
+            match self.mons.iter().find(|m| m.area.rect == o.rect) {
+                Some(m) => (p.0 + m.area.work.0 - o.work.0, p.1 + m.area.work.1 - o.work.1),
+                None => p,
+            }
         }
     }
 
@@ -393,26 +494,56 @@ pub(crate) mod desk {
             it.iImage = -1; // I_IMAGECALLBACK
             put(list, LVM_INSERTITEMW, 0, &it as *const _ as isize);
         }
-        let old = if view().auto { HashMap::new() } else { saved() };
-        for (i, p) in plan(&Grid::of(list), &names(), &old).into_iter().enumerate() { set_pos(list, i, p); }
+        let g = Grid::of(list);
+        let (ox, oy) = origin();
+        let auto = view().auto;
+        let old: HashMap<String, (i32, i32)> = if auto { HashMap::new() } else { saved().into_iter().map(|(n, (x, y))| (n, (x + ox, y + oy))).collect() };
+        let names = names();
+        let near = if auto { None } else { wanted() };
+        for (i, p) in plan(&g, &names, &old, near).into_iter().enumerate() { set_pos(list, i, p); }
+        if near.is_some() && names.iter().any(|n| !old.contains_key(n)) { WANT.set(None); } // the new icons came: used up
         save(list);
     }
 
-    /// Where each icon goes (list pixels, in the order of `names`): on its saved cell when that is on the grid and nobody else
-    /// has it, the others on the first free cells going down the columns. With nothing saved (arranging automatically) that is
-    /// the sort order, column after column.
-    fn plan(g: &Grid, names: &[String], old: &HashMap<String, (i32, i32)>) -> Vec<(i32, i32)> {
+    /// The monitors or the bar changed (a monitor came, went or resized; the bar came, went or changed its strip): every icon
+    /// goes with its monitor's icon area, or when its monitor is gone to the nearest free cell of another.
+    pub fn relayout(list: HWND) {
+        let names = names();
+        if put(list, LVM_GETITEMCOUNT, 0, 0) as usize != names.len() { return; } // not loaded yet: the first fill lays out
+        let (old_v, old) = LAST.take();
+        let g = Grid::of(list);
+        let cur: HashMap<String, (i32, i32)> = if view().auto { HashMap::new() } else {
+            names.iter().enumerate().map(|(i, n)| { let (x, y) = raw_pos(list, i); (n.clone(), g.carry(&old, (x + old_v.0, y + old_v.1))) }).collect()
+        };
+        for (i, p) in plan(&g, &names, &cur, None).into_iter().enumerate() { set_pos(list, i, p); }
+        save(list);
+    }
+
+    /// Where each icon goes (screen pixels, in the order of `names`): on its saved cell when that is on a monitor's grid and
+    /// nobody else has it; the icons whose position is off every grid (a gap between monitors, a monitor that went away) or
+    /// whose cell is taken on the nearest free cells to where they were; new ones (`near`: where they should appear, such as
+    /// the point of a drop) on the free cells nearest to it, else the first free cells going down the primary monitor's columns.
+    /// With nothing saved (arranging automatically) that is the sort order, column after column.
+    fn plan(g: &Grid, names: &[String], old: &HashMap<String, (i32, i32)>, near: Option<(i32, i32)>) -> Vec<(i32, i32)> {
         let mut taken = HashSet::new();
         let mut out = vec![(0, 0); names.len()];
-        let mut later = vec![];
+        let (mut moved, mut fresh) = (vec![], vec![]);
         for (i, name) in names.iter().enumerate() {
-            match old.get(name).and_then(|&p| g.cell(p)).filter(|c| !taken.contains(c)) {
-                Some(c) => { taken.insert(c); out[i] = g.at(c); }
-                None => later.push(i),
+            match old.get(name) {
+                Some(&p) => match g.on(p).filter(|c| !taken.contains(c)) {
+                    Some(c) => { taken.insert(c); out[i] = g.at(c); }
+                    None => moved.push((i, p)),
+                },
+                None => fresh.push(i),
             }
         }
-        for i in later {
-            let c = g.free(&taken, None);
+        for (i, p) in moved {
+            let c = g.free(&taken, Some(p));
+            taken.insert(c);
+            out[i] = g.at(c);
+        }
+        for i in fresh {
+            let c = g.free(&taken, near);
             taken.insert(c);
             out[i] = g.at(c);
         }
@@ -428,7 +559,7 @@ pub(crate) mod desk {
     pub fn dropped_here(at: (i32, i32)) { DROP_AT.set(Some(at)); }
 
     /// After the drag: on a folder icon (not one of the dragged) the selection moves into that folder; anywhere else the
-    /// icons move by the drag distance, snapped to the grid, each to the nearest free cell. true = handled here.
+    /// icons move by the drag distance (on any monitor), each to the nearest free cell. true = handled here.
     pub fn drag_end(h: HWND, list: HWND) -> bool {
         let Some(from) = DRAG_FROM.take() else { return false };
         // normally our drop target recorded where it ended; over a live wallpaper OLE never reaches it (the wallpaper window of
@@ -464,19 +595,15 @@ pub(crate) mod desk {
         }
         let g = Grid::of(list);
         if view().auto { // nothing stays where it was dropped: everything goes back to the order of the sort
-            for (i, p) in plan(&g, &names(), &HashMap::new()).into_iter().enumerate() { set_pos(list, i, p); }
+            for (i, p) in plan(&g, &names(), &HashMap::new(), None).into_iter().enumerate() { set_pos(list, i, p); }
             return true;
         }
         let n = put(list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
-        let mut taken: HashSet<(i32, i32)> = (0..n).filter(|i| !sel.contains(i)).filter_map(|i| g.cell(pos(list, i))).collect();
+        let mut taken: HashSet<Slot> = (0..n).filter(|i| !sel.contains(i)).map(|i| g.snap(pos(list, i))).collect();
         let (dx, dy) = (pt.x - from.0, pt.y - from.1);
         for &i in &sel {
             let (x, y) = pos(list, i);
-            let want = g.cell((x + dx, y + dy)).unwrap_or_else(|| {
-                // dragged off the grid: the nearest edge cell
-                (((x + dx) / g.cx).clamp(0, g.cols - 1), ((y + dy) / g.cy).clamp(0, g.rows - 1))
-            });
-            let c = if taken.contains(&want) { g.free(&taken, Some(want)) } else { want };
+            let c = g.free(&taken, Some((x + dx, y + dy))); // dropped between monitors or off them: the nearest cell there is
             taken.insert(c);
             set_pos(list, i, g.at(c));
         }
@@ -545,41 +672,157 @@ pub(crate) mod desk {
 
     #[cfg(test)]
     mod tests {
-        use super::{Grid, plan};
+        use super::{Area, Grid, area_of, parse_saved, plan, saved_text};
         use std::collections::{HashMap, HashSet};
+
+        /// A monitor of size w x h at (x, y) whose icon area is the whole of it (no bar).
+        fn mon(x: i32, y: i32, w: i32, h: i32) -> Area { Area { rect: (x, y, x + w, y + h), work: (x, y, x + w, y + h) } }
+        /// Cells of 100 x 90, so a 300 x 180 monitor holds 3 x 2.
+        fn grid(areas: &[Area]) -> Grid { Grid::new(100, 90, areas) }
 
         #[test]
         fn grid_cells() {
-            let g = Grid { cx: 100, cy: 90, cols: 5, rows: 4 };
-            assert_eq!(g.cell((0, 0)), Some((0, 0)));
-            assert_eq!(g.cell((149, 44)), Some((1, 0))); // rounds to the nearest cell
-            assert_eq!(g.cell((900, 0)), None); // off the grid
-            let mut taken: HashSet<_> = [(0, 0), (0, 1)].into();
-            assert_eq!(g.free(&taken, None), (0, 2)); // down the first column first
-            taken.insert((2, 2));
-            assert_eq!(g.free(&taken, Some((2, 2))), (1, 2)); // nearest free to the wish (ties: lowest)
+            let g = grid(&[mon(0, 0, 500, 360)]); // 5 x 4
+            assert_eq!(g.snap((0, 0)), (0, 0, 0));
+            assert_eq!(g.on((149, 44)), Some((0, 1, 0))); // rounds to the nearest cell
+            assert_eq!(g.on((900, 0)), None); // off the grid
+            assert_eq!(g.snap((900, 0)), (0, 4, 0)); // ... and its nearest edge cell
+            assert_eq!(g.at((0, 4, 3)), (400, 270));
+            let mut taken: HashSet<_> = [(0, 0, 0), (0, 0, 1)].into();
+            assert_eq!(g.free(&taken, None), (0, 0, 2)); // down the first column first
+            taken.insert((0, 2, 2));
+            assert_eq!(g.free(&taken, Some((200, 180))), (0, 2, 1)); // nearest free to the wish: cells are taller than wide, so above it (ties: lowest)
         }
 
         fn names(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
 
         #[test]
         fn saved_cells_are_kept_and_the_rest_fills_the_free_ones() {
-            let g = Grid { cx: 100, cy: 90, cols: 3, rows: 2 };
+            let g = grid(&[mon(0, 0, 300, 180)]); // 3 x 2
             let old: HashMap<_, _> = [("b".to_string(), (200, 90)), ("gone".to_string(), (0, 0)), ("off".to_string(), (900, 900))].into();
-            // b keeps (2, 1); a and c (new) and "off" (its cell is off the grid now) take the free cells down the columns
-            let p = plan(&g, &names(&["a", "b", "c", "off"]), &old);
-            assert_eq!(p, vec![(0, 0), (200, 90), (0, 90), (100, 0)]);
+            // b keeps (2, 1); "off" (its position is off the grid) takes the free cell nearest to where it was, a and c (new) the
+            // first free ones down the columns
+            let p = plan(&g, &names(&["a", "b", "c", "off"]), &old, None);
+            assert_eq!(p, vec![(0, 0), (200, 90), (0, 90), (100, 90)]);
         }
 
         #[test]
         fn arranging_automatically_ignores_the_saved_cells_and_follows_the_order_down_the_columns() {
-            let g = Grid { cx: 100, cy: 90, cols: 3, rows: 2 };
-            let p = plan(&g, &names(&["a", "b", "c", "d"]), &HashMap::new());
+            let g = grid(&[mon(0, 0, 300, 180)]);
+            let p = plan(&g, &names(&["a", "b", "c", "d"]), &HashMap::new(), None);
             assert_eq!(p, vec![(0, 0), (0, 90), (100, 0), (100, 90)]);
             // the same names with a different sort order: a different layout, whatever was saved
-            let p = plan(&g, &names(&["d", "c", "b", "a"]), &[("a".to_string(), (200, 90))].into());
+            let p = plan(&g, &names(&["d", "c", "b", "a"]), &[("a".to_string(), (200, 90))].into(), None);
             assert_eq!(p[3], (200, 90)); // not auto: a keeps its cell
-            assert_eq!(plan(&g, &names(&["d", "c", "b", "a"]), &HashMap::new())[3], (100, 90)); // auto: it is the fourth
+            assert_eq!(plan(&g, &names(&["d", "c", "b", "a"]), &HashMap::new(), None)[3], (100, 90)); // auto: it is the fourth
+        }
+
+        #[test]
+        fn two_monitors_side_by_side_of_different_heights_leave_a_gap_no_icon_stands_in() {
+            // primary 500 x 360 at the origin, the second 300 x 180 right of it, its top aligned: below it is a gap
+            let g = grid(&[mon(0, 0, 500, 360), mon(500, 0, 300, 180)]);
+            assert_eq!(g.on((500, 0)), Some((1, 0, 0))); // the second monitor's first cell
+            assert_eq!(g.on((700, 90)), Some((1, 2, 1)));
+            assert_eq!(g.on((600, 270)), None); // in the gap under the second monitor
+            assert_eq!(g.snap((600, 270)), (1, 1, 1)); // nearest is the second monitor's bottom row (it is closer than the primary)
+            assert_eq!(g.snap((450, 300)), (0, 4, 3)); // ... but here the primary's
+            assert_eq!(g.at((1, 2, 1)), (700, 90));
+            // new icons start on the primary, and go on to the second monitor only when it is full
+            let many: Vec<String> = (0..21).map(|i| format!("n{i}")).collect();
+            let p = plan(&g, &many, &HashMap::new(), None);
+            assert_eq!(p[19], (400, 270)); // the primary's last cell (5 x 4 = 20 cells)
+            assert_eq!(p[20], (500, 0)); // the 21st: the second monitor
+        }
+
+        #[test]
+        fn a_monitor_above_the_primary_and_one_left_of_it_have_negative_coordinates() {
+            let g = grid(&[mon(0, 0, 300, 180), mon(0, -180, 300, 180), mon(-300, 0, 300, 180)]);
+            assert_eq!(g.on((0, -90)), Some((1, 0, 1)));
+            assert_eq!(g.on((-100, 0)), Some((2, 2, 0)));
+            // a point between the two outer monitors' corners lands on a cell of a real monitor
+            for p in [(-50, -50), (310, 200), (-400, 400), (150, -500)] {
+                let c = g.snap(p);
+                let a = g.at(c);
+                assert!(g.all().any(|x| x == c), "{p:?} -> {c:?} is no cell");
+                assert!(g.mons.iter().any(|m| a.0 >= m.area.work.0 && a.0 < m.area.work.2 && a.1 >= m.area.work.1 && a.1 < m.area.work.3));
+            }
+        }
+
+        #[test]
+        fn icons_of_a_removed_monitor_snap_to_the_nearest_free_cells_of_the_rest() {
+            let both = grid(&[mon(0, 0, 300, 180), mon(300, 0, 300, 180)]);
+            let names = names(&["a", "b", "c", "d"]);
+            // a and b on the second monitor (x >= 300), c and d on the primary
+            let old: HashMap<_, _> = [("a", (300, 0)), ("b", (400, 90)), ("c", (0, 0)), ("d", (100, 0))].map(|(n, p)| (n.to_string(), p)).into();
+            assert_eq!(plan(&both, &names, &old, None), vec![(300, 0), (400, 90), (0, 0), (100, 0)]); // unchanged while both are there
+            let one = grid(&[mon(0, 0, 300, 180)]); // the second one is unplugged
+            let p = plan(&one, &names, &old, None);
+            assert_eq!(p[2], (0, 0));
+            assert_eq!(p[3], (100, 0)); // the ones that stayed keep their cells
+            assert_eq!(p[0], (200, 0)); // a: the nearest free cell to (300, 0) is the primary's right column, top
+            assert_eq!(p[1], (200, 90)); // b: next to it
+            assert_eq!(p.iter().collect::<HashSet<_>>().len(), 4, "no two icons on one cell");
+        }
+
+        #[test]
+        fn the_bar_changing_moves_the_icons_with_their_monitor_and_a_gone_monitor_does_not() {
+            let before = [mon(0, 0, 300, 180), mon(300, 0, 300, 180)];
+            // a bar appears on the primary: its icon area starts 40 px lower; the second monitor is unchanged
+            let mut after = before;
+            after[0].work.1 += 40;
+            let g = grid(&after);
+            assert_eq!(g.carry(&before, (100, 90)), (100, 130)); // on the primary: down with the area, so the same cell
+            assert_eq!(g.carry(&before, (400, 0)), (400, 0)); // on the second monitor: where it was
+            // a monitor that changed size is no longer there: the position is left for `snap`
+            let g = grid(&[mon(0, 0, 300, 180), mon(300, 0, 200, 180)]);
+            assert_eq!(g.carry(&before, (400, 90)), (400, 90));
+            assert_eq!(g.carry(&[], (5, 6)), (5, 6));
+        }
+
+        #[test]
+        fn new_icons_appear_near_the_drop_point_on_any_monitor() {
+            let g = grid(&[mon(0, 0, 300, 180), mon(300, 0, 300, 180)]);
+            let old: HashMap<_, _> = [("a".to_string(), (400, 90))].into();
+            // two dropped files at the second monitor's (410, 10): a is on a cell near it, they take the free ones around it
+            let p = plan(&g, &names(&["a", "x", "y"]), &old, Some((410, 10)));
+            assert_eq!(p[0], (400, 90));
+            assert_eq!(p[1], (400, 0));
+            assert_eq!(p[2], (500, 0)); // then the next nearest
+            // without a wish they go to the primary
+            assert_eq!(plan(&g, &names(&["a", "x"]), &old, None)[1], (0, 0));
+        }
+
+        #[test]
+        fn the_bar_strips_shape_each_monitors_icon_area() {
+            // no bar: a small gap at the top and bottom
+            let a = area_of((1920, 0, 3840, 1080), (1920, 0, 3840, 1080), false);
+            assert_eq!(a.work, (1920, 8, 3840, 1072));
+            // a bar reserving 40 px on top, another 36 px at the bottom
+            let a = area_of((0, 0, 2560, 1440), (0, 40, 2560, 1404), false);
+            assert_eq!(a.work, (0, 48, 2560, 1400));
+            // the dock floats over the bottom edge without reserving: a fixed gap
+            let a = area_of((0, 0, 1920, 1080), (0, 0, 1920, 1080), true);
+            assert_eq!(a.work, (0, 8, 1920, 1028));
+            // a side bar's strip is outside the work area already
+            assert_eq!(area_of((0, 0, 1920, 1080), (60, 0, 1920, 1080), false).work.0, 60);
+        }
+
+        #[test]
+        fn positions_survive_the_file_both_ways_with_negative_coordinates_and_odd_names() {
+            let items = [("a.txt", (0, 0)), ("New folder (2)", (-300, 90)), ("tab\u{e9} \u{65e5}\u{672c}.lnk", (4000, -180))];
+            let text = saved_text(items.iter().map(|&(n, p)| (n, p)));
+            let back = parse_saved(&text);
+            assert_eq!(back.len(), 3);
+            for (n, p) in items { assert_eq!(back[n], p); }
+            // a file from before the second monitor read the same way, and a garbled line is skipped
+            assert_eq!(parse_saved("76\t64\tx\nnot a line\n\t\t\n")["x"], (76, 64));
+            // and the cells come out the same after the round trip
+            let g = grid(&[mon(0, 0, 500, 360), mon(500, 0, 300, 180)]);
+            let ns = names(&["p", "q"]);
+            let old: HashMap<_, _> = [("p".to_string(), (200, 90)), ("q".to_string(), (700, 90))].into();
+            let first = plan(&g, &ns, &old, None);
+            let again = parse_saved(&saved_text(ns.iter().zip(&first).map(|(n, &p)| (n.as_str(), p))));
+            assert_eq!(plan(&g, &ns, &again, None), first);
         }
     }
 }
