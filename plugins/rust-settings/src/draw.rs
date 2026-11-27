@@ -14,7 +14,7 @@ use winrust_ui::{
 };
 
 use crate::{
-    Box4, Cmd, Drive, Extra, Fill, Hero, Hue, Line, Op, Row, Tile, Tone,
+    Box4, Cmd, Drive, Extra, Fill, Hero, Hue, Line, Op, Row, Tile, Tone, WU_PAGE, is_seg,
     app::{
         Fid, ID_FIRST_SELECT, ID_ARR, ID_BACK, ID_DLG_KEEP, ID_DLG_REVERT, ID_DLG_SCRIM, ID_GACT, ID_HERO, ID_HIT, ID_IDENTIFY, ID_NAV, ID_PROFILE, ID_SCROLL, ID_SEARCH, ID_WALL, ID_AQ, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, row_id,
         style_search,
@@ -40,7 +40,8 @@ fn tone_ink(t: Tone) -> Rgba {
         Tone::Good => GREEN,
         Tone::Warn => AMBER,
         Tone::Bad => RED,
-        Tone::Accent => acc(),
+        Tone::Accent => acc().accent_text(),
+        Tone::Faint => T4,
     }
 }
 
@@ -70,6 +71,10 @@ pub enum BKind {
     Quiet,
     Primary,
     Danger,
+    /// The one of a few ways that is chosen: the accent's tint.
+    Chosen,
+    /// One of a few ways that is not chosen.
+    Soft,
 }
 
 impl ExpItem {
@@ -130,9 +135,11 @@ fn extra_height(e: &Extra) -> f32 {
 
 /// The height of a line's own row.
 fn row_height(l: &Line) -> f32 {
-    if l.big {
+    if let Some(h) = l.h {
+        h
+    } else if l.big {
         72.0
-    } else if matches!(l.row, Row::Cycle(_, _, Op::Proxy | Op::Pac)) {
+    } else if matches!(l.row, Row::Cycle(_, _, Op::Proxy | Op::Pac | Op::Try)) {
         40.0
     } else if l.sub.is_empty() {
         48.0
@@ -192,6 +199,11 @@ impl Settings {
             Row::Cycle(_, _, Op::Pac) => {
                 v.push(ExpItem::Field(Fid::Pac, t!("Адрес скрипта (PAC), необязательно", "Setup script (PAC) address, optional")));
                 err(&mut v);
+            }
+            Row::Cycle(_, _, Op::Try) => v.push(ExpItem::Field(Fid::Try, t!("Удерживайте клавишу здесь, чтобы почувствовать скорость повтора", "Hold down a key here to feel the repeat speed"))),
+            Row::Item(_, _, Cmd::NotifyApp(_)) if open => {
+                let cur = l.cur.unwrap_or(0);
+                v.push(ExpItem::Acts(crate::more::mode_labels().iter().enumerate().map(|(i, name)| Act { label: (*name).into(), kind: if i == cur { if i == 2 { BKind::Danger } else { BKind::Chosen } } else { BKind::Soft }, busy: false }).collect()));
             }
             Row::Item(_, _, Cmd::BtUnpair(_)) if open => {
                 let armed = self.armed.as_deref() == Some(l.key.as_str());
@@ -321,14 +333,14 @@ impl Settings {
         let initial = user.chars().next().map_or('?', |ch| ch.to_ascii_uppercase()).to_string();
         let av = Rect::new(p.x + 8.0, p.y + 8.0, 36.0, 36.0);
         c.circle(av.cx(), av.cy(), 18.0, acc_at(0.22));
-        c.text(&initial, av, Font::new(15.0, 600), acc(), Align::Center);
+        c.text(&initial, av, Font::new(15.0, 600), acc().accent_text(), Align::Center);
         c.text_fit(&user, Rect::new(p.x + 54.0, p.y + 10.5, p.w - 62.0, 16.0), BODY_M.weight600(), T1, Align::Start);
         c.text_fit(&pc, Rect::new(p.x + 54.0, p.y + 26.5, p.w - 62.0, 15.0), SMALL, T3, Align::Start);
         // the pages
         let searching = !self.q.text.trim().is_empty();
         let wu_count = self.wu_badge;
         for i in 0..PAGES {
-            let y = 122.0 + 36.0 * i as f32 + if i >= 5 { 10.0 } else { 0.0 } + if i >= 8 { 10.0 } else { 0.0 };
+            let y = 122.0 + 36.0 * i as f32 + 10.0 * [5, 9, 11].iter().filter(|&&g| i >= g).count() as f32;
             let r = Rect::new(10.0, y, 215.0, 34.0);
             let cur = !searching && i == self.page;
             let hot = f.focusable(ID_NAV + i as Id, r);
@@ -341,8 +353,8 @@ impl Settings {
             c.fill(t, 6.0, look::rgb(tile));
             c.icon(glyph, (t.cx(), t.cy()), 13.0, 2.2, Rgba::pure_white(1.0), 0.0);
             let title = crate::page_title(i);
-            c.text_fit(&title, Rect::new(r.x + 40.0, r.y, r.w - 48.0 - if i == 6 && wu_count > 0 { 26.0 } else { 0.0 }, r.h), Font::new(13.0, if cur { 600 } else { 500 }), T1, Align::Start);
-            if i == 6 && wu_count > 0 {
+            c.text_fit(&title, Rect::new(r.x + 40.0, r.y, r.w - 48.0 - if i == WU_PAGE && wu_count > 0 { 26.0 } else { 0.0 }, r.h), Font::new(13.0, if cur { 600 } else { 500 }), T1, Align::Start);
+            if i == WU_PAGE && wu_count > 0 {
                 let b = Rect::new(r.x + r.w - 8.0 - 18.0, r.cy() - 9.0, 18.0, 18.0);
                 c.fill(b, 9.0, look::BADGE);
                 c.text(&wu_count.to_string(), b, Font::new(11.0, 600), Rgba::pure_white(1.0), Align::Center);
@@ -512,7 +524,7 @@ impl Settings {
         if !first {
             c.fill(Rect::new(card.x, y - 1.0, card.w, 1.0), 0.0, ink(0.06));
         }
-        let clickable = matches!(l.row, Row::Wifi(..) | Row::Adapter(..)) || matches!(l.row, Row::Cycle(_, _, Op::Hidden)) || matches!(l.row, Row::Item(_, _, Cmd::BtUnpair(_)));
+        let clickable = matches!(l.row, Row::Wifi(..) | Row::Adapter(..)) || matches!(l.row, Row::Cycle(_, _, Op::Hidden)) || matches!(l.row, Row::Item(_, _, Cmd::BtUnpair(_) | Cmd::NotifyApp(_) | Cmd::PrivGo(_) | Cmd::OpenSecurity));
         let mut hover = 0.0;
         if clickable {
             let hot = f.item(row_id(flat, P_BODY), r);
@@ -625,7 +637,10 @@ impl Settings {
     fn right_items(&self, l: &Line) -> Vec<RItem> {
         let mut v = Vec::new();
         match &l.row {
-            Row::Toggle { .. } | Row::Switch(..) => v.push(RItem::Switch(l.on)),
+            Row::Toggle { .. } | Row::Switch(..) | Row::Flag(..) => v.push(RItem::Switch(l.on, l.dis)),
+            Row::Gauge(..) => v.push(RItem::Slider { w: 260.0, v: l.vol, mute: None }),
+            Row::Cycle(_, _, Op::Try) => {}
+            Row::Cycle(_, _, op) if is_seg(*op) && !l.opts.is_empty() && !matches!(op, Op::Topology | Op::Plan) => v.push(RItem::Seg(l.opts.clone(), l.cur.unwrap_or(usize::MAX))),
             Row::Info(..) => {
                 if !l.val.is_empty() {
                     v.push(RItem::Val(l.val.clone()));
@@ -647,7 +662,11 @@ impl Settings {
                 v.push(RItem::Slider { w, v: l.vol, mute: l.mute });
             }
             Row::Item(_, _, cmd) => match cmd {
-                Cmd::BtUnpair(_) => v.push(RItem::Chev(self.open.as_deref() == Some(l.key.as_str()))),
+                Cmd::BtUnpair(_) | Cmd::NotifyApp(_) => v.push(RItem::Chev(self.open.as_deref() == Some(l.key.as_str()))),
+                Cmd::PrivGo(_) | Cmd::OpenSecurity => v.push(RItem::Chev(false)),
+                Cmd::QuickScan => v.push(RItem::Btns(vec![RBtn { label: l.val.clone(), kind: BKind::Quiet, busy: l.busy, dis: l.busy }])),
+                Cmd::SyncTime => v.push(RItem::Btns(vec![RBtn { label: if self.syncing { t!("Синхронизация", "Syncing").into() } else { l.val.clone() }, kind: BKind::Quiet, busy: self.syncing, dis: self.syncing }])),
+                Cmd::NotifyMode(..) => {}
                 Cmd::CleanTemp => {
                     if l.busy {
                         v.push(RItem::Val(l.val.clone()));
@@ -718,9 +737,9 @@ impl Settings {
                 let k = f.tween(id(P_BODY) + 100_000, 6, f32::from(*open), 250, SPRING);
                 c.icon(look::CHEVRON_RIGHT, (x + 6.0, r.cy()), 12.0, 2.4, T4, 90.0 * k);
             }
-            RItem::Switch(on) => {
+            RItem::Switch(on, dim) => {
                 let tr = Rect::new(x, r.cy() - 11.0, 38.0, 22.0);
-                let (state, dis) = (on.unwrap_or(false), on.is_none());
+                let (state, dis) = (on.unwrap_or(false), on.is_none() || *dim);
                 c.faded(if dis { 0.45 } else { 1.0 }, |c| {
                     button::toggle(c, f, id(P_CTL), tr, state);
                 });
@@ -902,9 +921,11 @@ impl Settings {
                             f.hand();
                             c.transformed(rect.cx(), rect.cy(), 1.0 - 0.03 * hot.press, 0.0, 0.0, |c| {
                                 let (bg, fg) = match a.kind {
-                                    BKind::Primary => (acc(), Rgba::pure_white(1.0)),
+                                    BKind::Primary => (acc().accent_fill(), Rgba::pure_white(1.0)),
                                     BKind::Danger => (Rgba::css(229, 72, 77, 0.14), RED),
-                                    _ => (ink(0.08), T1),
+                                    BKind::Chosen => (acc_at(0.20), T1),
+                                    BKind::Soft => (ink(0.06), T2),
+                                    BKind::Quiet => (ink(0.08), T1),
                                 };
                                 c.fill(rect, 8.0, bg);
                                 if hot.hover > 0.0 {
@@ -978,7 +999,7 @@ impl Settings {
             let on = j == sel;
             c.fill(r, 8.0, if on { acc_at(0.22) } else { ink(0.08 + 0.02 * hot.hover) });
             c.ring(r, 8.0, if on { 2.0 } else { 1.0 }, if on { acc() } else { ink(0.16) });
-            let ink_n = if on { acc() } else { T2 };
+            let ink_n = if on { acc().accent_text() } else { T2 };
             c.text(&(j + 1).to_string(), Rect::new(r.x, r.cy() - 20.0, r.w, 24.0), Font::new(20.0, 600), ink_n, Align::Center);
             c.text(&format!("{}\u{d7}{}", m.w, m.h), Rect::new(r.x, r.cy() + 4.0, r.w, 14.0), Font::new(11.0, 400), T3, Align::Center);
             if m.primary {
@@ -1087,7 +1108,7 @@ impl Settings {
                     let hot = f.item(id, b);
                     f.hand();
                     c.transformed(b.cx(), b.cy(), 1.0 - 0.03 * hot.press, 0.0, 0.0, |c| {
-                        c.fill(b, 9.0, if primary { acc() } else { ink(0.08) });
+                        c.fill(b, 9.0, if primary { acc().accent_fill() } else { ink(0.08) });
                         if hot.hover > 0.0 {
                             c.fill(b, 9.0, Rgba::pure_white(0.1 * hot.hover));
                         }
@@ -1143,7 +1164,7 @@ enum RItem {
     Val(String),
     Spin(f32),
     Chev(bool),
-    Switch(Option<bool>),
+    Switch(Option<bool>, bool),
     Select(String),
     Seg(Vec<String>, usize),
     Btns(Vec<RBtn>),
@@ -1168,7 +1189,7 @@ fn item_width(c: &mut Canvas<'_>, it: &RItem) -> f32 {
         RItem::Val(s) => c.measure(s, BODY.tabular()).ceil(),
         RItem::Spin(d) => *d,
         RItem::Chev(_) => 12.0,
-        RItem::Switch(_) => 38.0,
+        RItem::Switch(..) => 38.0,
         RItem::Select(s) => (c.measure(s, Font::new(12.5, 500)).ceil() + 11.0 + 8.0 + 10.0 + 8.0).min(280.0),
         RItem::Seg(l, _) => {
             let names: Vec<&str> = l.iter().map(String::as_str).collect();
@@ -1183,8 +1204,10 @@ fn item_width(c: &mut Canvas<'_>, it: &RItem) -> f32 {
 fn btn_colors(k: BKind) -> (Rgba, Rgba) {
     match k {
         BKind::Quiet => (ink(0.08), T1),
-        BKind::Primary => (acc(), Rgba::pure_white(1.0)),
+        BKind::Primary => (acc().accent_fill(), Rgba::pure_white(1.0)),
         BKind::Danger => (Rgba::css(229, 72, 77, 0.16), RED),
+        BKind::Chosen => (acc_at(0.20), T1),
+        BKind::Soft => (ink(0.06), T2),
     }
 }
 
@@ -1192,15 +1215,15 @@ fn paint_tile(c: &mut Canvas<'_>, r: Rect, t: Tile) {
     let (bg, fg, d): (Rgba, Rgba, &'static str) = match t {
         Tile::None => return,
         Tile::Quiet(d) => (ink(0.06), T2, d),
-        Tile::Lit(d) => (acc_at(0.20), acc(), d),
+        Tile::Lit(d) => (acc_at(0.20), acc().accent_text(), d),
         Tile::Solid(d, col) => (look::rgb(col), Rgba::pure_white(1.0), d),
         Tile::Soft(d, tone) => {
             let (bg, fg) = match tone {
                 Tone::Good => (Rgba::css(76, 195, 138, 0.16), GREEN),
                 Tone::Warn => (Rgba::css(255, 163, 72, 0.16), AMBER),
                 Tone::Bad => (Rgba::css(229, 72, 77, 0.14), RED),
-                Tone::Accent => (acc_at(0.18), acc()),
-                Tone::Dim => (ink(0.06), T2),
+                Tone::Accent => (acc_at(0.18), acc().accent_text()),
+                Tone::Dim | Tone::Faint => (ink(0.06), T2),
             };
             (bg, fg, d)
         }
@@ -1229,7 +1252,7 @@ fn paint_hero(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, h: &Hero) {
     let (bg, fg) = match h.tone {
         Tone::Good => (Rgba::css(76, 195, 138, 0.16), GREEN),
         Tone::Bad => (Rgba::css(229, 72, 77, 0.14), RED),
-        _ => (acc_at(0.18), acc()),
+        _ => (acc_at(0.18), acc().accent_text()),
     };
     c.fill(t, 12.0, bg);
     c.icon(h.d, (t.cx(), t.cy()), 24.0, 1.9, fg, 0.0);
@@ -1240,7 +1263,7 @@ fn paint_hero(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, h: &Hero) {
         let hot = f.focusable(ID_HERO, b);
         f.hand();
         c.transformed(b.cx(), b.cy(), 1.0 - 0.03 * hot.press, 0.0, 0.0, |c| {
-            c.fill(b, 8.0, acc());
+            c.fill(b, 8.0, acc().accent_fill());
             c.fill(b, 8.0, Rgba::pure_white(0.1 * hot.hover));
             c.text(label, b, BODY_M, Rgba::pure_white(1.0), Align::Center);
         });

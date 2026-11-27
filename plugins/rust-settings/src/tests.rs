@@ -3,7 +3,8 @@
 //! Nothing here reads or writes the real system: `os()` is the demo source on every thread of `cargo test`.
 use super::*;
 use crate::{
-    app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
+    more::{Cap, Flag, Gauge, Opt, Who},
+    app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
     demo::{self, Demo},
 };
 use std::rc::Rc;
@@ -110,7 +111,8 @@ fn names_and_pages() {
     assert_eq!(os_name("Windows 10 Pro", 26100), "Windows 11 Pro");
     assert_eq!(os_name("Windows 10 Pro", 19045), "Windows 10 Pro");
     assert_eq!(gb(16 << 30), "16.0 GB");
-    assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (8, 0, 0, 0));
+    assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (ABOUT_PAGE, 0, 0, 0));
+    assert_eq!((page_for("ms-settings:notifications"), page_for("ms-settings:privacy-microphone"), page_for("ms-settings:keyboard"), page_for("ms-settings:dateandtime")), (NOTIFY_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE));
     assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 7));
     assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
     assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (2, 2));
@@ -160,7 +162,7 @@ fn search_finds_lines_by_label_value_and_section_case_insensitively() {
     assert!(f.is_empty() || f.iter().all(|f| f.page == 0), "{f:?}"); // (the built-in display has no HDR line: nothing, or only Display)
     // by value: the About page holds the computer name as a value
     let f = search::search(&pgs, "daniiar-pc");
-    assert!(f.iter().any(|f| f.page == 8), "{f:?}");
+    assert!(f.iter().any(|f| f.page == ABOUT_PAGE), "{f:?}");
     // by section title: every line of "Volume per app"
     let title = pgs[1].groups[2].title.to_lowercase();
     let f = search::search(&pgs, &title);
@@ -786,7 +788,7 @@ fn the_sidebar_pages_history_and_back() {
     assert!(s.key(0x28, Mods { ctrl: true, shift: false }, &mut Cx::default()));
     assert_eq!(s.page, 1);
     click(&mut s, app::ID_PROFILE);
-    assert_eq!(s.page, 8);
+    assert_eq!(s.page, ABOUT_PAGE);
 }
 
 #[test]
@@ -824,8 +826,8 @@ fn the_page_signature_notices_a_change() {
 fn the_source_files_of_the_window_never_call_the_system_but_through_os() {
     // the window's own files may name the types of the logic modules and use their pure helpers; every other call goes through `os()`
     const PURE: [&str; 10] = ["display::resolutions", "display::with_res", "display::rates_at", "display::snap", "wifi::reason_text", "ext::valid_proxy", "ext::valid_pac", "ext::night_helper", "power::size", "net::speed_text"];
-    let modules = ["audio", "bt", "display", "ext", "net", "power", "sys", "wifi", "wu"];
-    for (file, text) in [("main.rs", include_str!("main.rs")), ("app.rs", include_str!("app.rs")), ("draw.rs", include_str!("draw.rs")), ("search.rs", include_str!("search.rs"))] {
+    let modules = ["audio", "bt", "display", "ext", "net", "power", "sys", "sysx", "wifi", "wu"];
+    for (file, text) in [("main.rs", include_str!("main.rs")), ("app.rs", include_str!("app.rs")), ("draw.rs", include_str!("draw.rs")), ("search.rs", include_str!("search.rs")), ("more.rs", include_str!("more.rs"))] {
         for m in modules {
             let pat = format!("{m}::");
             let mut rest = text;
@@ -978,4 +980,211 @@ fn light_and_dark_draw_every_state_of_the_design() {
         }
     }
     winrust_common::style::set_light(false);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the pages of the second design round: Notifications, Privacy & security, Keyboard & mouse, Date & time
+
+#[test]
+fn the_new_pages_are_in_the_sidebars_order_and_the_search_finds_their_lines() {
+    assert_eq!(PAGES, 13);
+    assert_eq!((NOTIFY_PAGE, PERSONAL_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE, WU_PAGE, ABOUT_PAGE), (6, 7, 8, 9, 10, 11, 12));
+    assert_eq!(look::NAV.len(), PAGES);
+    let pgs = pages();
+    assert!(pgs.iter().all(|p| !p.groups.is_empty()));
+    // (under test the language is Russian: ask for a line by the label the page itself has)
+    let label = |p: usize, pred: fn(&Row) -> bool| pgs[p].groups.iter().flat_map(|g| &g.rows).find(|l| pred(&l.row)).unwrap().row.label().to_lowercase();
+    let f = search::search(&pgs, &label(PRIVACY_PAGE, |r| matches!(r, Row::Info(_, v) if v == "On" || v == "Включён")));
+    assert!(f.iter().any(|f| f.page == PRIVACY_PAGE), "{f:?}");
+    let f = search::search(&pgs, &label(KEYBOARD_PAGE, |r| matches!(r, Row::Gauge(_, Gauge::Pointer))));
+    assert!(f.iter().any(|f| f.page == KEYBOARD_PAGE), "{f:?}");
+}
+
+#[test]
+fn a_notifying_app_unfolds_and_its_way_reaches_the_system() {
+    let (mut s, d) = win("notify");
+    let tg = |l: &Line| l.key == "na:telegram";
+    press(&mut s, tg, P_BODY);
+    assert_eq!(s.open.as_deref(), Some("na:telegram"), "a click unfolds it");
+    let flat = s.flat_of(tg).unwrap();
+    let acts = s.expansion(s.line(flat).unwrap());
+    assert!(matches!(acts.as_slice(), [draw::ExpItem::Acts(a)] if a.len() == 3 && a[0].kind == draw::BKind::Chosen), "{acts:?}");
+    click(&mut s, row_id(flat, P_ACT + 1)); // only in the centre
+    assert_eq!(d.log(), vec!["notify_set telegram 1"]);
+    assert_eq!(s.line(flat).unwrap().cur, Some(1), "the page was read again");
+    click(&mut s, row_id(flat, P_ACT + 2)); // off
+    assert_eq!(d.log().last().map(String::as_str), Some("notify_set telegram 2"));
+}
+
+#[test]
+fn the_master_switch_dims_what_depends_on_it_and_do_not_disturb_is_the_bars_file() {
+    let (mut s, d) = win("notify");
+    press(&mut s, |l| matches!(&l.row, Row::Flag(_, Flag::Dnd)), P_CTL);
+    assert_eq!(d.log(), vec!["flag_set Dnd true"]);
+    d.clear_log();
+    press(&mut s, |l| matches!(&l.row, Row::Toggle { name: "ToastEnabled", .. }), P_CTL);
+    assert_eq!(d.log(), vec!["reg_set_dword ToastEnabled 0"]);
+    d.clear_log();
+    // everything that depends on it is dimmed and does nothing
+    assert!(s.line(s.flat_of(|l| matches!(&l.row, Row::Flag(_, Flag::Dnd))).unwrap()).unwrap().dis);
+    press(&mut s, |l| matches!(&l.row, Row::Flag(_, Flag::Dnd)), P_CTL);
+    press(&mut s, |l| matches!(&l.row, Row::Toggle { name: "NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND", .. }), P_CTL);
+    assert!(d.log().is_empty(), "{:?}", d.log());
+    // a drawn frame of the dimmed page
+    Rig::new("notify-off").frame();
+}
+
+#[test]
+fn the_lists_of_the_new_pages_reach_opt_set_and_a_refusal_says_so() {
+    // a segmented row: a segment picks its entry
+    let (mut s, d) = win("notify");
+    press(&mut s, |l| matches!(&l.row, Row::Cycle(_, _, Op::Opt(Opt::Toast))), P_SEG + 3);
+    assert_eq!(d.log(), vec!["opt_set Toast 3"]);
+    // a drop-down: the same list the model has, a pick reaches it
+    let (mut s, d) = win("time");
+    let at = id(&s, |l| matches!(&l.row, Row::Cycle(_, _, Op::Opt(Opt::Zone))), P_CTL);
+    let cx = click(&mut s, at);
+    let (tag, items) = menu(&cx).expect("a list");
+    assert_eq!(tag, TAG_PICK);
+    assert_eq!(items.iter().map(|m| m.text.clone()).collect::<Vec<_>>(), choices(Op::Opt(Opt::Zone)).unwrap().0);
+    let mut cx = Cx::default();
+    s.command(TAG_PICK, 2, &mut cx);
+    assert_eq!(d.log(), vec!["opt_set Zone 2"]);
+    assert!(toasts(&cx).is_empty());
+    // Windows refuses (no administrator rights): a toast says so, and the list is read again
+    d.deny_admin();
+    s.click(at, Button::Left, 0.0, 0.0, &mut Cx::default());
+    let mut cx = Cx::default();
+    s.command(TAG_PICK, 3, &mut cx);
+    assert_eq!(toasts(&cx).len(), 1, "{:?}", toasts(&cx));
+    assert_eq!(choices(Op::Opt(Opt::Zone)).unwrap().1, Some(2), "the zone did not move");
+    // the clock preview follows the 12-hour choice
+    press(&mut s, |l| matches!(&l.row, Row::Cycle(_, _, Op::Opt(Opt::Clock))), P_SEG + 1);
+    assert!(s.pg.groups[0].rows[0].row.label().contains("AM"), "{}", s.pg.groups[0].rows[0].row.label());
+}
+
+#[test]
+fn the_gauges_snap_to_their_steps_and_say_it_in_words() {
+    let (mut s, d) = win("keyboard");
+    let flat = s.flat_of(|l| matches!(&l.row, Row::Gauge(_, Gauge::KeyDelay))).unwrap();
+    s.tracks.push((flat, 100.0, 400.0));
+    let at = row_id(flat, P_CTL);
+    let mut cx = Cx::default();
+    s.down(at, Button::Left, 391.0, 0.0, &mut cx);
+    assert_eq!(d.log().last().map(String::as_str), Some("gauge_set KeyDelay 1.00"));
+    assert_eq!(s.line(flat).unwrap().sub, more::gauge_text(Gauge::KeyDelay, Some(1.0)));
+    s.drag(at, 109.0, 0.0, &mut cx);
+    assert_eq!(s.line(flat).unwrap().sub, more::gauge_text(Gauge::KeyDelay, Some(0.0)));
+    s.release(at, &mut cx);
+    assert!(s.hold.is_none());
+    let flat = s.flat_of(|l| matches!(&l.row, Row::Gauge(_, Gauge::Pointer))).unwrap();
+    s.tracks.push((flat, 100.0, 400.0));
+    s.down(row_id(flat, P_CTL), Button::Left, 250.0, 0.0, &mut cx);
+    assert_eq!(d.log().last().map(String::as_str), Some("gauge_set Pointer 0.50"));
+}
+
+#[test]
+fn pointer_precision_and_the_clock_service_are_flags_and_a_refusal_is_told() {
+    let (mut s, d) = win("keyboard");
+    press(&mut s, |l| matches!(&l.row, Row::Flag(_, Flag::MouseAccel)), P_CTL);
+    assert_eq!(d.log(), vec!["flag_set MouseAccel false"]);
+    assert_eq!(s.line(s.flat_of(|l| matches!(&l.row, Row::Flag(_, Flag::MouseAccel))).unwrap()).unwrap().on, Some(false));
+    let (mut s, d) = win("time");
+    d.deny_admin();
+    let cx = press(&mut s, |l| matches!(&l.row, Row::Flag(_, Flag::AutoTime)), P_CTL);
+    assert_eq!(toasts(&cx).len(), 1, "the time service needs administrator rights");
+    assert_eq!(os().flag(&Flag::AutoTime), Some(true), "nothing changed");
+}
+
+#[test]
+fn the_try_it_field_takes_keys_and_does_nothing_with_them() {
+    let (mut s, d) = win("keyboard");
+    let flat = s.flat_of(|l| matches!(&l.row, Row::Cycle(_, _, Op::Try))).unwrap();
+    assert_eq!(s.fields_of(flat), vec![app::Fid::Try]);
+    let mut cx = Cx { focus: Some(row_id(flat, P_FIELD)), ..Cx::default() };
+    s.text("abc", &mut cx);
+    assert_eq!(s.fields.tryit.text, "abc");
+    s.key(0x0D, Mods::default(), &mut cx);
+    assert!(d.log().is_empty(), "{:?}", d.log());
+}
+
+#[test]
+fn privacy_tabs_follow_the_pick_and_the_permissions_reach_the_consent_store() {
+    let (mut s, d) = win("privacy");
+    assert_eq!(more::pv_tab(), Cap::Mic);
+    // "Right now": a click on the camera line opens its tab and scrolls to the list
+    press(&mut s, |l| l.key == "now:webcam", P_BODY);
+    assert_eq!(more::pv_tab(), Cap::Cam);
+    assert_eq!(s.reveal.as_deref(), Some("pvtab"));
+    assert!(s.pg.groups[2].rows.iter().any(|l| l.key == "webcam:wcam"), "the camera's apps are listed");
+    // the tab control picks another
+    press(&mut s, |l| l.key == "pvtab", P_SEG + 2);
+    assert_eq!(more::pv_tab(), Cap::Loc);
+    assert!(s.pg.groups[2].rows.iter().any(|l| l.key == "location:weather"));
+    // one Store app's switch, the user's switch
+    press(&mut s, |l| l.key == "location:weather", P_CTL);
+    press(&mut s, |l| l.key == "location:user", P_CTL);
+    assert_eq!(d.log(), vec![format!("flag_set {:?} false", Flag::Access(Cap::Loc, Who::App("weather".into()))), format!("flag_set {:?} false", Flag::Access(Cap::Loc, Who::User))]);
+    d.clear_log();
+    // with the user's switch off the apps below are dimmed and do nothing
+    press(&mut s, |l| l.key == "location:maps", P_CTL);
+    assert!(d.log().is_empty(), "{:?}", d.log());
+    // the PC's switch is the administrator's
+    d.deny_admin();
+    let cx = press(&mut s, |l| l.key == "location:dev", P_CTL);
+    assert_eq!(toasts(&cx).len(), 1);
+}
+
+#[test]
+fn a_camera_off_for_the_pc_says_blocked_for_every_app_in_right_now() {
+    let (s, _d) = win("privacy-camera-off");
+    let cam = s.pg.groups[0].rows.iter().find(|l| l.key == "now:webcam").unwrap();
+    assert!(cam.sub.contains("Blocked") || cam.sub.contains("Закрыт"), "{}", cam.sub);
+    assert!(cam.badge.is_some());
+    // and in use: the microphone says who has it
+    let (s, _d) = win("privacy");
+    let mic = s.pg.groups[0].rows.iter().find(|l| l.key == "now:microphone").unwrap();
+    assert!(mic.sub.contains("Discord") && mic.badge.is_some(), "{}", mic.sub);
+}
+
+#[test]
+fn windows_security_scans_and_opens() {
+    let (mut s, d) = win("privacy");
+    press(&mut s, |l| l.key == "sec:av", P_CTL);
+    assert_eq!(d.log(), vec!["quick_scan"]);
+    d.clear_log();
+    press(&mut s, |l| l.key == "sec:open", P_BODY);
+    assert_eq!(d.log(), vec!["open_security"]);
+    // a scan under way: the button is busy and does nothing
+    let (mut s, d) = win("privacy-scanning");
+    assert!(s.pg.groups[1].rows[0].busy);
+    press(&mut s, |l| l.key == "sec:av", P_CTL);
+    assert!(d.log().is_empty());
+}
+
+#[test]
+fn sync_now_runs_once_until_the_time_service_answers() {
+    let (mut s, d) = win("time");
+    press(&mut s, |l| l.key == "sync", P_CTL);
+    assert_eq!(d.log(), vec!["time_sync"]);
+    assert!(s.syncing);
+    press(&mut s, |l| l.key == "sync", P_CTL);
+    assert_eq!(d.log().len(), 1, "a second click waits");
+    // the answer (the worker's note) frees the button
+    s.message(app::MSG_NOTE, 0, Box::into_raw(Box::new("Clock synced".to_string())) as isize, &mut Cx::default());
+    assert!(!s.syncing);
+}
+
+#[test]
+fn names_dates_and_times_of_the_new_pages_read_well() {
+    assert_eq!(more::app_name("Microsoft.WindowsCamera_8wekyb3d8bbwe"), "Windows Camera");
+    assert_eq!(more::app_name("C:#Program Files#Discord#discord.exe"), "Discord");
+    assert_eq!(more::app_name("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"), "Windows Terminal");
+    assert_eq!(more::app_name("Chrome"), "Chrome");
+    assert_eq!(more::fmt_date("dd.MM.yyyy", 2026, 11, 7), "07.11.2026");
+    assert_eq!(more::fmt_date("M/d/yy", 2026, 11, 7), "11/7/26");
+    assert_eq!(more::fmt_date("yyyy-MM-dd", 2026, 1, 27), "2026-01-27");
+    let w = |ago| more::When { days_ago: ago, hour: 8, min: 5, day: 20, month: 11 };
+    assert!(more::when_text(w(0)).ends_with("08:05") && more::when_text(w(1)).ends_with("08:05"));
+    assert!(more::when_text(w(5)).starts_with("20 "));
 }

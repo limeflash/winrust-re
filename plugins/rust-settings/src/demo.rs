@@ -11,18 +11,21 @@ use winrust_ui::core::App;
 use crate::{
     Fill, Wall, audio, bt,
     display::{Mode, Mon, Topo},
-    ext, net,
+    ext,
+    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NotifyApp, Opt, Security, When, Who, fmt_date},
+    net,
     os::{Battery, Note, Os, Ping, WuExtra, set_os},
     power, wifi, wu,
 };
 use windows_sys::core::GUID;
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, the pages, and a few more.
-pub const STATES: [&str; 50] = [
+pub const STATES: [&str; 59] = [
     "display", "sound", "power", "network", "bluetooth", "apps", "update", "personal", "about", "battery-charging", "battery-on-battery", "battery-low", "battery-none", "net-wifi", "net-ethernet", "net-no-wifi-adapter",
     "net-offline", "net-airplane", "identify", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
     "appearance-light", "appearance-night-light", "wifi-password", "wifi-connected-open", "adapter-open", "dropdown", "search", "search-page", "search-none", "display-single", "sound-muted", "power-plans-many", "update-checking",
-    "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many", "apps-search", "apps-none",
+    "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many", "apps-search", "apps-none", "notify", "notify-open", "notify-off", "keyboard", "time", "privacy", "privacy-camera-off", "privacy-scanning",
+    "privacy-location",
 ];
 
 fn guid() -> GUID {
@@ -76,6 +79,15 @@ struct State {
     walls: Vec<(String, Fill)>,
     wall: usize,
     lang: winrust_common::Lang,
+    /// The new pages: the entry each list is on, the gauges, the flags that are not one registry value, the apps.
+    opts: std::collections::HashMap<String, usize>,
+    gauges: [f32; 3],
+    flags: std::collections::HashMap<String, bool>,
+    notify: Vec<NotifyApp>,
+    consent: Vec<(Cap, Vec<CApp>)>,
+    security: Security,
+    /// Changes that need administrator rights are refused.
+    deny_admin: bool,
 }
 
 /// The demo source. `log` says what a test or a render asked it to change.
@@ -107,6 +119,32 @@ fn adapter(name: &str, desc: &str, wifi: bool, up: bool, speed: u64, ip: Option<
 
 fn net(ssid: &str, quality: u32, sec: Option<wifi::Sec>, eap: Option<&'static str>, saved: bool, connected: bool) -> wifi::Net {
     wifi::Net { ssid: ssid.into(), raw: ssid.as_bytes().to_vec(), quality, connected, profile: saved.then(|| ssid.to_string()), sec, eap, iface: guid() }
+}
+
+/// A moment of the demo's day: Friday 27 November, `ago` days back, at `h:m`.
+fn when(ago: u32, h: u8, m: u8) -> When {
+    let day = 27 - ago.min(26) as u8;
+    When { days_ago: ago, hour: h, min: m, day, month: 11 }
+}
+
+/// What the design's Privacy page lists: Store apps and desktop apps for each of camera, microphone and location.
+fn demo_consent() -> Vec<(Cap, Vec<CApp>)> {
+    let app = |id: &str, name: &str, desktop: bool, last: Option<When>, live: bool| CApp { id: id.into(), name: name.into(), desktop, last, live };
+    vec![
+        (Cap::Cam, vec![app("wcam", "Camera", false, Some(when(0, 8, 31)), false), app("plink", "Phone Link", false, None, false), app("telegram", "Telegram", true, Some(when(1, 21, 40)), false), app("discord", "Discord", true, Some(when(3, 12, 5)), false), app("edge", "Microsoft Edge", true, None, false)]),
+        (
+            Cap::Mic,
+            vec![
+                app("vrec", "Voice Recorder", false, Some(when(15, 9, 0)), false),
+                app("plink", "Phone Link", false, None, false),
+                app("discord", "Discord", true, Some(when(0, 9, 14)), true),
+                app("telegram", "Telegram", true, Some(when(1, 21, 40)), false),
+                app("edge", "Microsoft Edge", true, Some(when(7, 18, 2)), false),
+                app("winrust", "WinRust screen recorder", true, Some(when(0, 12, 40)), false),
+            ],
+        ),
+        (Cap::Loc, vec![app("weather", "Weather", false, Some(when(0, 9, 11)), false), app("maps", "Maps", false, Some(when(9, 14, 20)), false), app("edge", "Microsoft Edge", true, None, false), app("telegram", "Telegram", true, None, false)]),
+    ]
 }
 
 fn app_entry(name: &str, version: &str, publisher: &str) -> ext::App {
@@ -199,6 +237,13 @@ impl Demo {
             ],
             wall: 0,
             lang: winrust_common::Lang::En,
+            opts: [("Wheel", 1), ("Zone", 0)].into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            gauges: [0.33, 0.70, 0.50],
+            flags: [(Flag::MouseAccel, true), (Flag::AutoTime, true)].into_iter().chain([("vrec", Cap::Mic, true), ("plink", Cap::Mic, false), ("wcam", Cap::Cam, true), ("plink", Cap::Cam, false), ("weather", Cap::Loc, true), ("maps", Cap::Loc, true)].map(|(id, c, on)| (Flag::Access(c, Who::App(id.into())), on))).map(|(f, on)| (format!("{f:?}"), on)).collect(),
+            notify: [("telegram", "Telegram", 0), ("discord", "Discord", 0), ("outlook", "Microsoft Outlook", 0), ("taskmgr", "Task Manager", 0), ("update", "Windows Update", 1), ("edge", "Microsoft Edge", 1), ("spotify", "Spotify", 2)].map(|(id, name, mode)| NotifyApp { id: id.into(), name: name.into(), mode }).to_vec(),
+            consent: demo_consent(),
+            security: Security { av: Some(true), fw: Some(true), sig: "1.421.316.0".into(), sig_when: Some(when(0, 7, 14)), smart: "Warn".into(), scanning: false, scanned: false },
+            deny_admin: false,
         };
         Self { s: RefCell::new(s), log: RefCell::new(Vec::new()) }
     }
@@ -208,6 +253,12 @@ impl Demo {
     #[must_use]
     pub fn log(&self) -> Vec<String> {
         self.log.borrow().clone()
+    }
+
+    /// From now on the changes that need administrator rights are refused.
+    #[cfg(test)]
+    pub fn deny_admin(&self) {
+        self.with(|s| s.deny_admin = true);
     }
 
     #[cfg(test)]
@@ -273,6 +324,13 @@ impl Demo {
             "apps-many" => s.programs = (0..400).map(|i| app_entry(&format!("Program {i:03}"), &format!("{}.{}.{}", i % 9 + 1, i % 7, i % 13), "")).collect(),
             "sound-muted" => s.mute = [true, true],
             "power-plans-many" => s.plans = vec!["Power saver".into(), "Balanced".into(), "High performance".into(), "Ultimate Performance".into()],
+            "notify-off" => {
+                s.reg.insert((crate::more::TOAST.to_string(), "ToastEnabled".to_string()), 0);
+            }
+            "privacy-camera-off" => {
+                s.flags.insert(format!("{:?}", Flag::Access(Cap::Cam, Who::Pc)), false);
+            }
+            "privacy-scanning" => s.security.scanning = true,
             "proxy-on" => {
                 s.reg.insert((ext::INET.to_string(), "ProxyEnable".to_string()), 1);
                 s.proxy = "proxy.example.com:8080".into();
@@ -697,6 +755,95 @@ impl Os for Demo {
         self.note(format!("wallpaper_select {k}"));
         self.with(|s| s.wall = k.min(s.walls.len() - 1));
     }
+    fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>) {
+        let sec = |n: &[u32]| -> Vec<String> { n.iter().map(|&v| if v >= 60 { format!("{} min", v / 60) } else { format!("{v} s") }).collect() };
+        let list: Vec<String> = match o {
+            Opt::Toast => sec(&[5, 7, 15, 30, 60, 300]),
+            Opt::LangKey => ["Alt + Shift", "Ctrl + Shift", "Win + Space only"].map(String::from).to_vec(),
+            Opt::Hand => ["Left", "Right"].map(String::from).to_vec(),
+            Opt::Wheel => ["1 line", "3 lines", "5 lines", "A whole screen"].map(String::from).to_vec(),
+            Opt::Clock => ["24-hour \u{b7} 21:30", "12-hour \u{b7} 9:30 PM"].map(String::from).to_vec(),
+            Opt::Date => DATE_PATS.iter().map(|p| fmt_date(p, 2026, 11, 27)).collect(),
+            Opt::Week => ["Monday", "Sunday", "Saturday"].map(String::from).to_vec(),
+            Opt::Zone => ["(UTC+03:00) Istanbul", "(UTC+03:00) Moscow, St. Petersburg", "(UTC+05:00) Almaty", "(UTC+00:00) London", "(UTC\u{2212}05:00) New York"].map(String::from).to_vec(),
+        };
+        (list, Some(self.with(|s| s.opts.get(&format!("{o:?}")).copied().unwrap_or(0))))
+    }
+    fn opt_set(&self, o: Opt, i: usize) -> bool {
+        self.note(format!("opt_set {o:?} {i}"));
+        self.with(|s| {
+            if s.deny_admin && matches!(o, Opt::Zone) {
+                return false;
+            }
+            s.opts.insert(format!("{o:?}"), i);
+            true
+        })
+    }
+    fn gauge(&self, g: Gauge) -> Option<f32> {
+        Some(self.with(|s| s.gauges[g as usize]))
+    }
+    fn gauge_set(&self, g: Gauge, v: f32) {
+        self.note(format!("gauge_set {g:?} {v:.2}"));
+        // the delay has four steps, as the real one
+        let v = if g == Gauge::KeyDelay { (v * 3.0).round() / 3.0 } else { v };
+        self.with(|s| s.gauges[g as usize] = v);
+    }
+    fn flag(&self, f: &Flag) -> Option<bool> {
+        // Do not disturb starts off; everything else the demo does not know is allowed
+        Some(self.with(|s| s.flags.get(&format!("{f:?}")).copied().unwrap_or(*f != Flag::Dnd)))
+    }
+    fn flag_set(&self, f: &Flag, on: bool) -> bool {
+        self.note(format!("flag_set {f:?} {on}"));
+        self.with(|s| {
+            if s.deny_admin && matches!(f, Flag::AutoTime | Flag::Access(_, Who::Pc)) {
+                return false;
+            }
+            s.flags.insert(format!("{f:?}"), on);
+            true
+        })
+    }
+    fn notify_apps(&self) -> Vec<NotifyApp> {
+        self.with(|s| s.notify.clone())
+    }
+    fn notify_set(&self, id: &str, mode: usize) -> bool {
+        self.note(format!("notify_set {id} {mode}"));
+        self.with(|s| s.notify.iter_mut().filter(|a| a.id == id).for_each(|a| a.mode = mode));
+        true
+    }
+    fn consent(&self, cap: Cap) -> Consent {
+        Consent { apps: self.with(|s| s.consent.iter().find(|c| c.0 == cap).map(|c| c.1.clone()).unwrap_or_default()) }
+    }
+    fn security(&self) -> Security {
+        self.with(|s| s.security.clone())
+    }
+    fn quick_scan(&self, _done: Ping) {
+        self.note("quick_scan");
+        // the demo's scan is over at once
+        self.with(|s| (s.security.scanning, s.security.scanned) = (false, true));
+    }
+    fn open_security(&self) {
+        self.note("open_security");
+    }
+    fn layouts(&self) -> Vec<Layout> {
+        [("\u{420}\u{443}\u{441}\u{441}\u{43a}\u{438}\u{439}", "\u{419}\u{426}\u{423}\u{41a}\u{415}\u{41d}", "RU"), ("English (US)", "QWERTY", "EN")].map(|(name, sub, tag)| Layout { name: name.into(), sub: sub.into(), tag: tag.into() }).to_vec()
+    }
+    fn clock_text(&self) -> String {
+        let (h24, date) = self.with(|s| (s.opts.get("Clock").copied().unwrap_or(0) == 0, s.opts.get("Date").copied().unwrap_or(0)));
+        format!("{}  \u{b7}  {}", if h24 { "09:14" } else { "9:14 AM" }, fmt_date(DATE_PATS[date.min(DATE_PATS.len() - 1)], 2026, 11, 27))
+    }
+    fn region_text(&self) -> String {
+        "Russia".into()
+    }
+    fn numbers_text(&self) -> String {
+        "1\u{a0}234,56 \u{b7} 1\u{a0}234,56 \u{20bd}".into()
+    }
+    fn time_server(&self) -> String {
+        "Server: time.windows.com".into()
+    }
+    fn time_sync(&self, done: Note) {
+        self.note("time_sync");
+        done("Clock synced".into());
+    }
     fn init(&self) {}
     fn start(&self, _hwnd: isize) {}
     fn identify(&self, mons: &[Mon]) {
@@ -713,15 +860,20 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
     let d = Rc::new(Demo::for_state(name));
     set_os(d.clone());
     crate::set_app_query(""); // the Apps page's own search box starts empty in every state
+    crate::more::set_pv_tab(Cap::Mic); // and the Privacy page's tab is the design's first one
     let page = match name {
         "sound" | "sound-muted" => 1,
         "power" | "battery-charging" | "battery-on-battery" | "battery-low" | "battery-none" | "power-plans-many" => 2,
         "network" | "net-wifi" | "net-ethernet" | "net-no-wifi-adapter" | "net-offline" | "net-airplane" | "wifi-password" | "wifi-connected-open" | "adapter-open" | "network-hidden" | "proxy-on" => 3,
         "bluetooth" | "bt-paired" | "bt-searching" | "bt-needs-pin" | "bt-off" | "bt-pairing" => 4,
         "apps" | "apps-many" | "apps-search" | "apps-none" => 5,
-        "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => 6,
-        "personal" | "appearance-dark" | "appearance-light" | "personal-light" => 7,
-        "about" => 8,
+        "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => crate::WU_PAGE,
+        "notify" | "notify-open" | "notify-off" => crate::NOTIFY_PAGE,
+        "personal" | "appearance-dark" | "appearance-light" | "personal-light" => crate::PERSONAL_PAGE,
+        "privacy" | "privacy-camera-off" | "privacy-scanning" | "privacy-location" => crate::PRIVACY_PAGE,
+        "keyboard" => crate::KEYBOARD_PAGE,
+        "time" => crate::TIME_PAGE,
+        "about" => crate::ABOUT_PAGE,
         _ => 0,
     };
     let mut s = crate::app::Settings::new(page);
@@ -737,6 +889,9 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "dropdown" => s.demo_clicks.push(crate::app::ID_FIRST_SELECT), // the Resolution line
         "apps-search" => s.demo_app_search("micro"),
         "apps-none" => s.demo_app_search("photoshop"),
+        "notify-open" => s.demo_open("na:telegram", None),
+        "privacy-camera-off" => crate::more::set_pv_tab(Cap::Cam),
+        "privacy-location" => crate::more::set_pv_tab(Cap::Loc),
         "search" => s.demo_search("net"),
         "search-page" => s.demo_search("blue"),
         "search-none" => s.demo_search("zzzq"),
@@ -831,9 +986,9 @@ fn bench_pages(light: bool) -> i32 {
     }
     let (mut pages, mut hovers, mut pages_all, mut hovers_all) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..12 {
-        for p in [1, 2, 3, 4, 5, 6, 7, 8, 0] {
+        for p in (1..crate::PAGES).chain([0]) {
             t += 600;
-            let Some((x, y)) = core.hits().get(crate::app::ID_NAV + p).map(|h| (h.r.cx(), h.r.cy())) else { return 1 };
+            let Some((x, y)) = core.hits().get(crate::app::ID_NAV + p as winrust_ui::frame::Id).map(|h| (h.r.cx(), h.r.cy())) else { return 1 };
             core.pointer_move(x, y, t);
             core.down(Button::Left, x, y, t);
             core.up(Button::Left, x, y, t);

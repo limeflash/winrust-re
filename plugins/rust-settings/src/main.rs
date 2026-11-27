@@ -3,12 +3,21 @@
 // Pages: Display (resolution, refresh rate, scale, orientation, HDR, night light, arrangement of several displays by dragging), Sound (output/input
 // device, volume, mute, volume per app), Power & storage (battery, power plan, drives, disk cleanup), Network (adapters, Wi-Fi on every adapter:
 // radio, connect with a password or 802.1X user name/password, hidden networks, disconnect/forget; VPN; proxy), Bluetooth (radio,
-// airplane mode, paired and nearby devices), Apps (installed programs, uninstall), Windows Update (check, install), Personalization, About.
+// airplane mode, paired and nearby devices), Apps (installed programs, uninstall), Notifications (the master switch, Do not disturb, how long a
+// pop-up stays, a sound, how each app notifies), Windows Update (check, install), Personalization, Privacy & security (who uses the camera,
+// microphone and location, what Windows Security says, a quick scan, what each app may use), Keyboard & mouse (layouts, the key that switches
+// them, key repeat, pointer speed and precision, the main button, the wheel), Date & time (12/24 hours, date format, first day of the week,
+// time zone, the time service), About. Not here, because Windows has no way to set them from a program: the design's Default apps page
+// (Windows protects the choice of each file type), its Shortcuts page (WinRust's hotkeys are fixed in the bar), the automatic Do-not-disturb
+// rules, adding and removing keyboard layouts, the touchpad, the clock's seconds and date on the bar, the screen-recording switches.
 // `page` is a name or an ms-settings: address; anything unknown opens the first page. Ctrl+Up/Down change the page, Ctrl+F searches.
 // A new resolution or refresh rate is temporary until confirmed: Enter keeps it, Esc or 15 s without a key goes back.
 // Safety: only documented Win32/WinRT calls (the one undocumented piece is the default-device switch of the sound panel, see audio.rs);
 // written are the HKCU values in `pages()`, the proxy values, the display mode and layout, the audio volume/mute/default device,
-// Wi-Fi profiles through the WLAN API (a password typed here goes only into the profile Windows stores), the night-light setting;
+// Wi-Fi profiles through the WLAN API (a password typed here goes only into the profile Windows stores), the night-light setting; for the
+// new pages (sysx.rs): the notification and consent-store values of `HKCU`, the keyboard, mouse and international values, the bar's own
+// dnd.txt, and with administrator rights the time service's type and the PC-wide permission; `tzutil /s`, `w32tm /resync` and Defender's
+// `MpCmdRun -Scan -ScanType 1` are started with fixed arguments;
 // started: a program's own uninstaller after a second click, and this exe again for the night-light filter. No shell, no strings run as commands.
 // Display: resolution, refresh rate, scale (undocumented DisplayConfig type -4, the one Windows' Settings uses), orientation, HDR.
 // Several displays: pick the display the rows act on, extend/duplicate/one screen only (confirmed like a resolution), make main.
@@ -30,11 +39,13 @@ mod draw;
 mod ext;
 mod identify;
 mod look;
+mod more;
 mod net;
 mod os;
 mod power;
 mod search;
 mod sys;
+mod sysx;
 mod wifi;
 mod wu;
 #[cfg(test)]
@@ -65,13 +76,17 @@ pub enum Row {
     Switch(String, fn() -> Option<bool>, Op),
     /// A visible Wi-Fi network and its status text: a click opens it (the password goes there), Connect connects.
     Wifi(wifi::Net, String),
+    /// A slider of a number the system keeps as a step of a scale (key repeat, pointer speed); the line's `vol` is 0..=1.
+    Gauge(String, more::Gauge),
+    /// A switch of a yes/no that is not one DWORD of `HKCU` (Do not disturb, a permission, pointer precision); a click flips it.
+    Flag(String, more::Flag),
 }
 
 impl Row {
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
-            Row::Toggle { label, .. } | Row::Info(label, _) | Row::Cycle(label, ..) | Row::Slider(label, _) | Row::Item(label, ..) | Row::Switch(label, ..) => label,
+            Row::Toggle { label, .. } | Row::Info(label, _) | Row::Cycle(label, ..) | Row::Slider(label, _) | Row::Item(label, ..) | Row::Switch(label, ..) | Row::Gauge(label, _) | Row::Flag(label, _) => label,
             Row::Adapter(a, _) => &a.name,
             Row::Wifi(n, _) => &n.ssid,
         }
@@ -103,6 +118,12 @@ pub enum Op {
     Bt,     // Bluetooth radio
     Air,    // airplane mode
     UiLang, // the language of every WinRust program
+    /// A value of the new pages picked from a list (more.rs `Opt`).
+    Opt(more::Opt),
+    /// The tab of the Privacy page's App access list.
+    PvTab,
+    /// The Keyboard page's "Try it" field: nothing to do, the field is only there to hold keys down in.
+    Try,
 }
 
 /// The languages the drop-down offers, in the order it shows them.
@@ -124,6 +145,15 @@ pub enum Cmd {
     Check,
     Install,
     Wallpaper,
+    /// A notifying app of the Notifications page: a click unfolds its three ways.
+    NotifyApp(String),
+    /// App id, way (0 banner, 1 only in the centre, 2 off).
+    NotifyMode(String, usize),
+    /// A line of the Privacy page's "Right now": opens its tab of App access.
+    PrivGo(more::Cap),
+    QuickScan,
+    OpenSecurity,
+    SyncTime,
 }
 
 pub const CONFIRM_SECS: u32 = 15;
@@ -137,6 +167,8 @@ pub enum Tone {
     Warn,
     Bad,
     Accent,
+    /// Dimmer than `Dim` (an app that is off).
+    Faint,
 }
 
 /// The tile in front of a line.
@@ -184,6 +216,10 @@ pub struct Line {
     pub big: bool,
     /// The buttons of the Windows Update "restart" state (the real one never has them).
     pub restart: bool,
+    /// Drawn dim and not clickable (a switch whose master switch is off).
+    pub dis: bool,
+    /// A height of its own, DIPs.
+    pub h: Option<f32>,
 }
 
 impl Line {
@@ -209,14 +245,23 @@ impl Line {
             cur: None,
             big: false,
             restart: false,
+            dis: false,
+            h: None,
         };
         match &l.row {
             Row::Cycle(_, value, op) => {
                 l.val = value();
-                if matches!(op, Op::Topology | Op::Plan) {
+                if is_seg(*op) {
                     (l.opts, l.cur) = choices(*op).unwrap_or_default();
+                } else if matches!(op, Op::Opt(_)) {
+                    l.val = choices(*op).and_then(|(v, c)| c.and_then(|c| v.get(c).cloned())).unwrap_or_else(|| "?".into());
                 }
             }
+            Row::Gauge(_, g) => {
+                l.vol = os().gauge(*g);
+                l.sub = more::gauge_text(*g, l.vol);
+            }
+            Row::Flag(_, f) => l.on = os().flag(f),
             Row::Switch(_, value, _) => l.on = value(),
             Row::Toggle { key, name, on_when, default, .. } => l.on = Some(is_on(os().reg_dword(key, name), *on_when, *default)),
             Row::Slider(_, src) => l.vol = os().audio_volume(*src),
@@ -413,7 +458,21 @@ pub fn gb(bytes: u64) -> String {
 }
 
 /// Words that select each page, in the order of `pages()`.
-const PAGE_KEYS: [&[&str]; 9] = [&["display"], &["sound"], &["power", "battery", "storage"], &["network", "wifi", "ethernet"], &["bluetooth", "airplane"], &["apps"], &["update"], &["personal", "color", "theme"], &["about"]];
+const PAGE_KEYS: [&[&str]; 13] = [
+    &["display"],
+    &["sound"],
+    &["power", "battery", "storage"],
+    &["network", "wifi", "ethernet"],
+    &["bluetooth", "airplane"],
+    &["apps"],
+    &["notification"],
+    &["personal", "color", "theme"],
+    &["privacy", "webcam", "microphone", "location", "windowsdefender"],
+    &["keyboard", "mouse", "typing"],
+    &["dateandtime", "time", "region"],
+    &["update"],
+    &["about"],
+];
 
 /// The page a name or an ms-settings: address points at; the first page when nothing matches.
 pub fn page_for(arg: &str) -> usize {
@@ -484,8 +543,13 @@ fn orient_names() -> [&'static str; 4] {
 
 /// Rows whose value is picked from a list (the others act on a click). Screen modes need a second screen.
 pub fn listed(op: Op) -> bool {
-    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang)
+    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab)
         || (matches!(op, Op::Topology) && os().display_connected() > 1)
+}
+
+/// Rows drawn as a segmented control whenever they have a list (a click on a segment picks it).
+pub fn is_seg(op: Op) -> bool {
+    matches!(op, Op::Topology | Op::Plan | Op::PvTab) || matches!(op, Op::Opt(o) if o.segmented())
 }
 
 /// The values a list offers and the index of the current one. None when there is nothing to choose.
@@ -518,6 +582,8 @@ pub fn choices(op: Op) -> Option<(Vec<String>, Option<usize>)> {
             (d.iter().map(|d| d.name.clone()).collect(), d.iter().position(|d| d.default))
         }
         Op::Night => (night_labels(), ext::NIGHT_STEPS.iter().position(|&k| k == o.night_kelvin())),
+        Op::Opt(x) => o.opt_list(x),
+        Op::PvTab => (more::Cap::ALL.iter().map(|c| c.name().to_string()).collect(), more::Cap::ALL.iter().position(|&c| c == more::pv_tab())),
         Op::Plan => o.power_plans(),
         Op::Screen => o.power_timeouts(power::Timeout::Screen),
         Op::Sleep => o.power_timeouts(power::Timeout::Sleep),
@@ -534,6 +600,8 @@ pub enum Done {
     Confirm,
     /// The interface language changed; the flag says whether the other programs will see it (lang.txt was written).
     Lang(bool),
+    /// Windows did not take the change (usually: it needs administrator rights).
+    Denied,
 }
 
 /// Applies entry `i` of `choices(op)`. Display modes are temporary until confirmed (the 15 s countdown, `Done::Confirm`).
@@ -579,6 +647,16 @@ pub fn choose(op: Op, i: usize) -> Done {
             }
         }
         (Op::Night, _) => o.night_set(ext::NIGHT_STEPS.get(i).copied().unwrap_or(0)),
+        (Op::Opt(x), _) => {
+            if !o.opt_set(x, i) {
+                done = Done::Denied;
+            }
+        }
+        (Op::PvTab, _) => {
+            if let Some(&c) = more::Cap::ALL.get(i) {
+                more::set_pv_tab(c);
+            }
+        }
         (Op::Plan, _) => o.power_set_plan(i),
         (Op::Screen, _) => o.power_set_timeout(power::Timeout::Screen, i),
         (Op::Sleep, _) => o.power_set_timeout(power::Timeout::Sleep, i),
@@ -670,7 +748,13 @@ fn pac_text() -> String {
 pub const NET_PAGE: usize = 3;
 pub const BT_PAGE: usize = 4;
 pub const APPS_PAGE: usize = 5;
-pub const WU_PAGE: usize = 6;
+pub const NOTIFY_PAGE: usize = 6;
+pub const PERSONAL_PAGE: usize = 7;
+pub const PRIVACY_PAGE: usize = 8;
+pub const KEYBOARD_PAGE: usize = 9;
+pub const TIME_PAGE: usize = 10;
+pub const WU_PAGE: usize = 11;
+pub const ABOUT_PAGE: usize = 12;
 pub const POWER_PAGE: usize = 2;
 
 thread_local! { static EXPANDED: RefCell<Option<String>> = const { RefCell::new(None) } } // the adapter whose details show
@@ -1118,8 +1202,12 @@ pub fn page_title(i: usize) -> String {
         3 => t!("Сеть", "Network", ja: "ネットワーク", pt: "Rede", zh: "网络"),
         4 => "Bluetooth",
         5 => t!("Приложения", "Apps", ja: "アプリ", pt: "Apps", zh: "应用"),
-        6 => t!("Центр обновления", "Windows Update", ja: "Windows Update", pt: "Windows Update", zh: "Windows 更新"),
-        7 => t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização", zh: "个性化"),
+        NOTIFY_PAGE => t!("Уведомления", "Notifications", ja: "通知", pt: "Notificações", zh: "通知"),
+        PERSONAL_PAGE => t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização", zh: "个性化"),
+        PRIVACY_PAGE => t!("Конфиденциальность и защита", "Privacy & security", ja: "プライバシーとセキュリティ", pt: "Privacidade e segurança", zh: "隐私和安全"),
+        KEYBOARD_PAGE => t!("Клавиатура и мышь", "Keyboard & mouse", ja: "キーボードとマウス", pt: "Teclado e mouse", zh: "键盘和鼠标"),
+        TIME_PAGE => t!("Дата и время", "Date & time", ja: "日付と時刻", pt: "Data e hora", zh: "日期和时间"),
+        WU_PAGE => t!("Центр обновления", "Windows Update", ja: "Windows Update", pt: "Windows Update", zh: "Windows 更新"),
         _ => t!("О системе", "About", ja: "バージョン情報", pt: "Sobre", zh: "关于"),
     }
     .into()
@@ -1142,8 +1230,12 @@ fn page_with(i: usize, apps: &str) -> Page {
         NET_PAGE => network_rows(),
         BT_PAGE => bt_rows(),
         APPS_PAGE => apps_rows(apps),
+        NOTIFY_PAGE => more::notify_rows(),
+        PERSONAL_PAGE => personal_rows(),
+        PRIVACY_PAGE => more::privacy_rows(),
+        KEYBOARD_PAGE => more::keyboard_rows(),
+        TIME_PAGE => more::time_rows(),
         WU_PAGE => wu_rows(),
-        7 => personal_rows(),
         _ => about_rows(),
     };
     Page { title: page_title(i), groups }
