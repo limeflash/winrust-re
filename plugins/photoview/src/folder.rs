@@ -191,6 +191,7 @@ mod tests {
 #[cfg(test)]
 mod recycle_test {
     #[test]
+    #[ignore = "puts a temp file in the real Recycle Bin: run with --ignored"]
     fn commits_temp_file_to_recycle_bin() {
         let dir = std::env::temp_dir().join(format!(
             "photoview-recycle-{}-{:?}",
