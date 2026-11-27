@@ -335,7 +335,7 @@ pub fn build_rows(d: &Data, c: &BuildCtx) -> Vec<Row> {
                 let exe = exe_from_command(&s.command);
                 let company = exe.as_deref().and_then(|e| d.res.get(e)).map(|r| r.company).unwrap_or_default();
                 // без администратора журнал загрузки не читается: «нет данных», а не «не замедляет»
-                let impact = if d.is_admin { crate::startup::boot_impact(s, crate::startup::boot_log()) } else { None };
+                let impact = if d.is_admin { crate::startup::boot_impact(s, &d.boot) } else { None };
                 let impact_txt = match impact {
                     Some(ms) => tf!("+{} с", "+{} s", ja: "+{} 秒", pt: "+{} s", zh: "+{} 秒", dec(ms as f64 / 1000.0, 1)),
                     None if d.is_admin => "—".into(),

@@ -27,9 +27,9 @@ use crate::{
 };
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, and every page.
-pub const STATES: [&str; 28] = [
+pub const STATES: [&str; 32] = [
     "processes", "performance", "users", "speed", "settings", "alert", "no-alert", "process-menu", "more-menu", "end-tree", "no-results", "history-cleared", "no-rules",
-    "history", "startup", "details", "services", "rules", "insights", "perf-memory", "perf-disk", "perf-network", "perf-gpu", "processes-expanded", "users-collapsed", "speed-open",
+    "history", "startup", "details", "services", "rules", "slow", "slow-app", "slow-drv", "slow-ok", "slow-checking", "perf-memory", "perf-disk", "perf-network", "perf-gpu", "processes-expanded", "users-collapsed", "speed-open",
     "toast", "tray-question",
 ];
 
@@ -78,6 +78,9 @@ impl Demo {
                     Some("Telegram Desktop") => "0.6 s",
                     Some("NVIDIA Broadcast") => "0.9 s",
                     Some("Steam Client Bootstrapper") => "3.2 s",
+                    Some("Claude") => "91.9 s",
+                    Some("Cardinal") => "86.2 s",
+                    Some("BotForge Panel") => "50.2 s",
                     _ => "1.8 s",
                 };
                 r.cells[3] = format!("+{cost}");
@@ -301,6 +304,7 @@ pub fn data() -> Data {
         ("NVIDIA Broadcast", "NVIDIA Corporation", "nvbroadcast", r#""C:\Program Files\NVIDIA Corporation\NVIDIA Broadcast\NVIDIA Broadcast UI.exe""#, true),
         ("Steam Client Bootstrapper", "Valve Corporation", "steam", r#""C:\Program Files (x86)\Steam\steam.exe" -silent"#, false),
         ("Microsoft OneDrive", "Microsoft Corporation", "onedrive", r"%LocalAppData%\Microsoft\OneDrive\OneDrive.exe /background", false),
+        ("Claude", "Anthropic", "claude", r#""C:\Users\Daniiar\AppData\Local\AnthropicClaude\claude.exe""#, true),
     ] {
         let item = startup::Item { name: name.into(), command: cmd.into(), source: 0, enabled: on };
         if let Some(exe) = crate::model::exe_from_command(cmd) {
@@ -309,6 +313,27 @@ pub fn data() -> Data {
         }
         d.startup.push(item);
     }
+    // two entries of no publisher and no icon of their own (the What's slow page tells them by a letter)
+    for (name, cmd) in [("Cardinal", r#""C:\Program Files\Cardinal\cardinal.exe""#), ("BotForge Panel", r#""C:\Program Files\BotForge\botforge.exe""#)] {
+        d.startup.push(startup::Item { name: name.into(), command: cmd.into(), source: 0, enabled: true });
+    }
+    // what Windows logged of its last five startups (the design's numbers) and what delayed them
+    d.boot = startup::BootLog {
+        boots: vec![("2026-11-20 13:39".into(), 88_000, 44_000), ("2026-11-17 09:05".into(), 59_000, 31_000), ("2026-11-14 10:12".into(), 71_000, 36_000), ("2026-11-11 08:47".into(), 126_000, 60_000), ("2026-11-09 09:20".into(), 139_000, 70_000)],
+        slow: vec![
+            ("msmpeng.exe".into(), "Microsoft Defender Antivirus".into(), 273_000),
+            ("claude.exe".into(), "Claude".into(), 91_900),
+            ("cardinal.exe".into(), "Cardinal".into(), 86_200),
+            ("botforge.exe".into(), "BotForge Panel \u{2014} Steam Account Management".into(), 50_200),
+            ("tslgame.exe".into(), "tslgame.exe".into(), 39_800),
+        ],
+    };
+    // what the apps usually use (the real window has no such week of history)
+    let mb = |v: u64| v * 1_048_576;
+    for (k, mem, cpu) in [("claude.exe", 3740, 0.0), ("msedge.exe", 1620, 0.0), ("spotify.exe", 955, 0.0), ("discord.exe", 380, 0.0), ("rustc.exe", 0, 10.0)] {
+        d.usual.insert(k.into(), crate::data::Usual { mem: mb(mem), cpu });
+    }
+    (d.dpc_pct, d.intr_pct) = (0.7, 0.1);
     // the history page: a row a minute
     let tops = ["Claude", "rustc", "Microsoft Edge", "Claude", "Spotify", "cargo", "Claude", "Discord", "Microsoft Edge", "Antimalware Service", "Claude", "rustc", "Telegram Desktop", "Claude"];
     for (i, top) in tops.iter().enumerate() {
@@ -433,7 +458,7 @@ pub fn build(state: &str) -> (Tm, Arc<Fake>) {
         "details" => Page::Details,
         "services" => Page::Services,
         "rules" | "no-rules" => Page::Rules,
-        "insights" => Page::Insights,
+        "insights" | "slow" | "slow-app" | "slow-drv" | "slow-ok" | "slow-checking" => Page::Insights,
         _ => Page::Processes,
     };
     let mut tm = Tm::new(fake.clone(), d, Some(dm), false, page);
@@ -476,6 +501,16 @@ pub fn build(state: &str) -> (Tm, Arc<Fake>) {
         "speed-open" => {
             tm.tw_open.insert(0);
         }
+        "slow-app" => {
+            // Discord's processes together hold 1.6 GB (it usually holds 380 MB)
+            let sum: u64 = tm.d.procs.iter().filter(|p| p.name == "Discord.exe").map(|p| p.mem).sum();
+            for p in tm.d.procs.iter_mut().filter(|p| p.name == "Discord.exe") {
+                p.mem = (p.mem as f64 * 1638.0 * 1_048_576.0 / sum as f64) as u64;
+            }
+        }
+        "slow-drv" => (tm.d.dpc_pct, tm.d.intr_pct) = (3.8, 0.4),
+        "slow-ok" => tm.d.boot.boots[0] = ("2026-11-20 13:39".into(), 60_000, 30_000),
+        "slow-checking" => tm.slow_chk = Some(crate::app::SlowCheck { serial: 1, born: None }),
         "toast" => tm.say("Efficiency mode on for rustc", look::DOT_OK),
         _ => {}
     }
@@ -496,6 +531,10 @@ pub fn build(state: &str) -> (Tm, Arc<Fake>) {
         }
     }
     if page == Page::Boost {
+        tm.rebuild();
+    }
+    if page == Page::Insights {
+        tm.slow_at = "17:02".into(); // the design's time
         tm.rebuild();
     }
     (tm, fake)
@@ -562,6 +601,8 @@ pub struct Fake {
     pub boost: Mutex<HashMap<&'static str, boost::State>>,
     /// What the fake answers to a service or startup change: `Err(5)` is "access denied".
     pub deny: AtomicBool,
+    /// The startup entries it was told to switch (by key): the next read of them shows it.
+    pub startup: Mutex<HashMap<String, bool>>,
 }
 
 impl Fake {
@@ -597,8 +638,14 @@ impl Machine for Fake {
         d.cpu_total = d.series.cpu.back().copied().unwrap_or(0.0);
         Vec::new()
     }
-    fn load_startup(&self, _d: &mut Data) {
+    fn load_startup(&self, d: &mut Data) {
         self.log("read: startup".into());
+        let told = self.startup.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for it in &mut d.startup {
+            if let Some(&on) = told.get(&it.key()) {
+                it.enabled = on;
+            }
+        }
     }
     fn load_history(&self, _d: &mut Data) {
         self.log("read: history".into());
@@ -650,7 +697,11 @@ impl Machine for Fake {
     }
     fn startup_set(&self, it: &startup::Item, on: bool) -> Result<(), u32> {
         self.log(format!("startup {} {on}", it.name));
-        if self.deny.load(Ordering::Relaxed) { Err(5) } else { Ok(()) }
+        if self.deny.load(Ordering::Relaxed) {
+            return Err(5);
+        }
+        self.startup.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(it.key(), on);
+        Ok(())
     }
     fn boost_start(&self, id: boost::Id, on: bool, _donors: Vec<u32>) -> Result<(), String> {
         self.log(format!("boost {} {on}", id.key()));

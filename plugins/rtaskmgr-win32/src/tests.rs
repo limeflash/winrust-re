@@ -346,3 +346,86 @@ fn every_table_page_has_columns_the_rows_fill() {
         }
     }
 }
+
+#[test]
+fn whats_slow_is_in_the_sidebar_between_speed_and_rules_and_counts_what_is_slow() {
+    let order: Vec<Page> = NAV_PAGES.to_vec();
+    let at = |p: Page| order.iter().position(|x| *x == p).expect("in the sidebar");
+    assert_eq!((at(Page::Boost) + 1, at(Page::Insights) + 1), (at(Page::Insights), at(Page::Rules)));
+    let (tm, _fake) = window("slow");
+    assert_eq!(tm.page, Page::Insights);
+    assert_eq!(tm.slow.n, 1, "the startup is slow in the design's data");
+    let (tm, _fake) = window("slow-ok");
+    assert_eq!(tm.slow.n, 0, "nothing: no badge");
+    let (tm, _fake) = window("slow-app");
+    assert_eq!(tm.slow.n, 2);
+}
+
+#[test]
+fn turning_off_a_startup_app_goes_through_the_fake_and_undo_turns_it_on_again() {
+    use crate::draw::slowpage::{ID_SLOW, ID_SLOW_ALL, ID_SLOW_DEL};
+    let (mut tm, fake) = window("slow");
+    let claude = tm.slow.boot.delays.iter().position(|d| d.name == "Claude").expect("a row");
+    assert!(tm.slow.boot.delays[claude].on);
+    click(&mut tm, ID_SLOW_DEL + claude as i32);
+    assert_eq!(fake.changes(), vec!["startup Claude false"], "one entry, nothing else");
+    assert!(!tm.slow.boot.delays[claude].on, "the row is read again: it is off");
+    assert!(tm.toast.is_some());
+    click(&mut tm, ID_SLOW_DEL + claude as i32);
+    assert_eq!(fake.changes(), vec!["startup Claude false", "startup Claude true"]);
+    assert!(tm.slow.boot.delays[claude].on);
+    // Defender and what has no entry have no button: the click does nothing
+    let n = fake.changes().len();
+    click(&mut tm, ID_SLOW_DEL);
+    assert_eq!(fake.changes().len(), n);
+    // turn off what is left: the verdict changes and the badge goes
+    for i in 0..tm.slow.boot.delays.len() {
+        if tm.slow.boot.delays[i].can && tm.slow.boot.delays[i].on {
+            click(&mut tm, ID_SLOW_DEL + i as i32);
+        }
+    }
+    assert!(!tm.slow.boot.bad && tm.slow.n == 0);
+    // a denied change says so and keeps the row
+    let (mut tm, fake) = window("slow");
+    fake.deny.store(true, std::sync::atomic::Ordering::Relaxed);
+    click(&mut tm, ID_SLOW_DEL + 1);
+    assert!(tm.slow.boot.delays[1].on && tm.toast.as_ref().is_some_and(|t| t.text.contains("Claude")));
+    // the cards fold: the one that is wrong is open, the others are not
+    assert!(tm.slow_open.is_empty());
+    click(&mut tm, ID_SLOW);
+    assert_eq!(tm.slow_open.get(&0), Some(&false));
+    click(&mut tm, ID_SLOW + 1);
+    assert_eq!(tm.slow_open.get(&1), Some(&true));
+    // "All startup apps"
+    click(&mut tm, ID_SLOW_ALL);
+    assert_eq!(tm.page, Page::Startup);
+}
+
+#[test]
+fn check_again_reads_the_entries_once_and_waits_a_moment() {
+    let (mut tm, fake) = window("slow");
+    let reads = |f: &Fake| f.log_of().iter().filter(|l| *l == "read: startup").count();
+    let before = reads(&fake);
+    let acts = tm.head_actions();
+    assert_eq!(acts.len(), 1);
+    assert!(acts[0].3, "enabled");
+    let mut cx = Cx::default();
+    tm.do_act(Act::CheckSlow, &mut cx);
+    assert!(tm.slow_chk.is_some());
+    assert_eq!(reads(&fake), before + 1);
+    tm.do_act(Act::CheckSlow, &mut cx);
+    assert_eq!(reads(&fake), before + 1, "not again while it runs");
+    assert!(!tm.head_actions()[0].3, "the button waits");
+    assert!(fake.changes().is_empty(), "reading changes nothing");
+}
+
+#[test]
+fn an_app_far_over_its_usual_can_be_ended_from_the_page_and_the_dialog_asks_for_a_group() {
+    use crate::draw::slowpage::ID_SLOW_END;
+    let (mut tm, fake) = window("slow-app");
+    let first = &tm.slow.apps.rows[0];
+    assert!(first.bad && first.name == "Discord" && first.pids.len() > 1);
+    let cx = click(&mut tm, ID_SLOW_END);
+    assert_eq!(dialogs(&cx), vec![TAG_END], "six processes: asked first");
+    assert!(fake.changes().is_empty(), "nothing is ended until the red button");
+}

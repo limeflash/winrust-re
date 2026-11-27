@@ -26,6 +26,7 @@ mod net;
 mod perf;
 mod perfview;
 mod res;
+mod slow;
 mod startup;
 mod store;
 mod suspect;
@@ -155,7 +156,6 @@ fn main() {
     // `taskmgr /0 /startup` (how Settings opens the startup page) goes straight to that page
     let startup_asked = ifeo.as_deref().is_some_and(|a| a.to_lowercase().contains("/startup"));
     let page = if startup_asked { Page::Startup } else { NAV.get(cfg.view).map_or(Page::Processes, |n| n.0) };
-    let page = if page == Page::Insights { Page::Processes } else { page };
     let app = Tm::new(Arc::new(Real::new()), Data::new(cfg), None, hidden, page);
     let code = run(Box::new(app), Options { class: "WinRustTaskMgr", size: (1280.0, 780.0), icon: 1, place_file: place_path("rtaskmgr") });
     quit(code as u32);
