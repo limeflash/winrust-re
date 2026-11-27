@@ -49,6 +49,7 @@ members = [
     "plugins/debloat",
     "plugins/purge",
     "plugins/rust-settings",
+    "plugins/rust-term",
     "tools/winrust-sign",
 ]
 # Stay separate projects with their own target\ and Cargo.lock, because they need panic = "unwind" (the profile below is
