@@ -2531,6 +2531,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    run();
+    quit(0);
+}
+
+/// Ends the process without the loader's teardown. The main thread's thread-locals hold Direct3D / Direct2D objects; released in
+/// DLL_PROCESS_DETACH, after DXGI has been torn down, they made DXGI raise an exception (0x87A: the crash dialog when the bar
+/// closed, and the odd exit code of --render). What must reach the disk or the system is done before this (WM_DESTROY, the
+/// renderers); other threads were cut off at exit before too.
+fn quit(code: u32) -> ! {
+    let _ = std::io::Write::flush(&mut std::io::stdout()); // the reports of --bench and the self-tests
+    // SAFETY: ends this process.
+    unsafe { windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code) };
+    std::process::exit(code as i32)
+}
+
+fn run() {
     unsafe {
         if std::env::args().any(|a| a == "--restore") {
             show_taskbar(saved_taskbar_state().unwrap_or(ABS_ALWAYSONTOP as usize));
@@ -2566,7 +2582,7 @@ fn main() {
         // (and the microphone with `mic`), prints the frame counts (see rec.rs). Opt-in: it records the screen.
         if let Some(i) = std::env::args().position(|a| a == "--rec-selftest") {
             SetProcessDPIAware();
-            std::process::exit(if rec::selftest(&std::env::args().skip(i + 1).collect::<Vec<_>>()) { 0 } else { 1 });
+            quit(if rec::selftest(&std::env::args().skip(i + 1).collect::<Vec<_>>()) { 0 } else { 1 });
         }
         if std::env::args().any(|a| a == "--bench") {
             render::bench();
