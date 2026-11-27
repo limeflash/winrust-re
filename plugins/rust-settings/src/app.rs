@@ -195,6 +195,8 @@ pub struct Settings {
     pub sel_mon: usize,
     /// How many updates wait: the red dot of the Windows Update entry.
     pub wu_badge: usize,
+    /// `--render state=identify`: the numbers of the Identify button are drawn over the window.
+    pub demo_identify: bool,
     pub arr_box: Option<crate::Box4>,
     pub hold: Option<Hold>,
     /// Where the select buttons of the last frame are, by the number of their line (a menu opens under one).
@@ -217,8 +219,6 @@ pub struct Settings {
     pub demo_clicks: Vec<Id>,
     /// The size of the window, DIPs (the picture of the arrangement is mapped from it).
     pub win: (f32, f32),
-    /// Draw the picture of a night-light preview (the demo's "Night light" state shows it on the Display page; nothing more).
-    pub copied: Option<String>,
 }
 
 const REFRESH_MS: u64 = 4000;
@@ -257,6 +257,7 @@ impl Settings {
             mons: Vec::new(),
             sel_mon: 0,
             wu_badge: 0,
+            demo_identify: false,
             arr_box: None,
             hold: None,
             anchors: Vec::new(),
@@ -274,7 +275,6 @@ impl Settings {
             tick_at: None,
             demo_clicks: Vec::new(),
             win: (1000.0, 720.0),
-            copied: None,
         };
         s.read_page();
         s
@@ -305,15 +305,22 @@ impl Settings {
         self.fields.wipe_wifi();
         self.page = i;
         self.scroll = Scroll::default();
+        if i == APPS_PAGE {
+            forget_programs(); // the programs are read again
+        }
+        self.enter(i);
+        self.read_page();
+    }
+
+    /// What a page needs started when it opens: a Wi-Fi scan, the Bluetooth lists, the size of the temporary files.
+    fn enter(&self, i: usize) {
         let o = os();
         match i {
             NET_PAGE => o.wifi_scan(),
             BT_PAGE => o.bt_refresh(ping()),
-            APPS_PAGE => forget_programs(),
             POWER_PAGE if !o.temp_measured() => o.temp_measure(ping()),
             _ => {}
         }
-        self.read_page();
     }
 
     /// The page is read again (a worker finished, a setting changed): a frame is asked for when something on it moved.
@@ -665,12 +672,24 @@ impl Settings {
             GAct::Cmd(c) => self.run_cmd("", "", c, cx),
             GAct::Copy => {
                 let text = self.pg.groups.iter().flat_map(|g| &g.rows).filter_map(|l| if let Row::Info(a, b) = &l.row { Some(format!("{a}: {b}")) } else { None }).collect::<Vec<_>>().join(" \u{b7} ");
-                cx.set_clipboard_text(text.clone());
-                self.copied = Some(text);
+                cx.set_clipboard_text(text);
                 self.say(t!("Сведения об устройстве скопированы", "Device details copied"), cx);
             }
         }
         cx.invalidate();
+    }
+
+    /// A right click on a line: a network that is saved or connected unfolds (its Disconnect and Forget are there), as the old menu offered.
+    fn context(&mut self, flat: usize, part: Id) {
+        if part != P_BODY {
+            return;
+        }
+        if let Some(l) = self.line(flat)
+            && matches!(&l.row, Row::Wifi(n, _) if n.profile.is_some() || n.connected)
+        {
+            self.open = Some(l.key.clone());
+            self.field_err.clear();
+        }
     }
 
     /// A click on a line (`part`: which of its items).
@@ -895,7 +914,10 @@ impl App for Settings {
         self.hwnd = hwnd;
         MAIN.store(hwnd, Relaxed);
         os().start(hwnd);
-        post(hwnd, MSG_KICK, 0, 0);
+        self.enter(self.page); // the page the window opens on needs the same as one that is gone to
+        if hwnd != 0 {
+            post(hwnd, MSG_KICK, 0, 0);
+        }
     }
 
     fn demo_clicks(&self) -> Vec<Id> {
@@ -983,8 +1005,6 @@ impl App for Settings {
     }
 
     fn click(&mut self, id: Id, b: Button, _x: f32, _y: f32, cx: &mut Cx) {
-        // a pending toast of a finished action goes with the next click; nothing to clear here: toasts expire by themselves
-        let _ = b;
         match id {
             ID_FIRST_SELECT => {
                 if let Some(f) = self.first_select {
@@ -1045,7 +1065,11 @@ impl App for Settings {
             }
             i if i >= ID_ROW => {
                 let (flat, part) = (((i - ID_ROW) / 32) as usize, (i - ID_ROW) % 32);
-                self.click_line(flat, part, cx);
+                if b == Button::Right {
+                    self.context(flat, part);
+                } else {
+                    self.click_line(flat, part, cx);
+                }
             }
             _ => {}
         }
@@ -1139,6 +1163,12 @@ impl App for Settings {
                 self.q.set_text("");
                 self.run_search();
                 self.goto(to, true);
+                true
+            }
+            ESC if self.open.is_some() => {
+                // Esc folds an unfolded line before it closes the window
+                self.open = None;
+                self.field_err.clear();
                 true
             }
             ESC => {
@@ -1280,13 +1310,6 @@ impl Settings {
         self.fail(key, err.unwrap_or_default());
     }
 
-    /// The first control of the line `pred` picks is clicked before the picture is taken.
-    pub fn demo_click_line(&mut self, pred: impl Fn(&Line) -> bool) {
-        if let Some(flat) = self.flat_of(pred) {
-            self.demo_clicks.push(row_id(flat, P_CTL));
-        }
-    }
-
     /// The search box holds `q`.
     pub fn demo_search(&mut self, q: &str) {
         self.q.set_text(q);
@@ -1294,6 +1317,7 @@ impl Settings {
     }
 
     /// Where the line `pred` picks is (its flat number).
+    #[cfg(test)]
     pub fn flat_of(&self, pred: impl Fn(&Line) -> bool) -> Option<usize> {
         let mut flat = 0;
         for g in &self.pg.groups {

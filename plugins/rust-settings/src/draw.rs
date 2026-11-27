@@ -292,6 +292,12 @@ impl Settings {
         if self.confirm.is_some() {
             self.paint_confirm(c, f);
         }
+        if self.demo_identify {
+            // the render of the Identify button's result: the numbers as the mockup lays them on its one screen (the real ones are windows
+            // of their own, one on each display)
+            crate::identify::tile(c, Rect::new(60.0, 60.0, 120.0, 120.0), 1);
+            crate::identify::tile(c, Rect::new(w - 180.0, 60.0, 120.0, 120.0), 2);
+        }
     }
 
     fn paint_sidebar(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, h: f32) {

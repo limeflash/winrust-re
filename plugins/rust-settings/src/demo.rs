@@ -18,11 +18,11 @@ use crate::{
 use windows_sys::core::GUID;
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, the pages, and a few more.
-pub const STATES: [&str; 46] = [
+pub const STATES: [&str; 48] = [
     "display", "sound", "power", "network", "bluetooth", "apps", "update", "personal", "about", "battery-charging", "battery-on-battery", "battery-low", "battery-none", "net-wifi", "net-ethernet", "net-no-wifi-adapter",
-    "net-offline", "net-airplane", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
+    "net-offline", "net-airplane", "identify", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
     "appearance-light", "appearance-night-light", "wifi-password", "wifi-connected-open", "adapter-open", "dropdown", "search", "search-page", "search-none", "display-single", "sound-muted", "power-plans-many", "update-checking",
-    "bt-pairing", "network-hidden", "proxy-on", "personal-light",
+    "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many",
 ];
 
 fn guid() -> GUID {
@@ -270,6 +270,7 @@ impl Demo {
                 s.mons.truncate(1);
                 s.names.truncate(1);
             }
+            "apps-many" => s.programs = (0..400).map(|i| app_entry(&format!("Program {i:03}"), &format!("{}.{}.{}", i % 9 + 1, i % 7, i % 13))).collect(),
             "sound-muted" => s.mute = [true, true],
             "power-plans-many" => s.plans = vec!["Power saver".into(), "Balanced".into(), "High performance".into(), "Ultimate Performance".into()],
             "proxy-on" => {
@@ -716,7 +717,7 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "power" | "battery-charging" | "battery-on-battery" | "battery-low" | "battery-none" | "power-plans-many" => 2,
         "network" | "net-wifi" | "net-ethernet" | "net-no-wifi-adapter" | "net-offline" | "net-airplane" | "wifi-password" | "wifi-connected-open" | "adapter-open" | "network-hidden" | "proxy-on" => 3,
         "bluetooth" | "bt-paired" | "bt-searching" | "bt-needs-pin" | "bt-off" | "bt-pairing" => 4,
-        "apps" => 5,
+        "apps" | "apps-many" => 5,
         "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => 6,
         "personal" | "appearance-dark" | "appearance-light" | "personal-light" => 7,
         "about" => 8,
@@ -729,6 +730,7 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "wifi-connected-open" => s.demo_open("wifi:Home-5G", None),
         "adapter-open" => crate::toggle_adapter("Ethernet"),
         "network-hidden" => s.demo_open("wifi:other", None),
+        "identify" => s.demo_identify = true,
         "bt-needs-pin" => s.pin_err = Some("gb".into()),
         "bt-pairing" => s.pairing = Some("px".into()),
         "dropdown" => s.demo_clicks.push(crate::app::ID_FIRST_SELECT), // the Resolution line
@@ -763,8 +765,6 @@ pub fn cli(args: &[String]) -> Option<i32> {
     // SAFETY: before any other thread exists and before the language is first read.
     unsafe { std::env::set_var("ProgramData", &dir) };
     set_os(Rc::new(Demo::new()));
-    let state = args.iter().find_map(|a| a.strip_prefix("state=")).unwrap_or("").to_string();
-    let _ = state;
     if let Some(i) = args.iter().position(|a| a == "--bench")
         && args.get(i + 1).map(String::as_str) == Some("pages")
     {
@@ -851,12 +851,31 @@ fn bench_pages(light: bool) -> i32 {
             }
         }
     }
+    // 400 programs on the Apps page, scrolled by the wheel: only the lines in view are drawn
+    let (app, _d) = settings("apps-many");
+    let mut core = Core::new(Box::new(app), (w, h), scale, 0);
+    let (mut scrolls, mut scrolls_all) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        t += 400;
+        frame(&mut core, &mut g, t);
+    }
+    core.pointer_move(600.0, 400.0, t);
+    for k in 0..300 {
+        t += 8;
+        core.wheel(0.0, if (k / 100) % 2 == 0 { -0.4 } else { 0.4 }, Default::default(), t);
+        let (_, ms, all) = frame(&mut core, &mut g, t);
+        scrolls.push(ms);
+        scrolls_all.push(all);
+    }
     let (a, b, c, d) = (stats(&mut pages), stats(&mut hovers), stats(&mut pages_all), stats(&mut hovers_all));
+    let (e, f) = (stats(&mut scrolls), stats(&mut scrolls_all));
     println!("ms per frame at scale {scale}, {} theme, no window (the draw alone, then with the copy of the frame out of the GPU into a DIB)", if light { "light" } else { "dark" });
     println!("scenario            |  mean    p95    max");
     println!("page switch, draw   | {:6.3} {:6.3} {:6.3}   ({} frames)", a.0, a.1, a.2, pages.len());
     println!("page switch, + copy | {:6.3} {:6.3} {:6.3}", c.0, c.1, c.2);
     println!("hover, draw         | {:6.3} {:6.3} {:6.3}   ({} frames)", b.0, b.1, b.2, hovers.len());
     println!("hover, + copy       | {:6.3} {:6.3} {:6.3}", d.0, d.1, d.2);
+    println!("scroll 400, draw    | {:6.3} {:6.3} {:6.3}   ({} frames)", e.0, e.1, e.2, scrolls.len());
+    println!("scroll 400, + copy  | {:6.3} {:6.3} {:6.3}", f.0, f.1, f.2);
     0
 }

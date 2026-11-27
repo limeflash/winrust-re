@@ -39,15 +39,16 @@ fn to_windows(h: HWND) -> windows::Win32::Foundation::HWND {
     windows::Win32::Foundation::HWND(h)
 }
 
+/// The tile of display `n` (1-based) in `r` (120 x 120): the mockup's `.dlgbg`.
+pub fn tile(c: &mut winrust_ui::gfx::Canvas<'_>, r: Rect, n: usize) {
+    c.fill(r, 20.0, Rgba::css(0, 0, 0, 0.65));
+    c.text(&n.to_string(), r, Font::new(64.0, 600), Rgba::pure_white(1.0), Align::Center);
+}
+
 /// Draws the tile of display `n` (1-based) into `surf`, `side` device pixels square at `scale`.
 fn paint_tile(g: &mut Gfx, surf: &mut Surface, n: usize, scale: f32) -> bool {
     let side = (SIDE * scale).round() as i32;
-    g.paint(surf, side, side, |c| {
-        let r = Rect::new(0.0, 0.0, SIDE, SIDE);
-        c.fill(r, 20.0, Rgba::css(0, 0, 0, 0.65));
-        c.text(&n.to_string(), r, Font::new(64.0, 600), Rgba::pure_white(1.0), Align::Center);
-    })
-    .is_ok()
+    g.paint(surf, side, side, |c| tile(c, Rect::new(0.0, 0.0, SIDE, SIDE), n)).is_ok()
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -116,6 +117,8 @@ pub fn open_count() -> usize {
 /// `--selftest identify`: two tiles far off the screen, which exist, and are gone again once their time has run out. 0: all well.
 pub fn selftest() -> i32 {
     use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
+    // SAFETY: COM for WIC on this thread, once (a normal run has it from the host).
+    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED) };
     let _ = winrust_ui::gfx::compose_windows();
     let mons = [Mon { x: 0, y: 0, w: 2560, h: 1600, primary: true }, Mon { x: 2560, y: 0, w: 3840, h: 2160, primary: false }];
     let made = spawn(&mons, (-20_000, -20_000), 300);
@@ -124,7 +127,7 @@ pub fn selftest() -> i32 {
         println!("{} {what}", if ok { "ok  " } else { "FAIL" });
         failed += i32::from(!ok);
     };
-    check(made.len() == 2, "a window for each of two displays");
+    check(made.len() == 2, &format!("a window for each of two displays ({} made)", made.len()));
     // SAFETY: queries on windows of ours.
     check(made.iter().all(|&h| unsafe { IsWindow(h) } != 0), "they exist");
     let end = std::time::Instant::now() + std::time::Duration::from_millis(1500);

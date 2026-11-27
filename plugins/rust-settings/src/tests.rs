@@ -352,7 +352,8 @@ fn while_the_dialog_is_up_other_keys_do_nothing() {
 #[test]
 fn switches_and_buttons_do_what_display_or_mute_did() {
     type Pred = fn(&Line) -> bool;
-    let cases: [(&str, Pred, &str); 6] = [
+    let cases: [(&str, Pred, &str); 7] = [
+        ("sound", |l| matches!(&l.row, Row::Slider(_, audio::Src::Mic)), "audio_set_mute mic=true true"),
         ("bluetooth", |l| matches!(&l.row, Row::Switch(_, _, Op::Bt)), "bt_set_bluetooth false"),
         ("bluetooth", |l| matches!(&l.row, Row::Switch(_, _, Op::Air)), "bt_set_airplane true"),
         ("network", |l| matches!(&l.row, Row::Switch(_, _, Op::Radio)), "wifi_set_radio false"),
@@ -472,6 +473,21 @@ fn the_buttons_of_item_rows_run_the_same_commands() {
 }
 
 #[test]
+fn an_adapter_unfolds_its_details_on_a_click() {
+    let (mut s, _d) = win("network");
+    let eth = |l: &Line| matches!(&l.row, Row::Adapter(a, _) if !a.wifi);
+    let l = s.pg.groups.iter().flat_map(|g| &g.rows).find(|l| eth(l)).unwrap();
+    assert!(s.expansion(l).is_empty(), "folded at first");
+    press(&mut s, eth, P_BODY_FOR_TEST);
+    let l = s.pg.groups.iter().flat_map(|g| &g.rows).find(|l| eth(l)).unwrap();
+    assert!(matches!(&l.row, Row::Adapter(_, true)));
+    assert!(s.expansion(l).iter().any(|e| matches!(e, draw::ExpItem::Fact(..))), "its facts are there");
+    press(&mut s, eth, P_BODY_FOR_TEST);
+    let l = s.pg.groups.iter().flat_map(|g| &g.rows).find(|l| eth(l)).unwrap();
+    assert!(matches!(&l.row, Row::Adapter(_, false)), "a second click folds it");
+}
+
+#[test]
 fn a_connected_vpn_hangs_up() {
     let (mut s, d) = win("network");
     let at = id(&s, |l| matches!(&l.row, Row::Item(_, _, Cmd::Vpn(_))), P_CTL);
@@ -553,6 +569,23 @@ fn wifi_a_saved_network_connects_and_forgets_and_a_connected_one_disconnects() {
     s.number_lines();
     press(&mut s, home5, P_ACT);
     assert_eq!(d.log().last().map(String::as_str), Some("wifi_disconnect"));
+}
+
+#[test]
+fn a_right_click_on_a_saved_network_unfolds_it_and_on_an_unsaved_one_does_not() {
+    let (mut s, _d) = win("network");
+    let right = |s: &mut Settings, ssid: &str| {
+        let ssid = ssid.to_string();
+        let at = id(s, |l| matches!(&l.row, Row::Wifi(n, _) if n.ssid == ssid), P_BODY_FOR_TEST);
+        s.click(at, Button::Right, 0.0, 0.0, &mut Cx::default());
+    };
+    right(&mut s, "Home-2.4G");
+    assert_eq!(s.open.as_deref(), Some("wifi:Home-2.4G"));
+    right(&mut s, "Home-2.4G");
+    assert_eq!(s.open.as_deref(), Some("wifi:Home-2.4G"), "a second right click keeps it open");
+    s.open = None;
+    right(&mut s, "Kepez_Free");
+    assert!(s.open.is_none(), "nothing to forget or disconnect: a right click does nothing");
 }
 
 #[test]
@@ -841,7 +874,51 @@ fn drawn_for_real_the_window_names_its_items_and_a_click_on_a_list_reaches_choos
 }
 
 #[test]
+fn the_wheel_scrolls_the_page_and_only_the_lines_in_view_are_named() {
+    let mut r = Rig::new("apps-many");
+    let rows = |r: &Rig| r.core.hits().all().iter().filter(|h| h.id >= app::ID_ROW && h.id < ID_HIT).map(|h| h.id).collect::<Vec<_>>();
+    let before = rows(&r);
+    assert!(!before.is_empty() && r.core.hits().all().len() < 60, "400 programs, only the ones in view are named ({} items)", r.core.hits().all().len());
+    r.t = anim::now_ms(); // the window reads the wheel's time from the real clock, so the frames after it must be on that clock
+    r.core.pointer_move(600.0, 400.0, r.t);
+    r.core.wheel(0.0, -6.0, Mods::default(), r.t);
+    for _ in 0..4 {
+        r.frame();
+    }
+    let after = rows(&r);
+    assert!(!after.is_empty() && after.iter().min() > before.iter().min(), "scrolled down: later lines are in view ({before:?} -> {after:?})");
+    assert!(r.core.hits().all().len() < 60);
+}
+
+#[test]
+fn esc_folds_an_open_line_first_and_then_closes_the_window() {
+    let (mut s, _d) = win("network");
+    press(&mut s, |l| matches!(&l.row, Row::Wifi(n, _) if n.ssid == "Home-2.4G"), P_BODY_FOR_TEST);
+    assert!(s.open.is_some());
+    assert!(s.key(0x1B, Mods::default(), &mut Cx::default()));
+    assert!(s.open.is_none());
+    let mut cx = Cx::default();
+    assert!(s.key(0x1B, Mods::default(), &mut cx));
+    assert!(cx.reqs.iter().any(|r| matches!(r, Req::Close)), "Esc with nothing open closes the window");
+}
+
+#[test]
+fn the_page_the_window_opens_on_starts_what_it_needs() {
+    for (state, call) in [("network", "wifi_scan"), ("power", "")] {
+        let (mut s, d) = win(state);
+        s.start(0);
+        if !call.is_empty() {
+            assert_eq!(d.log(), vec![call], "{state}");
+        }
+    }
+}
+
+#[test]
 fn at_rest_nothing_asks_for_a_frame_and_a_search_or_a_spinner_is_what_does() {
+    for st in ["display", "bt-paired", "network", "wu-up-to-date", "dialog-none"] {
+        let r = Rig::new(st);
+        assert!(!r.core.wants_frames(r.t + 5000) && r.core.deadline(r.t + 5000).is_none(), "{st}: at rest no frames and no timer of the frame loop");
+    }
     let r = Rig::new("display");
     assert!(!r.core.wants_frames(r.t + 5000), "a page at rest: no frames");
     assert_eq!(r.core.deadline(r.t + 5000), None, "and no timer of the frame loop");
