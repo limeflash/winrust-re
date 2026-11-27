@@ -140,7 +140,87 @@ impl Choice {
     }
 }
 
+/// Which windows get an app button on a bar, when there are several (%ProgramData%\WinRustpps-on.txt: `all` / `here`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AppsOn {
+    /// Every window on every bar (Windows 11's default).
+    #[default]
+    All,
+    /// A window only on the bar of the monitor it is on.
+    Here,
+}
+
+impl AppsOn {
+    pub const ALL: [AppsOn; 2] = [AppsOn::All, AppsOn::Here];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AppsOn::All => "all",
+            AppsOn::Here => "here",
+        }
+    }
+    /// Unknown or empty text is `All`.
+    pub fn parse(s: &str) -> AppsOn {
+        AppsOn::ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or_default()
+    }
+}
+
+/// What the bars on the other monitors hold (%ProgramData%\WinRust\other-bars.txt: `win11` / `same`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OtherBars {
+    /// Like Windows 11: Start, search, Task view, the app buttons and the clock; the tray, language, quick settings and power
+    /// buttons stay on the main bar.
+    #[default]
+    Win11,
+    /// The same as the main bar.
+    Same,
+}
+
+impl OtherBars {
+    pub const ALL: [OtherBars; 2] = [OtherBars::Win11, OtherBars::Same];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            OtherBars::Win11 => "win11",
+            OtherBars::Same => "same",
+        }
+    }
+    /// Unknown or empty text is `Win11`.
+    pub fn parse(s: &str) -> OtherBars {
+        OtherBars::ALL.into_iter().find(|v| v.name().eq_ignore_ascii_case(s.trim())).unwrap_or_default()
+    }
+}
+
 static ACCENT: Choice = Choice::new("accent.txt");
+static ALL_BARS: Choice = Choice::new("all-bars.txt");
+static APPS_ON: Choice = Choice::new("apps-on.txt");
+static OTHER_BARS: Choice = Choice::new("other-bars.txt");
+
+/// A bar on every monitor, not just the primary one (on unless the file says `off`).
+pub fn bar_on_all_displays() -> bool {
+    ALL_BARS.get(|s| usize::from(!s.trim().eq_ignore_ascii_case("off"))) == 1
+}
+
+pub fn set_bar_on_all_displays(on: bool) {
+    ALL_BARS.set(usize::from(on), if on { "on" } else { "off" });
+}
+
+pub fn apps_on() -> AppsOn {
+    AppsOn::ALL[APPS_ON.get(|s| AppsOn::parse(s) as usize)]
+}
+
+pub fn set_apps_on(a: AppsOn) {
+    APPS_ON.set(a as usize, a.name());
+}
+
+pub fn other_bars() -> OtherBars {
+    OtherBars::ALL[OTHER_BARS.get(|s| OtherBars::parse(s) as usize)]
+}
+
+pub fn set_other_bars(o: OtherBars) {
+    OTHER_BARS.set(o as usize, o.name());
+}
+
 static ANIM: Choice = Choice::new("anim.txt");
 
 pub fn accent() -> Accent {
@@ -666,6 +746,9 @@ pub fn reset_all() {
     set_autohide(false);
     set_align_left(false);
     set_alttab_per_monitor(false);
+    set_bar_on_all_displays(true);
+    set_apps_on(AppsOn::All);
+    set_other_bars(OtherBars::Win11);
     Theme { name: String::new(), style: Style::Classic, colors: [u32::MAX; 7], opacity: 85, accent: Accent::Blue }.apply();
 }
 
@@ -804,6 +887,21 @@ mod tests {
             assert!(is_color_change(w("ImmersiveColorSet").as_ptr() as isize));
             assert!(!is_color_change(w("ImmersiveColorSetX").as_ptr() as isize) && !is_color_change(w("Environment").as_ptr() as isize));
             assert!(!is_color_change(w("Immersive").as_ptr() as isize) && !is_color_change(0));
+        }
+    }
+
+    #[test]
+    fn the_multi_monitor_choices_parse_and_default_to_windows_11() {
+        assert_eq!(AppsOn::parse(" Here
+"), AppsOn::Here);
+        assert_eq!((AppsOn::parse("all"), AppsOn::parse(""), AppsOn::parse("nope")), (AppsOn::All, AppsOn::All, AppsOn::All));
+        assert_eq!(OtherBars::parse("same"), OtherBars::Same);
+        assert_eq!((OtherBars::parse("win11"), OtherBars::parse(""), OtherBars::parse("?")), (OtherBars::Win11, OtherBars::Win11, OtherBars::Win11));
+        for a in AppsOn::ALL {
+            assert_eq!(AppsOn::parse(a.name()), a);
+        }
+        for o in OtherBars::ALL {
+            assert_eq!(OtherBars::parse(o.name()), o);
         }
     }
 

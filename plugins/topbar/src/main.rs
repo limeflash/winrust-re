@@ -40,6 +40,7 @@ mod vdesk;
 mod wins;
 mod render;
 mod selftest;
+mod bars;
 use winrust_ui::pacing;
 mod notify;
 #[allow(dead_code)]
@@ -95,10 +96,6 @@ fn shape() -> barui::Shape {
 fn dp(v: f32) -> i32 {
     (v * SCALE.get()).round() as i32
 }
-/// Thickness of the bar in device pixels.
-fn bar_h() -> i32 {
-    dp(shape().thick)
-}
 /// Thickness plus the gap to the screen edge ("barOuter"): popups stand 12 dip beyond it.
 fn bar_outer() -> i32 {
     dp(shape().outer())
@@ -116,13 +113,9 @@ unsafe fn side_x(w: i32) -> i32 {
 unsafe fn pop_y(h: i32) -> i32 {
     if vert() { GetSystemMetrics(SM_CYSCREEN) - dp(12.0) - h } else { bar_top() - dp(12.0) - h }
 }
-/// False once the bar has slid away completely.
-fn bar_visible() -> bool {
-    UI.with_borrow(|u| u.as_ref().is_none_or(|b| !b.placement().gone))
-}
-/// The bar window's rectangle on screen as (left, top, width, height), including the strip above a bottom bar.
+/// The main bar window's rectangle on screen as (left, top, width, height), including the strip above a bottom bar.
 fn bar_win() -> (i32, i32, i32, i32) {
-    UI.with_borrow(|u| u.as_ref().map_or((0, 0, 0, 0), |b| b.placement().win))
+    bars::main_bar().map_or((0, 0, 0, 0), |b| b.win())
 }
 const BAD: u32 = winrust_common::style::BAD;
 const CALLBACK: u32 = WM_APP + 1;
@@ -134,9 +127,9 @@ const ALT_TAB: u32 = WM_APP + 11; // posted by the keyboard hook: Alt+Tab (wp 1 
 const ALT_UP: u32 = WM_APP + 12; // posted by the keyboard hook: Alt released while switching (wp 1 = Esc: cancel)
 static SWITCHING: AtomicBool = AtomicBool::new(false); // Alt+Tab switcher open (the hook thread reads it)
 static FULLSCREEN: AtomicBool = AtomicBool::new(false);
-static DESK_HIDE: AtomicBool = AtomicBool::new(false); // the desktop in front and the pointer away from the bar for 2 s
 static WIN_ALONE: AtomicBool = AtomicBool::new(false);
 static BAR: AtomicIsize = AtomicIsize::new(0); // the bar window, for the hook thread
+const SYNC_BARS: u32 = WM_APP + 22; // posted by a bar when its monitor's scale changed: the main bar makes the bars match the monitors
 const WIN_NUM: u32 = WM_APP + 15; // posted by the keyboard hook: Win+1..9 (wp 0..8) = the n-th button of the bar
 const WIN_X: u32 = WM_APP + 17; // posted by the keyboard hook: Win+X = our power-user menu (start_menu)
 const NEXT_LANG: u32 = WM_APP + 16; // posted by the keyboard hook: Win+Space with no explorer (wp 1 = Shift held: previous layout)
@@ -216,13 +209,9 @@ thread_local! {
     static BTNS: RefCell<Vec<Btn>> = const { RefCell::new(Vec::new()) }; // [0] is always Start (pin None, no wins)
     static TAPPS: RefCell<Vec<TIcon>> = const { RefCell::new(Vec::new()) };
     static SHOWN: RefCell<Option<Vec<String>>> = const { RefCell::new(None) }; // tray icons kept on the bar (by exe); None = none: every tray icon lives in the chevron flyout
-    static HOT: Cell<i32> = const { Cell::new(NONE) };
     static ORDER: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // unpinned windows in the order their buttons were added
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static BUSY: Cell<bool> = const { Cell::new(false) }; // a fade is still running: the painter asks for another frame
-    static UI: RefCell<Option<barui::Bar>> = const { RefCell::new(None) }; // the bar's renderer and its animation state
-    static SHADOW: Cell<HWND> = const { Cell::new(null_mut()) }; // the window under the floating bars that holds their shadow
-    static DESK_T: Cell<u64> = const { Cell::new(0) }; // last moment the bar had a reason to stay on the desktop
     static SCALE: Cell<f32> = const { Cell::new(1.0) };
     static OLD_STATE: Cell<usize> = const { Cell::new(ABS_ALWAYSONTOP as usize) };
     static BAT: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // (percent or -1 = no battery, on AC)
@@ -281,7 +270,7 @@ unsafe fn tip_text(h: i32) -> String {
         },
         t if t > TAPP && t < TAPP + 100 => bar_idx().get((t - TAPP - 1) as usize).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|i| i.tip.clone()))).unwrap_or_default(),
         i if i >= 1 => {
-            let (wins, lnk) = BTNS.with_borrow(|b| b.get(i as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| wstr_of(&x.lnk))))))).unwrap_or_default();
+            let (wins, lnk) = btn_at(i).map(|(pin, wins, _)| (wins, pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| wstr_of(&x.lnk)))))).unwrap_or_default();
             let title = |w: HWND| {
                 let mut b = [0u16; 256];
                 let n = GetWindowTextW(w, b.as_mut_ptr(), 256).max(0) as usize;
@@ -308,32 +297,61 @@ fn vol_tip() -> String {
 
 /// The hint of bar element `key` after `delay` ms (the mockup waits .25 s), `hold` ms at most.
 unsafe fn key_tip(key: i32, text: String, delay: u32, hold: Option<u32>) {
+    // a lighter bar has no volume button for the wheel's readout, and so on: nothing to hang the hint on
+    if bars::cur().is_none_or(|b| b.ui.borrow().as_ref().is_none_or(|u| u.layout().rect_of(key).is_none())) {
+        return;
+    }
     let Some(a) = anchor(key) else { return };
     let along = tip_cx(key);
-    ui::tip::show(&text, ui::tip::Place::button(a.side, a.button, along, SCALE.get()), delay, hold);
+    let scale = bars::cur().map_or(SCALE.get(), |b| b.scale.get());
+    ui::tip::show(&text, ui::tip::Place::button(a.side, a.button, along, scale).on((a.origin.0, a.origin.1, a.screen.0, a.screen.1)), delay, hold);
+}
+
+/// The app button `key` (>= 1) of the bar being served: its pin, the windows it shows on that bar and its icon. A bar's keys
+/// count the buttons it shows (with every window on every bar they are `BTNS`' indices).
+fn btn_at(key: i32) -> Option<(Option<usize>, Vec<HWND>, HICON)> {
+    let b = bars::cur()?;
+    let bb = b.btns.borrow().get((key as usize).checked_sub(1)?).cloned()?;
+    BTNS.with_borrow(|v| v.get(bb.idx).map(|x| (x.pin, bb.wins, x.icon)))
 }
 
 /// Where a bar element is, for the panel that belongs to it (`NONE`: the bar as a whole), in device pixels with the bar at rest.
 unsafe fn anchor(key: i32) -> Option<ui::panel::Anchor> {
-    UI.with_borrow(|u| {
-        let b = u.as_ref()?;
-        let p = b.placement();
-        let (dx, dy) = (p.rest.0 - p.bar.0, p.rest.1 - p.bar.1);
-        let button = b.screen_rect(key).map_or((0, 0, 0, 0), |r| (r.0 + dx, r.1 + dy, r.2 + dx, r.3 + dy));
-        Some(ui::panel::Anchor {
-            side: i18n::style::side(),
-            button,
-            bar: (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3),
-            screen: (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
-        })
+    anchor_of(&*bars::cur()?, key)
+}
+
+/// [`anchor`] on the main bar whatever bar is being served (the notification pop-ups and the toasts live there).
+unsafe fn anchor_main(key: i32) -> Option<ui::panel::Anchor> {
+    anchor_of(&*bars::main_bar()?, key)
+}
+
+unsafe fn anchor_of(bar: &bars::BarCx, key: i32) -> Option<ui::panel::Anchor> {
+    let ui = bar.ui.borrow();
+    let b = ui.as_ref()?;
+    let p = b.placement();
+    let (dx, dy) = (p.rest.0 - p.bar.0, p.rest.1 - p.bar.1);
+    let button = b.screen_rect(key).map_or((0, 0, 0, 0), |r| (r.0 + dx, r.1 + dy, r.2 + dx, r.3 + dy));
+    let mon = bar.mon.get();
+    Some(ui::panel::Anchor {
+        side: i18n::style::side(),
+        button,
+        bar: (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3),
+        screen: (mon.w(), mon.h()),
+        origin: (mon.rect.0, mon.rect.1),
     })
 }
 
-/// A panel opened or closed: the bar redraws the button that is lit for it.
+/// A panel opened or closed: the bars redraw the button that is lit for it.
 fn panel_changed() {
     ui::notice_pop::restack(); // the cards stand over a panel that opened in their corner
-    // SAFETY: invalidating our own bar window.
-    unsafe { InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0) };
+    // SAFETY: invalidating our own bar windows.
+    unsafe { bars::invalidate_all() };
+}
+
+/// The panel host's notice: a panel opened or closed, from the bar being served (see `bars::opened`).
+fn panel_notice() {
+    bars::opened();
+    panel_changed();
 }
 
 /// A popup (a panel of the new frame, or an old flyout) is open: hints stay away and the bar stays put.
@@ -411,64 +429,80 @@ unsafe fn hide_taskbar_if_shown() {
     }
 }
 
-/// Reserves the strip the bar takes (maximized windows stay clear of it) and draws it in its place.
+/// Reserves the strip the bar takes on its monitor (maximized windows stay clear of it) and draws it in its place.
 unsafe fn place(hwnd: HWND) {
-    let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    let Some(bar) = bars::of(hwnd) else { return };
+    let mon = bar.mon.get();
+    let side = i18n::style::side();
+    let (mut ab, r) = query_strip(&bar);
+    SHAppBarMessage(ABM_SETPOS, &mut ab);
+    bar.strip.set(r);
+    // No explorer (rs-shell / rust-explorer): nobody handles appbars, so set the work area ourselves. Without it maximized
+    // windows slide under the bar and, covering the whole monitor, count as "fullscreen" and hide the bar.
+    // Also with Explorer: it does not always honour the appbar when its own taskbar is hidden (#89).
+    let w = bars::work_rect(mon.rect, side, r);
+    set_work_area(RECT { left: w.0, top: w.1, right: w.2, bottom: w.3 }, mon.id);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    redraw(hwnd);
+}
+
+/// ABN_POSCHANGED: another appbar moved. The main bar is put again as it always was (that also gives the work area back after
+/// Explorer touched it); another bar only if its strip would now be elsewhere: every `ABM_SETPOS` tells the other appbars, and
+/// with a bar on each monitor they would otherwise answer each other for ever.
+unsafe fn place_if_moved(hwnd: HWND) {
+    if let Some(bar) = bars::of(hwnd)
+        && (bar.main || query_strip(&bar).1 != bar.strip.get())
+    {
+        place(hwnd);
+    }
+}
+
+/// What `ABM_QUERYPOS` leaves of the strip the bar asks for on its monitor: the request, ready for `ABM_SETPOS`, and the strip.
+unsafe fn query_strip(bar: &bars::BarCx) -> (APPBARDATA, bars::R4) {
+    let mon = bar.mon.get();
+    let side = i18n::style::side();
+    let hwnd = bar.hwnd;
     let mut ab: APPBARDATA = zeroed();
     ab.cbSize = size_of::<APPBARDATA>() as u32;
     ab.hWnd = hwnd;
     // the bar and its gap to the screen edge (classic: no gap): maximized windows end above it, the dock included;
     // auto-hide reserves nothing (the bar slides in over the windows)
-    let strip = if i18n::style::autohide() { 0 } else { dp(shape().reserve()) };
-    if vert() {
-        let left = i18n::style::side() == i18n::style::Side::Left;
-        ab.uEdge = if left { ABE_LEFT } else { ABE_RIGHT };
-        ab.rc = if left { RECT { left: 0, top: 0, right: strip, bottom: cy } } else { RECT { left: cx - strip, top: 0, right: cx, bottom: cy } };
-        SHAppBarMessage(ABM_QUERYPOS, &mut ab);
-        if left { ab.rc.left = sane_edge(ab.rc.left, cx) } else { ab.rc.right = cx - sane_edge(cx - ab.rc.right, cx) }
-        if left { ab.rc.right = ab.rc.left + strip } else { ab.rc.left = ab.rc.right - strip }
-    } else {
-        ab.uEdge = ABE_BOTTOM;
-        ab.rc = RECT { left: 0, top: cy - strip, right: cx, bottom: cy };
-        SHAppBarMessage(ABM_QUERYPOS, &mut ab);
-        ab.rc.bottom = cy - sane_edge(cy - ab.rc.bottom, cy);
-        ab.rc.top = ab.rc.bottom - strip;
-    }
-    SHAppBarMessage(ABM_SETPOS, &mut ab);
-    // No explorer (rs-shell / rust-explorer): nobody handles appbars, so set the work area ourselves. Without it maximized
-    // windows slide under the bar and, covering the whole monitor, count as "fullscreen" and hide the bar.
-    // Also with Explorer: it does not always honour the appbar when its own taskbar is hidden (#89).
-    {
-        set_work_area(if vert() { if ab.uEdge == ABE_LEFT { RECT { left: ab.rc.right, top: 0, right: cx, bottom: cy } } else { RECT { left: 0, top: 0, right: ab.rc.left, bottom: cy } } } else { RECT { left: 0, top: 0, right: cx, bottom: ab.rc.top } });
-    }
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    redraw(hwnd);
+    let strip = if i18n::style::autohide() { 0 } else { bar.dp(shape().reserve()) };
+    ab.uEdge = match side {
+        Side::Left => ABE_LEFT,
+        Side::Right => ABE_RIGHT,
+        Side::Bottom => ABE_BOTTOM,
+    };
+    let r = bars::strip_rect(mon.rect, side, strip);
+    ab.rc = RECT { left: r.0, top: r.1, right: r.2, bottom: r.3 };
+    SHAppBarMessage(ABM_QUERYPOS, &mut ab);
+    let r = bars::settle_strip(mon.rect, side, (ab.rc.left, ab.rc.top, ab.rc.right, ab.rc.bottom), strip);
+    ab.rc = RECT { left: r.0, top: r.1, right: r.2, bottom: r.3 };
+    (ab, r)
 }
 
-/// How far from its screen edge the bar may sit after ABM_QUERYPOS (room left for other appbars). Explorer sometimes answers
-/// with a far-off edge (a stale or huge appbar entry), and the work area then shrank to half the screen (#106): past a
-/// quarter of the screen, or off it, the bar goes back to the edge.
-fn sane_edge(offset: i32, size: i32) -> i32 {
-    if (0..=size / 4).contains(&offset) { offset } else { 0 }
-}
-
-unsafe fn set_work_area(mut want: RECT) {
-    let mut cur: RECT = zeroed();
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut cur as *mut _ as *mut _, 0);
+/// Sets the work area of the monitor `mon` (a handle); `want` is inside it, which is how `SPI_SETWORKAREA` knows which one.
+unsafe fn set_work_area(mut want: RECT, mon: isize) {
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(mon as HMONITOR, &mut mi) == 0 {
+        return;
+    }
+    let cur = mi.rcWork;
     if (cur.left, cur.top, cur.right, cur.bottom) != (want.left, want.top, want.right, want.bottom) {
         // SPIF_SENDCHANGE waits for every top-level window (took ~3 s, #94): set quietly and post the notice instead
         SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut want as *mut _ as *mut _, 0);
         PostMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA as usize, 0);
-        EnumWindows(Some(fit_maximized), &[want, cur] as *const [RECT; 2] as isize);
+        EnumWindows(Some(fit_maximized), &(want, cur, mon) as *const (RECT, RECT, isize) as isize);
     }
 }
 
 /// A window that was already maximized keeps its old size when the work area changes: trim it where the area shrank, and
 /// stretch the edges that sat on the old area's edge where it grew (size only, no restore).
 unsafe extern "system" fn fit_maximized(h: HWND, lp: isize) -> i32 {
-    let [want, old] = *(lp as *const [RECT; 2]);
-    // the work area is the primary monitor's: a window maximized on another monitor would be cut to a sliver
-    if IsWindowVisible(h) == 0 || IsZoomed(h) == 0 || MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) {
+    let (want, old, mon) = *(lp as *const (RECT, RECT, isize));
+    // the work area is that of one monitor: a window maximized on another one is not touched
+    if IsWindowVisible(h) == 0 || IsZoomed(h) == 0 || MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) as isize != mon {
         return 1;
     }
     let mut r: RECT = zeroed();
@@ -524,7 +558,7 @@ unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> i32 {
     DwmGetWindowAttribute(h, 14, &mut cloaked as *mut _ as *mut _, 4);
     let mut cls = [0u16; 32];
     let n = GetClassNameW(h, cls.as_mut_ptr(), 32) as usize;
-    let ours = String::from_utf16_lossy(&cls[..n]) == "topbar";
+    let ours = matches!(String::from_utf16_lossy(&cls[..n]).as_str(), "topbar" | "topbar_extra");
     let skipped = SKIP.with_borrow(|s| s.contains(&h));
     if IsWindowVisible(h) != 0 && GetWindow(h, GW_OWNER).is_null() && cloaked == 0 && !ours && GetWindowTextLengthW(h) > 0 && (ex & WS_EX_TOOLWINDOW == 0 || ex & WS_EX_APPWINDOW != 0) && !skipped {
         (*(lp as *mut Vec<HWND>)).push(h);
@@ -991,6 +1025,7 @@ fn refresh_buttons() {
         }
     });
     BTNS.set(btns);
+    unsafe { bars::rebuild_buttons() };
 }
 
 thread_local! {
@@ -1048,7 +1083,7 @@ fn refresh_status() {
         read_volume();
         let up = !find_other("Shell_TrayWnd").is_null();
         if EXPLORER_UP.swap(up, Relaxed) && !up {
-            place(BAR.load(Relaxed) as HWND); // Explorer (started for Settings) is gone and took the reserved strip with it
+            bars::all().iter().for_each(|b| place(b.hwnd)); // Explorer (started for Settings) is gone and took the reserved strips with it
             // icons that apps put into Explorer's (hidden) tray went with it: ask every app to register again, now with us.
             // The empty-tray check below misses this when some icons already reached the bar.
             announce();
@@ -1097,13 +1132,13 @@ fn power_run(kind: ui::power_popup::Kind) {
 }
 
 /// The bar element under a client point of the bar window (device pixels), straight from the frame's layout table.
-unsafe fn hit(x: i32, y: i32) -> i32 {
-    UI.with_borrow(|u| u.as_ref().map_or(NONE, |b| b.hit(x, y)))
+unsafe fn hit(bar: &bars::BarCx, x: i32, y: i32) -> i32 {
+    bar.ui.borrow().as_ref().map_or(NONE, |b| b.hit(x, y))
 }
 
 /// Screen position (x for a bottom bar, y for a side bar) of the middle of a bar element, for its tooltip and menus.
 unsafe fn tip_cx(h: i32) -> i32 {
-    UI.with_borrow(|u| u.as_ref().and_then(|b| b.screen_center(h))).map_or(0, |(x, y)| if vert() { y } else { x })
+    bars::cur().and_then(|b| b.ui.borrow().as_ref().and_then(|u| u.screen_center(h))).map_or(0, |(x, y)| if vert() { y } else { x })
 }
 
 // ---------- animation ----------
@@ -1150,20 +1185,18 @@ unsafe fn glow(dc: HDC, key: i32, on: bool, r: RECT, from: u32, to: u32, rad: i3
     }
 }
 
-thread_local! {
-    static PRESS: Cell<(i32, u64)> = const { Cell::new((i32::MIN, 0)) }; // last clicked bar element and when
-}
-
-/// Marks `key` as just pressed: its icon squeezes for a moment.
+/// Marks `key` as just pressed on the bar being served: its icon squeezes for a moment.
 unsafe fn press(key: i32) {
-    PRESS.set((key, now_ms()));
+    if let Some(b) = bars::cur() {
+        b.press.set((key, now_ms()));
+    }
 }
 
-/// True when the foreground window covers the whole primary monitor (game, F11 video, presentation).
+/// True when the foreground window covers the whole monitor of `bar` (game, F11 video, presentation).
 /// A maximized window does not: the bar's reserved strip keeps it below the bar.
-unsafe fn fullscreen_now(bar: HWND) -> bool {
+unsafe fn fullscreen_now(bar: &bars::BarCx) -> bool {
     let fg = GetForegroundWindow();
-    if fg.is_null() || fg == bar || IsWindowVisible(fg) == 0 || IsIconic(fg) != 0 {
+    if fg.is_null() || bars::of(fg).is_some() || IsWindowVisible(fg) == 0 || IsIconic(fg) != 0 {
         return false;
     }
     let mut cls = [0u16; 64];
@@ -1175,10 +1208,11 @@ unsafe fn fullscreen_now(bar: HWND) -> bool {
     GetWindowRect(fg, &mut r);
     let mut mi: MONITORINFO = zeroed();
     mi.cbSize = size_of::<MONITORINFO>() as u32;
-    GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut mi);
+    let hm = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoW(hm, &mut mi);
     let m = mi.rcMonitor;
     let caption = GetWindowLongW(fg, GWL_STYLE) as u32 & WS_CAPTION == WS_CAPTION;
-    (m.left, m.top) == (0, 0) && covers_monitor(r, m, caption, IsZoomed(fg) != 0)
+    hm as isize == bar.mon.get().id && covers_monitor(r, m, caption, IsZoomed(fg) != 0)
 }
 
 /// A framed maximized window overhangs the monitor by its border and is not fullscreen (#88); but a game in "borderless
@@ -1190,52 +1224,58 @@ fn covers_monitor(r: RECT, m: RECT, caption: bool, zoomed: bool) -> bool {
     r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
 }
 
-/// True when no app window is on screen (none open, or all minimized: Win+D): the user is looking at the desktop.
-unsafe fn desktop_now() -> bool {
-    BTNS.with_borrow(|b| b.iter().flat_map(|b| &b.wins).all(|&w| IsIconic(w) != 0))
+/// True when no app window is on screen of `bar` (none open there, or all minimized: Win+D): the user is looking at the desktop.
+unsafe fn desktop_now(bar: &bars::BarCx) -> bool {
+    bar.btns.borrow().iter().flat_map(|b| &b.wins).all(|&w| IsIconic(w) != 0)
 }
 
-unsafe fn fs_update(hwnd: HWND) {
-    let fs = fullscreen_now(hwnd);
-    // a fullscreen game keeps the screen: the pointer at the bottom edge does not bring the bar (games park it at the
-    // edges all the time); Win opens Start, which brings the bar with it
+/// Looks at every bar's monitor: a fullscreen window hides that bar (and only that one), the desktop in front lets it slide away
+/// and the pointer at its edge brings it back.
+unsafe fn fs_update(_hwnd: HWND) {
+    let main = BAR.load(Relaxed) as HWND;
+    // the pointer decides about the hot zone at the bar's edge: a fullscreen game keeps the screen, the pointer at the edge
+    // does not bring the bar (games park it at the edges all the time); Win opens Start, which brings the bar with it
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
-    // desktop in front: the bar leaves 2 s after the pointer does and comes back at the bottom edge (an open flyout keeps it)
     let now = now_ms();
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    // the hot zone is a 6 dip strip at the edge; while the bar is out, the pointer over it keeps it there
-    let (edge, outer, shown) = (dp(6.0), bar_outer(), bar_visible());
-    let over = if vert() {
-        if i18n::style::side() == i18n::style::Side::Left { pt.x < edge || (pt.x < outer && shown) } else { pt.x >= sw - edge || (pt.x >= sw - outer && shown) }
-    } else {
-        pt.y >= sh - edge || (pt.y >= sh - outer && shown)
-    };
-    if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || popup_open() || over {
-        DESK_T.set(now);
-    }
-    let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
-    if DESK_HIDE.swap(desk, Relaxed) != desk {
-        redraw(hwnd);
-    }
-    if FULLSCREEN.swap(fs, Relaxed) != fs {
-        if fs {
-            fly::close_now();
-            ui::panel::close_now();
-            hide_tip(hwnd);
-            hide_preview();
+    let (mut any_fs, mut poll) = (false, i18n::style::autohide() || dock());
+    for bar in bars::all() {
+        let fs = fullscreen_now(&bar);
+        // desktop in front: the bar leaves 2 s after the pointer does and comes back at the bottom edge (an open flyout keeps it)
+        let (m, shown) = (bar.rect(), bar.visible());
+        // the hot zone is a 6 dip strip at the edge; while the bar is out, the pointer over it keeps it there
+        let (edge, outer) = (bar.dp(6.0), bar.outer());
+        let over = bars::pointer_at_edge(m, i18n::style::side(), (pt.x, pt.y), if shown { outer } else { edge });
+        if fs || !(i18n::style::autohide() || desktop_now(&bar) || dock_covered(&bar)) || popup_open() || over {
+            bar.desk_t.set(now);
         }
-        redraw(hwnd);
+        let desk = !fs && now.saturating_sub(bar.desk_t.get()) >= 2000;
+        if bar.desk_hide.replace(desk) != desk {
+            redraw(bar.hwnd);
+        }
+        if bar.fs.replace(fs) != fs {
+            if fs {
+                // what is open on this monitor's bar goes; what belongs to another bar stays
+                if bars::opener().is_none_or(|h| h == bar.hwnd) {
+                    fly::close_now();
+                    ui::panel::close_now();
+                }
+                hide_tip(bar.hwnd);
+                hide_preview();
+            }
+            redraw(bar.hwnd);
+        }
+        any_fs |= fs;
+        // the 250 ms watch is only needed while the pointer decides (auto-hide, dock, desktop, bar away); otherwise
+        // the foreground event, ABN_FULLSCREENAPP and the 1 s tick call this
+        poll |= desktop_now(&bar) || bar.desk_hide.get();
     }
-    // the 250 ms watch is only needed while the pointer decides (auto-hide, dock, desktop, bar away); otherwise
-    // the foreground event, ABN_FULLSCREENAPP and the 1 s tick call this
-    let poll = i18n::style::autohide() || dock() || desktop_now() || DESK_HIDE.load(Relaxed);
+    FULLSCREEN.store(any_fs, Relaxed);
     if FS_POLL.replace(poll) != poll {
         if poll {
-            SetTimer(hwnd, 3, 250, None);
+            SetTimer(main, 3, 250, None);
         } else {
-            KillTimer(hwnd, 3);
+            KillTimer(main, 3);
         }
     }
 }
@@ -1246,18 +1286,18 @@ thread_local! {
 
 /// The dock is in the way of the window in front (one dragged down under it): it hides like over the
 /// desktop and comes back when the pointer touches the bottom edge.
-unsafe fn dock_covered() -> bool {
+unsafe fn dock_covered(bar: &bars::BarCx) -> bool {
     if !dock() {
         return false;
     }
     let fg = GetForegroundWindow();
     // a maximized window never hides the dock (it could stay gone until the window was restored)
-    if fg.is_null() || IsIconic(fg) != 0 || IsZoomed(fg) != 0 || fg == BAR.load(Relaxed) as HWND || popup_open() {
+    if fg.is_null() || IsIconic(fg) != 0 || IsZoomed(fg) != 0 || bars::of(fg).is_some() || popup_open() {
         return false;
     }
     let mut r: RECT = zeroed();
     GetWindowRect(fg, &mut r);
-    let Some((x, y, w, h)) = UI.with_borrow(|u| u.as_ref().map(|b| b.placement().rest)) else { return false };
+    let Some((x, y, w, h)) = bar.ui.borrow().as_ref().map(|b| b.placement().rest) else { return false };
     r.bottom > y && r.top < y + h && r.right > x && r.left < x + w
 }
 
@@ -1348,7 +1388,8 @@ unsafe fn repaint_if_changed(hwnd: HWND, tick: bool) {
     let s = view_sig();
     if s != last || (tick && quiet >= 10) {
         SIG.set((s, 0));
-        InvalidateRect(hwnd, null(), 0);
+        let _ = hwnd;
+        bars::invalidate_all();
     } else if tick {
         SIG.set((s, quiet + 1));
     }
@@ -1384,10 +1425,7 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
 
 /// The mode changed (the Dark style tile, or Windows itself): the bar and whatever is open are painted again in it.
 unsafe fn theme_changed() {
-    let bar = BAR.load(Relaxed) as HWND;
-    if !bar.is_null() {
-        InvalidateRect(bar, null(), 0);
-    }
+    bars::invalidate_all();
     ui::panel::refresh();
     ui::notice_pop::changed(None);
 }
@@ -1397,6 +1435,8 @@ unsafe fn view_sig() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
+    // what each bar shows of them: a window moving to the other monitor moves its button
+    bars::all().iter().for_each(|b| b.btns.borrow().iter().for_each(|x| (x.idx, x.wins.iter().map(|&w| w as usize).collect::<Vec<_>>()).hash(&mut h)));
     (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), INET.get(), EXPLORER_UP.load(Relaxed), clock_texts(), lang_name()).hash(&mut h);
     notify::with(|s| (s.badge(), s.dnd())).hash(&mut h);
     TAPPS.with_borrow(|t| t.iter().for_each(|x| (x.hwnd as usize, x.uid, x.icon as usize, x.hidden, &x.tip).hash(&mut h)));
@@ -1493,38 +1533,47 @@ unsafe fn destroy_icon(ic: HICON) {
     DestroyIcon(ic);
 }
 
-/// What the bar shows now, gathered from the program's state.
-unsafe fn build_view() -> barui::View {
-    let s = SCALE.get();
+/// What `bar` shows now, gathered from the program's state.
+unsafe fn build_view(bar: &bars::BarCx) -> barui::View {
+    let s = bar.scale.get();
     let fg = GetForegroundWindow();
-    let apps = BTNS.with_borrow(|btns| {
-        btns.iter()
-            .skip(1) // Start is the layout's own button
-            .map(|b| {
-                let ic = match b.pin {
-                    Some(p) => PINS.with_borrow(|pins| pins.get(p).map_or(null_mut(), |p| p.icon)),
-                    None => b.icon,
-                };
-                let ic = if ic.is_null() { b.wins.first().map_or(ic, |&w| icon_of(w)) } else { ic }; // a pin whose icon failed to load (#91)
-                let active = b.wins.contains(&fg);
-                let flash = !active && FLASH.with_borrow(|f| b.wins.iter().any(|w| f.contains(w))); // lit until it is activated
-                barui::AppView { icon: wicon(ic), wins: b.wins.len(), active, flash, color: icon_color(ic) }
-            })
-            .collect()
-    });
-    let tray = {
-        let bar = bar_idx();
-        TAPPS.with_borrow(|t| bar.iter().map(|&i| wicon(t[i].icon)).collect())
+    let apps = {
+        let shown = bar.btns.borrow();
+        BTNS.with_borrow(|btns| {
+            shown
+                .iter()
+                .filter_map(|bb| btns.get(bb.idx).map(|b| (b, &bb.wins)))
+                .map(|(b, wins)| {
+                    let ic = match b.pin {
+                        Some(p) => PINS.with_borrow(|pins| pins.get(p).map_or(null_mut(), |p| p.icon)),
+                        None => b.icon,
+                    };
+                    let ic = if ic.is_null() { wins.first().map_or(ic, |&w| icon_of(w)) } else { ic }; // a pin whose icon failed to load (#91)
+                    let active = wins.contains(&fg);
+                    let flash = !active && FLASH.with_borrow(|f| wins.iter().any(|w| f.contains(w))); // lit until it is activated
+                    barui::AppView { icon: wicon(ic), wins: wins.len(), active, flash, color: icon_color(ic) }
+                })
+                .collect()
+        })
+    };
+    let full = bar.full();
+    let tray = if full {
+        let idx = bar_idx();
+        TAPPS.with_borrow(|t| idx.iter().map(|&i| wicon(t[i].icon)).collect())
+    } else {
+        Vec::new()
     };
     let (time, date) = clock_texts();
     let (bat, ac) = BAT.get();
     let (vol, muted) = VOL.get();
+    let mon = bar.mon.get();
     barui::View {
         style: style(),
         side: i18n::style::side(),
         size: i18n::style::bar_size(),
         align_left: i18n::style::align_left(),
-        screen: (GetSystemMetrics(SM_CXSCREEN) as f32 / s, GetSystemMetrics(SM_CYSCREEN) as f32 / s),
+        screen: (mon.w() as f32 / s, mon.h() as f32 / s),
+        full,
         op: i18n::style::bar_opacity() as f32 / 100.0,
         apps,
         tray,
@@ -1541,12 +1590,12 @@ unsafe fn build_view() -> barui::View {
         date,
         unread: notify::with(|s| s.badge()).unwrap_or(0),
         dnd: notify::with(|s| s.dnd()),
-        rec: snip::rec_time(),
+        rec: if full { snip::rec_time() } else { None },
     }
 }
 
-/// The pointer and the open panels.
-unsafe fn build_live() -> barui::Live {
+/// The pointer and the open panels, as `bar` shows them: a button is lit on the bar the open panel came from only.
+unsafe fn build_live(bar: &bars::BarCx) -> barui::Live {
     // the centre is the calendar's: open, it has seen what arrived (and the pop-ups are gone); closed, it has been seen
     let cal = ui::panel::is_open(ui::panel::Id::Cal);
     if notify::with(|s| s.centre_open()) != cal {
@@ -1554,42 +1603,43 @@ unsafe fn build_live() -> barui::Live {
         ui::notice_pop::changed(None);
     }
     let now = now_ms();
-    let (pk, pt) = PRESS.get();
+    let (pk, pt) = bar.press.get();
+    let lit = bars::lit(bar);
+    let open = |id| lit && ui::panel::is_open(id);
     barui::Live {
         now,
-        hot: HOT.get(),
+        hot: bar.hot.get(),
         press: if now.saturating_sub(pt) < 220 { pk } else { NONE },
-        gear: ui::panel::is_open(ui::panel::Id::Bar),
-        start: ui::panel::is_open(ui::panel::Id::Start),
-        search: ui::panel::is_open(ui::panel::Id::Search),
-        qs: ui::panel::is_open(ui::panel::Id::Qs),
-        cal,
-        lang: ui::panel::is_open(ui::panel::Id::Lang),
-        tray: ui::panel::is_open(ui::panel::Id::Tray),
-        task: ui::panel::is_open(ui::panel::Id::Task),
-        jump: if ui::panel::is_open(ui::panel::Id::Jump) { JL_KEY.get() } else { None },
-        hidden: FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)),
+        gear: open(ui::panel::Id::Bar),
+        start: open(ui::panel::Id::Start),
+        search: open(ui::panel::Id::Search),
+        qs: open(ui::panel::Id::Qs),
+        cal: lit && cal,
+        lang: open(ui::panel::Id::Lang),
+        tray: open(ui::panel::Id::Tray),
+        task: open(ui::panel::Id::Task),
+        jump: if open(ui::panel::Id::Jump) { JL_KEY.get() } else { None },
+        hidden: bar.fs.get() || (i18n::style::autohide() && bar.desk_hide.get()),
     }
 }
 
-/// Draws one frame of the bar (and of its shadow) and puts it on screen; asks for the next one while anything moves.
+/// Draws one frame of a bar (and of its shadow) and puts it on screen; asks for the next one while anything moves.
 /// Everything that wants the bar redrawn invalidates it, WM_PAINT lands here.
 unsafe fn redraw(hwnd: HWND) {
-    let live = build_live(); // first: it tells the notifications whether their centre is open, and the badge follows
-    let view = build_view();
-    let Some(p) = UI.with_borrow_mut(|u| u.as_mut().map(|b| b.frame(&view, &live))) else { return };
-    let shadow = SHADOW.get();
+    let Some(bar) = bars::of(hwnd) else { return };
+    let live = build_live(&bar); // first: it tells the notifications whether their centre is open, and the badge follows
+    let view = build_view(&bar);
+    let Some(p) = bar.ui.borrow_mut().as_mut().map(|b| b.frame(&view, &live)) else { return };
+    let shadow = bar.shadow;
     if p.gone {
         ShowWindow(hwnd, SW_HIDE); // not just moved away: a hidden bar cannot cover a game
         ShowWindow(shadow, SW_HIDE);
         pacing::set(hwnd as isize, false);
         return;
     }
-    UI.with_borrow(|u| {
-        if let Some(b) = u {
-            b.present(whwnd(hwnd), whwnd(shadow));
-        }
-    });
+    if let Some(b) = bar.ui.borrow().as_ref() {
+        b.present(whwnd(hwnd), whwnd(shadow));
+    }
     if IsWindowVisible(hwnd) == 0 {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -1724,11 +1774,11 @@ unsafe fn jump_list(h: i32) {
         Right,
         Start,
     }
-    if ui::panel::is_open(ui::panel::Id::Jump) && JL_KEY.get() == Some(h) {
+    if ui::panel::is_open(ui::panel::Id::Jump) && JL_KEY.get() == Some(h) && bars::cur().is_some_and(|b| bars::lit(&b)) {
         return ui::panel::close(); // the same button again
     }
     let Some(anchor) = anchor(h) else { return };
-    let (wins, pin, bicon) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin, b.icon)).unwrap_or((vec![], None, null_mut())));
+    let (pin, wins, bicon) = btn_at(h).unwrap_or((None, vec![], null_mut()));
     let exe = wins.first().map(|&w| exe_of(w)).unwrap_or_default();
     let (lnk, picon) = pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| (wstr_of(&x.lnk), x.icon)))).unwrap_or_default();
     let launch = if lnk.is_empty() { exe.clone() } else { lnk.clone() };
@@ -1853,7 +1903,7 @@ unsafe fn jump_list(h: i32) {
                 }
             }
         }
-        InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
+        bars::invalidate_all();
     };
     JL_KEY.set(Some(h));
     ui::panel::open(Box::new(JumpPanel::new(data, anchor.side, pick)), anchor);
@@ -1975,7 +2025,7 @@ unsafe fn on_drop(hwnd: HWND, hd: HDROP) {
         })
         .collect();
     DragFinish(hd);
-    let h = hit(pt.x, pt.y);
+    let h = bars::of(hwnd).map_or(NONE, |b| hit(&b, pt.x, pt.y));
     press(if h == NONE { 0 } else { h });
     if h == 0 {
         apps::pin_dropped(&files);
@@ -1986,7 +2036,7 @@ unsafe fn on_drop(hwnd: HWND, hd: HDROP) {
         files.iter().for_each(|f| pin_exe(f, ""));
         refresh_buttons();
     }
-    InvalidateRect(hwnd, null(), 0);
+    bars::invalidate_all();
 }
 
 /// The junk remover (purge, installed on request): lists what it would delete and asks for YES in its own elevated console.
@@ -2033,7 +2083,7 @@ pub(crate) unsafe fn start_toggle() {
 pub(crate) unsafe fn search_toggle() {
     ui::panel::toggle(ui::panel::Id::Search, || {
         let a = anchor(SEARCH)?;
-        let screen_h = GetSystemMetrics(SM_CYSCREEN) as f32 / SCALE.get();
+        let screen_h = a.screen.1 as f32 / SCALE.get();
         Some((Box::new(ui::search_panel::SearchPanel::new(screen_h)), a))
     });
 }
@@ -2057,6 +2107,10 @@ unsafe extern "system" fn snap_proc(_: windows_sys::Win32::UI::Accessibility::HW
         let r = frame(w);
         DRAG_SIZE.set(if IsZoomed(w) != 0 { (0, 0) } else { (r.right - r.left, r.bottom - r.top) }); // a maximized window is restored by the drag: its size says nothing
         return;
+    }
+    // a window dropped on the other monitor takes its button to that monitor's bar (with "only that monitor's windows")
+    if i18n::style::apps_on() == i18n::style::AppsOn::Here && !WIN_DIRTY.replace(true) {
+        SetTimer(BAR.load(Relaxed) as HWND, 8, 30, None);
     }
     if IsWindowVisible(w) == 0 || IsZoomed(w) != 0 {
         return;
@@ -2175,7 +2229,7 @@ unsafe fn magnet_window(w: HWND, r: RECT) {
 /// Win+1..9: opens the n-th app button's pin, or brings its window up (a second press on the only window minimizes it,
 /// with several windows each press moves on to the next one).
 unsafe fn win_num(n: usize) {
-    let Some((wins, pin)) = BTNS.with_borrow(|b| b.get(n + 1).map(|b| (b.wins.clone(), b.pin))) else { return };
+    let Some((pin, wins, _)) = btn_at(n as i32 + 1) else { return };
     if wins.is_empty() {
         if let Some(l) = pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))) {
             open(&l);
@@ -2247,7 +2301,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         0 if left => start_toggle(),
         0 => start_menu(),
         1.. => {
-            let (wins, lnk) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default());
+            let (wins, lnk) = btn_at(h).map(|(pin, wins, _)| (wins, pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default();
             match (wins.first(), left) {
                 // not running: launch the pinned app (a Store app may have updated since the pins were loaded)
                 (None, true) => lnk.iter().for_each(|l| {
@@ -2287,24 +2341,30 @@ struct ShellHookInfo {
 unsafe fn min_rect(info: *mut ShellHookInfo, _bar: HWND) {
     let w = (*info).hwnd;
     let exe = exe_of(w);
-    let i = BTNS.with_borrow(|b| b.iter().position(|b| b.wins.contains(&w)).or_else(|| b.iter().position(|b| !exe.is_empty() && b.wins.first().is_some_and(|&x| exe_of(x) == exe))));
-    // no button (yet): fly to Start
-    if let Some((left, top, right, bottom)) = UI.with_borrow(|u| u.as_ref().and_then(|b| b.screen_rect(i.map_or(0, |i| i as i32)))) {
-        (*info).rc = RECT { left, top, right, bottom };
+    // the button on the bar of the window's own monitor (the others when it has none there), by the window, else by its exe
+    let at = bars::monitor_of(w);
+    let mut bars_in_order = bars::all();
+    bars_in_order.sort_by_key(|b| b.mon.get().id != at);
+    for b in bars_in_order {
+        let shown = b.btns.borrow();
+        let key = shown.iter().position(|x| x.wins.contains(&w)).or_else(|| shown.iter().position(|x| !exe.is_empty() && x.wins.first().is_some_and(|&y| exe_of(y) == exe)));
+        drop(shown);
+        // no button (yet): fly to Start
+        if let Some((left, top, right, bottom)) = b.ui.borrow().as_ref().and_then(|u| u.screen_rect(key.map_or(0, |i| i as i32 + 1))) {
+            (*info).rc = RECT { left, top, right, bottom };
+            return;
+        }
     }
 }
 
-/// Registers the bar as an appbar with explorer (again after explorer restarts: its list starts empty).
-unsafe fn appbar_new(hwnd: HWND) {
-    let mut ab: APPBARDATA = zeroed();
-    ab.cbSize = size_of::<APPBARDATA>() as u32;
-    ab.hWnd = hwnd;
-    ab.uCallbackMessage = CALLBACK;
-    SHAppBarMessage(ABM_NEW, &mut ab);
-    EXP_TRAY.set(tray()[0]);
+/// A bar's window procedure: every bar's messages are handled with that bar being served (see `bars::cur`); the keyboard's
+/// shortcuts, posted to the main bar, mean the bar on the monitor the pointer is on.
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let on = if matches!(msg, WIN_START | ALT_SPACE | WIN_X | WIN_NUM | WIN_V | ALT_TAB) { bars::at_pointer().map_or(hwnd, |b| b.hwnd) } else { hwnd };
+    bars::serving(on, || bar_proc(hwnd, msg, wp, lp))
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg != 0 && msg == SH_MSG.get() {
         if wp == 5 && lp != 0 {
             min_rect(lp as *mut ShellHookInfo, hwnd); // HSHELL_GETMINRECT
@@ -2316,16 +2376,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             4 | 0x8004 | 2 => FLASH.with_borrow_mut(|f| f.retain(|&x| x != w)), // activated (HSHELL_WINDOWACTIVATED / RUDEAPPACTIVATED), destroyed
             _ => return 0,
         }
-        InvalidateRect(hwnd, null(), 0);
+        bars::invalidate_all();
         return 0;
     }
     if msg != 0 && msg == TB_MSG.get() {
         // also our own announce(): act only when explorer's taskbar is a new window (explorer restarted / came back)
         let t = tray()[0];
         if !t.is_null() && t != EXP_TRAY.get() {
-            appbar_new(hwnd);
+            for b in bars::all() {
+                bars::appbar_register(&b);
+            }
+            EXP_TRAY.set(t);
             hide_taskbar();
-            place(hwnd);
+            for b in bars::all() {
+                place(b.hwnd);
+            }
         }
         return 0;
     }
@@ -2337,7 +2402,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ERASEBKGND => return 1,
         WM_TIMER if wp == 2 => {
             KillTimer(hwnd, 2);
-            let h = HOT.get();
+            let h = bars::of(hwnd).map_or(NONE, |b| b.hot.get());
             if h != NONE && !popup_open() && !preview_for(h) {
                 // an app button with windows shows their live previews (#92), anything else its tip
                 if !preview_open(h, false, 0) {
@@ -2433,13 +2498,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             repaint_if_changed(hwnd, true);
         }
         WM_MOUSEMOVE => {
-            let h = hit((lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
+            let Some(bar) = bars::of(hwnd) else { return DefWindowProcW(hwnd, msg, wp, lp) };
+            let h = hit(&bar, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             TrackMouseEvent(&mut tme);
-            if HOT.replace(h) != h {
+            if bar.hot.replace(h) != h {
                 hide_tip(hwnd);
                 if h != NONE {
-                    let has_wins = h >= 1 && BTNS.with_borrow(|b| b.get(h as usize).is_some_and(|b| !b.wins.is_empty()));
+                    let has_wins = h >= 1 && btn_at(h).is_some_and(|b| !b.1.is_empty());
                     // the previews come after the mockup's .38 s, at once when others are open (`hvEnter`)
                     SetTimer(hwnd, 2, if has_wins { 380 } else { 450 }, None);
                     if ui::panel::is_open(ui::panel::Id::Preview) {
@@ -2461,7 +2527,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSELEAVE => {
             hide_tip(hwnd);
-            HOT.set(-1);
+            if let Some(b) = bars::of(hwnd) {
+                b.hot.set(NONE);
+            }
             InvalidateRect(hwnd, null(), 0);
         }
         WM_MOUSEWHEEL => {
@@ -2475,9 +2543,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             InvalidateRect(hwnd, null(), 0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            let Some(bar) = bars::of(hwnd) else { return DefWindowProcW(hwnd, msg, wp, lp) };
             let (px, py) = ((lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
-            let h = hit(px, py);
-            let (wx, wy, ..) = bar_win();
+            let h = hit(&bar, px, py);
+            let (wx, wy, ..) = bar.win();
             let x = if vert() { py + wy } else { px + wx }; // screen position along the bar
             hide_tip(hwnd);
             hide_preview();
@@ -2500,10 +2569,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if wp == ABN_FULLSCREENAPP as usize {
                 fs_update(hwnd);
             } else if wp == ABN_POSCHANGED as usize {
-                place(hwnd);
+                place_if_moved(hwnd);
             }
         }
-        WM_DISPLAYCHANGE => place(hwnd),
+        // a monitor came, went or moved: the bars follow (the main bar's window hears of it first; the others' copies are ignored)
+        WM_DISPLAYCHANGE if hwnd == BAR.load(Relaxed) as HWND => bars::sync(),
+        WM_DISPLAYCHANGE => {}
+        // a bar's monitor changed its scale: said to the main bar by another message, so that no bar is taken down inside its own handler
+        WM_DPICHANGED => _ = PostMessageW(BAR.load(Relaxed) as HWND, SYNC_BARS, 0, 0),
+        SYNC_BARS => bars::sync(),
         // Windows' own Settings (or our Dark style tile) switched the theme: read it again and paint everything in it
         WM_SETTINGCHANGE if i18n::style::is_color_change(lp) => {
             if i18n::style::follow_system() {
@@ -2511,17 +2585,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             return 0;
         }
+        WM_DESTROY if hwnd != BAR.load(Relaxed) as HWND => bars::destroyed(hwnd), // another bar's window went
         WM_DESTROY => {
             pacing::set(hwnd as isize, false);
+            bars::destroy_extra(); // the other bars, with their strips
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
             ab.hWnd = hwnd;
             SHAppBarMessage(ABM_REMOVE, &mut ab);
-            set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // ours: give the strip back
+            if let Some(b) = bars::of(hwnd) {
+                let r = b.rect();
+                set_work_area(RECT { left: r.0, top: r.1, right: r.2, bottom: r.3 }, b.mon.get().id); // ours: give the strip back
+                DestroyWindow(b.shadow);
+            }
             show_taskbar(OLD_STATE.get());
             forget_taskbar_state();
             DestroyWindow(HOST.replace(null_mut()));
-            DestroyWindow(SHADOW.replace(null_mut()));
             announce(); // icons go back to explorer's tray
             PostQuitMessage(0);
         }
@@ -2551,7 +2630,9 @@ fn run() {
         if std::env::args().any(|a| a == "--restore") {
             show_taskbar(saved_taskbar_state().unwrap_or(ABS_ALWAYSONTOP as usize));
             forget_taskbar_state();
-            set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // a killed bar's reserved strip
+            for m in bars::monitors() {
+                set_work_area(RECT { left: m.rect.0, top: m.rect.1, right: m.rect.2, bottom: m.rect.3 }, m.id); // a killed bar's reserved strips, on every monitor
+            }
             announce(); // a killed bar took its tray icons with it; apps re-register with explorer
             return;
         }
@@ -2626,10 +2707,12 @@ fn run() {
         i18n::style::follow_system(); // light or dark, as Windows has it: read here and again on its broadcast
         TB_MSG.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()));
         SH_MSG.set(RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()));
-        SetProcessDPIAware();
-        let dc = GetDC(null_mut());
-        SCALE.set(GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0);
-        ReleaseDC(null_mut(), dc);
+        // per monitor (v2): the windows are in physical pixels on every monitor, whatever its scale, so a bar on a second monitor
+        // with another scale is not stretched by the system; without it (an old Windows) the system's scale for all
+        if windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(-4isize as _) == 0 {
+            SetProcessDPIAware();
+        }
+        SCALE.set(bars::monitors().iter().find(|m| m.primary).map_or(1.0, bars::Mon::scale));
         SHOWN.set(std::fs::read_to_string(appdata_file("topbar-tray.txt")).ok().map(|s| s.lines().map(str::to_string).collect()));
         load_pins();
         fly::init(GetModuleHandleW(null()));
@@ -2645,13 +2728,9 @@ fn run() {
         // The windows are drawn by DirectComposition (no redirection bitmap, cut to what catches the mouse); without it (WINRUST_ULW=1,
         // a machine that has none) they are layered windows painted with UpdateLayeredWindow, as before.
         ui::gfx::compose_windows();
-        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | ui::gfx::window_ex(), class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), bar_h(), null_mut(), null_mut(), hi, null());
-        // The floating styles' shadow: a click-through window right under the bar (see redraw())
-        let shc = wide("topbar_shadow");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: hi, lpszClassName: shc.as_ptr(), ..zeroed() });
-        SHADOW.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | ui::gfx::window_ex_through(), shc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
-        ui::gfx::through(whwnd(SHADOW.get()));
-        UI.set(barui::Bar::new(SCALE.get()).ok());
+        // The main bar's window (the primary monitor) with its shadow window; the bars of the other monitors come with `bars::sync`
+        let Some(main_bar) = bars::create_main() else { return };
+        let hwnd = main_bar.hwnd;
         // Our own Shell_TrayWnd (hidden, topmost, so apps find it before explorer's): apps register their tray icons here.
         let tc = wide("Shell_TrayWnd");
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(tray_proc), hInstance: hi, lpszClassName: tc.as_ptr(), ..zeroed() });
@@ -2662,25 +2741,19 @@ fn run() {
         // HrInit failed (E_NOTIMPL) for every app while the bar ran. DeleteTab / AddTab then come here (tray_proc).
         SetPropW(HOST.get(), wide("TaskbandHWND").as_ptr(), HOST.get());
         ChangeWindowMessageFilterEx(HOST.get(), SH_MSG.get(), MSGFLT_ALLOW, null_mut());
-        ChangeWindowMessageFilterEx(hwnd, CALLBACK, MSGFLT_ALLOW, null_mut());
-        ChangeWindowMessageFilterEx(hwnd, TB_MSG.get(), MSGFLT_ALLOW, null_mut()); // explorer restarted (it runs unelevated)
-        // files dragged from a normal-rights app onto the (elevated) bar: Start button = add to Start, elsewhere = pin
-        DragAcceptFiles(hwnd, 1);
-        for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, WM_COPYDATA] {
-            ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, null_mut());
-        }
-        ui::panel::init(hi, SCALE.get(), hwnd, panel_changed);
+        ui::panel::init(hi, SCALE.get(), hwnd, panel_notice);
         ui::tip::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
         ui::toast::init(hi, SCALE.get(), (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
         {
             // the notification pop-ups, and the icons their cards draw (the shell's, at the size they are drawn)
             let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            ui::notice_pop::init(hi, SCALE.get(), ui::panel::Anchor { side: i18n::style::side(), button: (0, 0, 0, 0), bar: (0, sh - 54, sw, sh), screen: (sw, sh) });
+            ui::notice_pop::init(hi, SCALE.get(), ui::panel::Anchor { side: i18n::style::side(), button: (0, 0, 0, 0), bar: (0, sh - 54, sw, sh), screen: (sw, sh), origin: (0, 0) });
             ui::notice::set_icon_loader(|p| item_icon(p, sc(32)) as isize);
             notify::with(|s| s.set_dnd(notify::load_dnd()));
         }
         OLD_STATE.set(remember_taskbar_state());
-        appbar_new(hwnd);
+        bars::appbar_register(&main_bar);
+        EXP_TRAY.set(tray()[0]);
         // Without explorer nobody is the "taskman" window, so Windows treats minimized windows as loose icons and leaves
         // them as caption stubs on the desktop. Becoming that window (what explorer's taskbar does) makes them hide properly
         // and gets us HSHELL_GETMINRECT. Only when explorer's taskbar is absent: with it running its own registration stays.
@@ -2697,6 +2770,7 @@ fn run() {
         announce(); // apps already running re-add their icons to us
         SetTimer(hwnd, 1, 1000, None); // status poll; windows come from win_event
         BAR.store(hwnd as isize, Relaxed);
+        bars::sync(); // the bars of the other monitors, if the setting asks for them
         hist::init(hwnd);
         SetTimer(hwnd, 3, 250, None); // fullscreen watch
         windows_sys::Win32::UI::Accessibility::SetWinEventHook(0x000A, 0x000B, null_mut(), Some(snap_proc), 0, 0, 0); // EVENT_SYSTEM_MOVESIZESTART..END
@@ -2767,9 +2841,9 @@ mod tests {
 
     #[test]
     fn a_far_off_appbar_edge_goes_back_to_the_screen_edge() {
-        assert_eq!(super::sane_edge(48, 1080), 48); // another bar below ours: stack above it
-        assert_eq!(super::sane_edge(540, 1080), 0); // half the screen (#106)
-        assert_eq!(super::sane_edge(-20, 1080), 0);
+        assert_eq!(super::bars::sane_edge(48, 1080), 48); // another bar below ours: stack above it
+        assert_eq!(super::bars::sane_edge(540, 1080), 0); // half the screen (#106)
+        assert_eq!(super::bars::sane_edge(-20, 1080), 0);
     }
 
     #[test]

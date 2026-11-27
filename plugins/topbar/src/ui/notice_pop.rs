@@ -741,7 +741,7 @@ mod tests {
     use crate::notify::{App, AppIcon};
 
     fn anchor() -> Anchor {
-        Anchor { side: Side::Bottom, button: (1300, 852, 1400, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) }
+        Anchor { side: Side::Bottom, button: (1300, 852, 1400, 894), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) }
     }
 
     fn note(t: &str) -> Note {

@@ -107,7 +107,11 @@ pub struct Anchor {
     pub button: (i32, i32, i32, i32),
     /// The bar where it rests (not slid away).
     pub bar: (i32, i32, i32, i32),
+    /// The size of the monitor the bar is on.
     pub screen: (i32, i32),
+    /// Its top left corner on the virtual screen: `button` and `bar` are in virtual screen coordinates, the panel is placed
+    /// within the monitor and moved by this. `(0, 0)` on the primary monitor.
+    pub origin: (i32, i32),
 }
 
 /// How the panel's box lines up with its button along the bar.
@@ -440,6 +444,7 @@ pub struct Popup {
     scrim: Surface,
     scrim_done: bool,
     screen: (i32, i32),
+    origin: (i32, i32),
     last: Shown,
     /// The pose of the last frame and the point it scales around, for the holes.
     posed: Option<(Pose, (f32, f32))>,
@@ -523,7 +528,8 @@ impl Popup {
         // what the glass blurs: the panel window and the blur's reach beyond it
         let reach_px = (look.blur * 3.0 * s).ceil() as i32;
         let cr = (win.0 - reach_px, win.1 - reach_px, win.2 + 2 * reach_px, win.3 + 2 * reach_px);
-        let mut cap = backdrop(cr, anchor.screen, grab).map(|px| (px, cr));
+        let (ox, oy) = anchor.origin;
+        let mut cap = backdrop((cr.0 - ox, cr.1 - oy, cr.2, cr.3), anchor.screen, &mut |x, y, w, h| grab(x + ox, y + oy, w, h)).map(|px| (px, cr));
         // the scrim lies over the screen under the box: what the glass blurs is the dimmed screen, as in a browser
         if let (Some(sc), Some((px, _))) = (look.scrim, cap.as_mut()) {
             let ch = |p: u32, shift: u32, c: f32| (((p >> shift) & 255) as f32 * (1.0 - sc.color.a) + c * 255.0 * sc.color.a).round() as u32;
@@ -564,11 +570,18 @@ impl Popup {
             scrim: Surface::composed(),
             scrim_done: false,
             screen: anchor.screen,
+            origin: anchor.origin,
             last: Shown::default(),
             posed: None,
             fade_cached: false,
             act,
         }
+    }
+
+    /// The monitor the panel is on (left, top, width, height), device pixels.
+    #[must_use]
+    pub const fn monitor(&self) -> (i32, i32, i32, i32) {
+        (self.origin.0, self.origin.1, self.screen.0, self.screen.1)
     }
 
     #[must_use]
@@ -973,7 +986,7 @@ impl Popup {
                 None => fade(sc.fade_in, age),
                 Some((tc, _)) => fade(sc.fade_in, tc.saturating_sub(self.t0)) * (1.0 - fade(sc.fade_out, now.saturating_sub(tc))),
             };
-            ((0, 0, self.screen.0, self.screen.1), (255.0 * k).round() as u8)
+            ((self.origin.0, self.origin.1, self.screen.0, self.screen.1), (255.0 * k).round() as u8)
         });
 
         // Search's exit changes only whole-window opacity once its entry has settled.
@@ -1093,10 +1106,19 @@ fn button_origin(a: &Anchor, at: (i32, i32), size: (f32, f32), s: f32) -> (f32, 
 }
 
 /// The top left corner of a `size` px box next to its button.
-fn place_box(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
+fn place_box(a: &Anchor, size: (i32, i32), p: Place, s: f32) -> (i32, i32) {
     if let Along::Abs(x, y) = p.along {
         return (x, y);
     }
+    // within the monitor, as if it stood at (0, 0); then moved to where it is
+    let (ox, oy) = a.origin;
+    let local = Anchor { button: (a.button.0 - ox, a.button.1 - oy, a.button.2 - ox, a.button.3 - oy), bar: (a.bar.0 - ox, a.bar.1 - oy, a.bar.2 - ox, a.bar.3 - oy), origin: (0, 0), ..*a };
+    let (x, y) = place_in_monitor(&local, size, p, s);
+    (x + ox, y + oy)
+}
+
+/// [`place_box`] on a monitor at the origin.
+fn place_in_monitor(a: &Anchor, (w, h): (i32, i32), p: Place, s: f32) -> (i32, i32) {
     if p.along == Along::Fill {
         return (0, 0);
     }
@@ -1717,7 +1739,7 @@ impl Host {
     fn sync_tip(&mut self) {
         let Some(p) = self.popup.as_ref() else { return };
         let Some((text, along, top)) = p.tip() else { return super::tip::hide() };
-        let place = super::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * self.scale).round() as i32 };
+        let place = super::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * self.scale).round() as i32, mon: (0, 0, 0, 0) }.on(p.monitor());
         super::tip::show(&text, place, 500, None);
     }
 }
@@ -1747,7 +1769,7 @@ mod tests {
         // SAFETY: COM for WIC on this test thread.
         unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
         let mut g = Gfx::new(1.0).unwrap();
-        let anchor = Anchor { side: Side::Bottom, button: (1000, 846, 1032, 886), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let anchor = Anchor { side: Side::Bottom, button: (1000, 846, 1032, 886), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
         let mut p = Popup::new(&mut g, Box::new(TrayPanel::new(cells, |_, _, _| {})), anchor, 0, &mut grab);
         let (x, y, w, h) = p.rect();
@@ -1767,7 +1789,7 @@ mod tests {
         // SAFETY: COM for WIC on this test thread.
         unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
         let mut g = Gfx::new(1.0).unwrap();
-        let anchor = Anchor { side: Side::Bottom, button: (1000, 846, 1032, 886), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let anchor = Anchor { side: Side::Bottom, button: (1000, 846, 1032, 886), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
         let mut p = Popup::new(&mut g, Box::new(TrayPanel::new(cells, |_, _, _| {})), anchor, 0, &mut grab);
         let (_, _, w, h) = p.rect();
@@ -1790,7 +1812,7 @@ mod tests {
         // SAFETY: COM for WIC on this test thread.
         unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
         let mut g = Gfx::new(1.0).unwrap();
-        let anchor = Anchor { side: Side::Bottom, button: (552, 852, 594, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let anchor = Anchor { side: Side::Bottom, button: (552, 852, 594, 894), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
         let mut p = Popup::new(&mut g, Box::new(crate::ui::power_popup::PowerPanel::new(crate::ui::power_popup::Kind::Restart, |_| {})), anchor, 0, &mut grab);
         let shown = p.frame(&mut g, 5000);
@@ -1799,12 +1821,48 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_of_a_bar_on_the_monitor_to_the_left_stands_on_that_monitor_and_grabs_its_pixels() {
+        use crate::ui::{search_panel::SearchPanel, start_panel::StartPanel};
+        // SAFETY: COM for WIC on this test thread.
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).unwrap();
+        // the user's second monitor: 1920x1080 at negative x, its bar 54 high at its foot
+        let (ox, oy) = (-1920, 0);
+        let anchor = Anchor { side: Side::Bottom, button: (ox + 552, 1032, ox + 594, 1074), bar: (ox, 1026, ox + 1920, 1080), screen: (1920, 1080), origin: (ox, oy) };
+        let grabbed = std::cell::RefCell::new(Vec::new());
+        let mut grab = |x, y, w: i32, h: i32| {
+            grabbed.borrow_mut().push((x, y, w, h));
+            Some(vec![0xff10_1010u32; (w * h) as usize])
+        };
+        let start = Popup::new(&mut g, Box::new(StartPanel::with_state("", 0, Vec::new(), Vec::new(), ("A".into(), String::new()))), anchor, 0, &mut grab);
+        // centred on that monitor, 12 above its bar: the same as on the primary one, moved by the monitor's corner
+        assert_eq!(start.rect(), (ox + (1920 - 648) / 2, 1026 - 12 - 569, 648, 569));
+        assert_eq!(start.monitor(), (ox, oy, 1920, 1080));
+        assert!(grabbed.borrow().iter().all(|&(x, y, w, h)| x >= ox && y >= oy && x + w <= ox + 1920 && y + h <= oy + 1080), "what the glass blurs is on that monitor: {:?}", grabbed.borrow());
+        assert!(!grabbed.borrow().is_empty());
+
+        let mut search = Popup::new(&mut g, Box::new(SearchPanel::with_query(900.0, "", Vec::new(), Vec::new())), anchor, 0, &mut grab);
+        let (x, y, w, _) = search.rect();
+        assert_eq!((x, y, w), (ox + (1920 - 640) / 2, 150, 640), "centred on the monitor, 150 from its top");
+        let shown = search.frame(&mut g, 5000);
+        assert_eq!(shown.scrim.map(|s| (s.0, s.1)), Some(((ox, oy, 1920, 1080), 255)), "the scrim dims that monitor, not the primary one");
+        // a side bar on the left of that monitor, the quick settings' corner and a button: all within the monitor
+        let side = Anchor { side: Side::Left, button: (ox, 400, ox + 54, 440), bar: (ox, 0, ox + 54, 1080), screen: (1920, 1080), origin: (ox, oy) };
+        let (x, y) = place_box(&side, (400, 300), Place { along: Along::Center, gap: 12.0 }, 1.0);
+        assert_eq!((x, y), (ox + 54 + 12, 400 + 20 - 150), "beside the bar, centred on its button");
+        let (x, _) = place_box(&anchor, (400, 300), Place { along: Along::ScreenEnd, gap: 12.0 }, 1.0);
+        assert_eq!(x, ox + 1920 - 12 - 400, "the far end of the monitor");
+        let (x, y) = place_box(&anchor, (1920, 1080), Place { along: Along::Fill, gap: 0.0 }, 1.0);
+        assert_eq!((x, y), (ox, oy), "a full-screen dialog covers the monitor");
+    }
+
+    #[test]
     fn start_stands_in_the_middle_of_the_screen_and_search_hangs_from_its_top_over_a_scrim() {
         use crate::ui::{search_panel::SearchPanel, start_panel::StartPanel};
         // SAFETY: COM for WIC on this test thread.
         unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
         let mut g = Gfx::new(1.0).unwrap();
-        let anchor = Anchor { side: Side::Bottom, button: (552, 852, 594, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let anchor = Anchor { side: Side::Bottom, button: (552, 852, 594, 894), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
 
         let mut start = Popup::new(&mut g, Box::new(StartPanel::with_state("", 0, Vec::new(), Vec::new(), ("A".into(), String::new()))), anchor, 0, &mut grab);

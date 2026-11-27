@@ -334,7 +334,7 @@ impl Content for TaskView {
     }
 
     fn place(&self) -> Place {
-        Place { along: Along::Abs(0, 0), gap: 0.0 }
+        Place { along: Along::Fill, gap: 0.0 }
     }
 
     fn size(&mut self, _g: &mut Gfx) -> (f32, f32) {

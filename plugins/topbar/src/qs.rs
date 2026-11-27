@@ -663,7 +663,7 @@ pub(crate) unsafe fn cal_toggle() {
         let a = anchor(CLOCK)?;
         // the column's room: from 12 below the top of the screen to 12 above the bar (beside a side bar, to the screen's end)
         let s = SCALE.get();
-        let (sh, bar_top) = (a.screen.1 as f32 / s, a.bar.1 as f32 / s);
+        let (sh, bar_top) = (a.screen.1 as f32 / s, (a.bar.1 - a.origin.1) as f32 / s);
         let room = if a.side == Side::Bottom { bar_top - 12.0 - 12.0 } else { sh - 24.0 };
         Some((Box::new(ui::cal_popup::CalPanel::new(ui::cal_popup::system_now, a.side, room)), a))
     });

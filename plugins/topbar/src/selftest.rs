@@ -115,6 +115,7 @@ fn view(style: Style, side: Side, apps: Vec<barui::AppView>) -> View {
         size: 1,
         align_left: false,
         screen: (W as f32, H as f32),
+        full: true,
         op: 0.85,
         apps,
         tray: Vec::new(),
@@ -313,7 +314,7 @@ unsafe fn panels(st: &Stage) {
         return;
     }
     panel::NO_FOCUS.store(true, Relaxed);
-    let anchor = Anchor { side: Side::Bottom, button: (700, H - 48, 748, H - 6), bar: (0, H - 54, W, H), screen: (W, H) };
+    let anchor = Anchor { side: Side::Bottom, button: (700, H - 48, 748, H - 6), bar: (0, H - 54, W, H), screen: (W, H), origin: (0, 0) };
     let icon = |path: &str| {
         let ic = if std::path::Path::new(path).exists() { item_icon(path, bar_icon_px()) } else { null_mut() };
         wicon(ic)
@@ -381,7 +382,7 @@ unsafe fn memory(st: &Stage) {
     let gpu = || gfx::gpu_memory().map_or(0.0, |g| g.0);
     let (ws1, pv1) = render::memory();
     st.say(&format!("memory ({}): process start {ws0:.0} / {pv0:.0} MB (working set / private); with the devices, the bar's renderer and the windows of the panels, tip and toast ({up}) {ws1:.0} / {pv1:.0} MB, video {:.0} MB", if composed { "composed" } else { "layered" }, gpu()));
-    let anchor = Anchor { side: Side::Bottom, button: (700, H - 48, 748, H - 6), bar: (0, H - 54, W, H), screen: (W, H) };
+    let anchor = Anchor { side: Side::Bottom, button: (700, H - 48, 748, H - 6), bar: (0, H - 54, W, H), screen: (W, H), origin: (0, 0) };
     let icon = |path: &str| {
         let ic = if std::path::Path::new(path).exists() { item_icon(path, bar_icon_px()) } else { null_mut() };
         wicon(ic)

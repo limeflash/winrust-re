@@ -125,7 +125,7 @@ fn act(a: Act) {
     unsafe {
         match a {
             Act::Relook => relook(),
-            Act::Language => _ = InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0),
+            Act::Language => bars::invalidate_all(),
             Act::Tile => tile_windows(),
             Act::OpenLog => open_log(),
             Act::Restart => restart_bar(),
@@ -148,7 +148,7 @@ fn act(a: Act) {
 /// Puts the bar in the new look: its place and size may have changed (the renderer glides to them), the colours too; the panel
 /// follows the bar.
 unsafe fn relook() {
-    place(BAR.load(Relaxed) as HWND);
+    bars::sync(); // every bar: the place and size, and the bars of the other monitors that the settings ask for or no longer do
     if let Some(a) = anchor(GEAR) {
         ui::panel::reanchor(ui::panel::Id::Bar, a);
     }
@@ -157,7 +157,7 @@ unsafe fn relook() {
 /// A toast over the bar.
 pub(crate) unsafe fn say(text: &str) {
     if let Some(a) = anchor(NONE) {
-        ui::toast::show(text, a.side, a.bar);
+        ui::toast::show(text, a.side, a.bar, (a.origin.0, a.origin.1, a.screen.0, a.screen.1));
     }
 }
 

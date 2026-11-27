@@ -512,7 +512,7 @@ mod tests {
         }
         crate::notify::with(|s| *s = crate::notify::Store::new());
         let mut g = Gfx::new(1.0).unwrap();
-        let anchor = Anchor { side: Side::Bottom, button: (1330, 850, 1430, 894), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let anchor = Anchor { side: Side::Bottom, button: (1330, 850, 1430, 894), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
         let mut p = Popup::new(&mut g, Box::new(CalPanel::new(now, Side::Bottom, 822.0)), anchor, 0, &mut grab);
         let (x, y, w, h) = p.rect();

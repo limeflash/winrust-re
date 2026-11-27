@@ -112,8 +112,12 @@ pub struct View {
     pub side: Side,
     pub size: u8,
     pub align_left: bool,
-    /// The primary monitor in DIPs.
+    /// The monitor the bar stands on, in DIPs.
     pub screen: (f32, f32),
+    /// The whole bar (the main one, or an other bar set to be "the same"): with the settings gear, the tray, the language, quick
+    /// settings, the power buttons and the recording button. Without it the bar holds Start, search, Task view, the app buttons and
+    /// the clock, like Windows 11's bars on the other monitors.
+    pub full: bool,
     /// Bar opacity, 0..1.
     pub op: f32,
     pub apps: Vec<AppView>,
@@ -257,9 +261,12 @@ fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>, clock_extra:
     let b = |kind, key, idx, w: f32, h: f32, vh: f32| {
         if vert { Cell::btn(kind, key, idx, vh, bw) } else { Cell::btn(kind, key, idx, w, h) }
     };
-    let mut left = vec![b(Kind::Gear, GEAR, 0, 40.0, 40.0, 36.0)];
-    if dock {
-        left.push(Cell::sep(28.0, 8.0, 6.0, 0.22, 0.3));
+    let mut left = Vec::new();
+    if v.full {
+        left.push(b(Kind::Gear, GEAR, 0, 40.0, 40.0, 36.0));
+        if dock {
+            left.push(Cell::sep(28.0, 8.0, 6.0, 0.22, 0.3));
+        }
     }
 
     let mut mid = vec![
@@ -288,19 +295,22 @@ fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>, clock_extra:
             Cell::sep(24.0, 6.0, 6.0, 0.24, 0.3)
         }
     };
-    let mut right = vec![b(Kind::Chevron, TAPP, 0, 32.0, 40.0, 36.0)];
-    for i in 0..v.tray.len() {
-        right.push(b(Kind::Tray, TAPP + i as i32 + 1, i, 32.0, 40.0, 36.0));
+    let mut right = Vec::new();
+    if v.full {
+        right.push(b(Kind::Chevron, TAPP, 0, 32.0, 40.0, 36.0));
+        for i in 0..v.tray.len() {
+            right.push(b(Kind::Tray, TAPP + i as i32 + 1, i, 32.0, 40.0, 36.0));
+        }
+        right.push(b(Kind::Lang, LANG, 0, (lang_w + 20.0).max(46.0), 40.0, 36.0));
+        right.push(rsep());
+        let qs_len = 24.0 + 18.0 * n_qs as f32 + 12.0 * (n_qs - 1) as f32;
+        right.push(b(Kind::Qs, SYS_GRP, 0, qs_len, 40.0, 16.0 + 18.0 * n_qs as f32 + 8.0 * (n_qs - 1) as f32));
+        right.push(rsep());
+        right.push(b(Kind::Restart, POW_R, 0, 38.0, 40.0, 36.0));
+        right.push(b(Kind::Power, POW_S, 0, 38.0, 40.0, 36.0));
+        right.push(rsep());
     }
-    right.push(b(Kind::Lang, LANG, 0, (lang_w + 20.0).max(46.0), 40.0, 36.0));
-    right.push(rsep());
-    let qs_len = 24.0 + 18.0 * n_qs as f32 + 12.0 * (n_qs - 1) as f32;
-    right.push(b(Kind::Qs, SYS_GRP, 0, qs_len, 40.0, 16.0 + 18.0 * n_qs as f32 + 8.0 * (n_qs - 1) as f32));
-    right.push(rsep());
-    right.push(b(Kind::Restart, POW_R, 0, 38.0, 40.0, 36.0));
-    right.push(b(Kind::Power, POW_S, 0, 38.0, 40.0, 36.0));
-    right.push(rsep());
-    if let Some(t) = &v.rec {
+    if let Some(t) = v.rec.as_ref().filter(|_| v.full) {
         // `recbar`: 30 high, `padding: 0 10px 0 9px`, an 8 px dot, 7 px gap, 6 px before the clock
         let w = 9.0 + 8.0 + 7.0 + g.measure(t, FONT_REC) + 10.0;
         let mut cell = if vert { Cell::btn(Kind::Rec, REC_I, 0, 30.0, bw) } else { Cell::btn(Kind::Rec, REC_I, 0, w, 30.0) };
@@ -332,7 +342,7 @@ pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32
     let pad = if dock { 8.0 } else { 10.0 };
     let n = v.apps.len();
     let room = match bar_len {
-        Some(len) => len - 2.0 * pad - l1 - l3 - if !vert && v.align_left { 12.0 } else { 0.0 },
+        Some(len) => len - 2.0 * pad - l1 - l3 - if !vert && v.align_left && l1 > 0.0 { 12.0 } else { 0.0 },
         None if (if vert { v.screen.1 } else { v.screen.0 }) > 0.0 => (if vert { v.screen.1 } else { v.screen.0 }) - 2.0 * pad - l1 - l3 - 40.0, // 40: the dock's own spacers, and some air
         None => f32::INFINITY,
     };
@@ -354,7 +364,7 @@ pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32
             let p3 = p2 + l2 + 6.0 + 8.0;
             (p1, p2, p3, p3 + l3 + pad)
         } else {
-            let p2 = pad + l1 + 2.0;
+            let p2 = pad + if l1 > 0.0 { l1 + 2.0 } else { 0.0 };
             let p3 = p2 + l2 + 2.0 + 6.0 + 8.0;
             (pad, p2, p3, p3 + l3 + pad)
         }
@@ -366,7 +376,7 @@ pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32
         } else {
             let inner = total - 2.0 * pad;
             let c1 = if v.align_left {
-                l1 + 12.0
+                if l1 > 0.0 { l1 + 12.0 } else { 0.0 }
             } else {
                 ((inner - l2) / 2.0).min(inner - l2 - l3).max(l1)
             };
@@ -591,6 +601,8 @@ pub struct Bar {
     lay: Layout,
     place: Placement,
     scale: f32,
+    /// The top left corner of the monitor the bar stands on (device pixels): the placement is in virtual screen coordinates.
+    origin: (i32, i32),
     seen: Option<bool>,
     lang_seen: Option<String>,
     dead: Vec<HICON>,
@@ -608,10 +620,16 @@ impl Bar {
             lay: Layout::default(),
             place: Placement::default(),
             scale,
+            origin: (0, 0),
             seen: None,
             lang_seen: None,
             dead: Vec::new(),
         })
+    }
+
+    /// Moves the bar to another monitor (its top left corner, device pixels); the next frame is placed there.
+    pub fn set_origin(&mut self, origin: (i32, i32)) {
+        self.origin = origin;
     }
 
     #[must_use]
@@ -772,13 +790,14 @@ impl Bar {
             }
             shadow_rect = Some((bx - pad, by - pad, w, h));
         }
+        let (mx, my) = self.origin;
         let place = Placement {
-            win: (bx, by - head, win_w, win_h),
-            bar: (bx, by, bw, bh),
-            rest: (bx - dx, by - dy, bw, bh),
+            win: (mx + bx, my + by - head, win_w, win_h),
+            bar: (mx + bx, my + by, bw, bh),
+            rest: (mx + bx - dx, my + by - dy, bw, bh),
             slide,
             alpha: (255.0 * appear).round() as u8,
-            shadow: shadow_rect,
+            shadow: shadow_rect.map(|(x, y, w, h)| (mx + x, my + y, w, h)),
             shadow_alpha,
             gone: hide >= 0.999 && live.hidden,
             busy: self.motion.running(now),
@@ -1191,6 +1210,7 @@ mod tests {
             size: 1,
             align_left: false,
             screen: (1440.0, 900.0),
+            full: true,
             op: 0.85,
             apps: (0..apps).map(|_| AppView { icon: HICON(std::ptr::null_mut()), wins: 1, active: false, flash: false, color: Rgba::hex(0x62a0ea) }).collect(),
             tray: vec![],
@@ -1394,7 +1414,75 @@ mod tests {
     }
 
     #[test]
+    fn a_bar_on_another_monitor_holds_start_search_task_view_apps_and_the_clock_only() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).expect("the renderer");
+        let sh = shape(Style::Classic, Side::Bottom, 1);
+        let mut v = view(8);
+        v.battery = Some((80, false));
+        v.rec = Some("0:24".into());
+        v.tray = vec![HICON(std::ptr::null_mut()); 2];
+        let full = layout(&mut g, &v, &sh, 54.0, Some(1920.0), 0.0);
+        v.full = false;
+        let light = layout(&mut g, &v, &sh, 54.0, Some(1920.0), 0.0);
+        let kinds = |l: &Layout| l.items.iter().map(|i| i.kind).collect::<Vec<_>>();
+        for gone in [Kind::Gear, Kind::Chevron, Kind::Tray, Kind::Lang, Kind::Qs, Kind::Restart, Kind::Power, Kind::Rec] {
+            assert!(kinds(&full).contains(&gone), "the whole bar has {gone:?}");
+            assert!(!kinds(&light).contains(&gone), "the lighter bar has no {gone:?}");
+        }
+        let want = [Kind::Search, Kind::TaskView, Kind::Start, Kind::Clock, Kind::ShowDesk];
+        assert!(want.iter().all(|k| kinds(&light).contains(k)));
+        assert_eq!(kinds(&light).iter().filter(|k| **k == Kind::App).count(), 8);
+        // the clock is at the end of the bar like the whole bar's; the apps stay in the middle of the 1920
+        let clock = light.rect_of(CLOCK).expect("the clock");
+        assert!((clock.x + clock.w - 1910.0).abs() < 0.5, "{clock:?}");
+        let (first, last) = (light.rect_of(SEARCH).expect("search"), light.rect_of(8).expect("app 8"));
+        assert!(((first.x + last.x + last.w) / 2.0 - 960.0).abs() < 1.0, "the group is centred: {first:?} {last:?}");
+        assert_eq!(light.hit(clock.cx(), clock.cy()), CLOCK);
+        assert_eq!(light.hit(10.0, 27.0), NONE, "where the gear was there is nothing");
+        // left-aligned like Windows 10: Start comes after a plain margin, there is no gear to make room for
+        v.align_left = true;
+        let left = layout(&mut g, &v, &sh, 54.0, Some(1920.0), 0.0);
+        assert!(left.rect_of(SEARCH).expect("search").x < 30.0, "{:?}", left.rect_of(SEARCH));
+        // the dock of a lighter bar is just as short as its content
+        let dock = shape(Style::Dock, Side::Bottom, 1);
+        v.align_left = false;
+        let d = layout(&mut g, &v, &dock, 64.0, None, 0.0);
+        v.full = true;
+        let d_full = layout(&mut g, &v, &dock, 64.0, None, 0.0);
+        assert!(d.bar.w < d_full.bar.w - 200.0, "{} vs {}", d.bar.w, d_full.bar.w);
+    }
+
+    #[test]
+    fn a_bar_stands_where_its_monitor_is_on_the_virtual_screen() {
+        let mut b = bar();
+        let v = view(3);
+        b.frame(&v, &live(0));
+        let at_origin = b.frame(&v, &live(10_000));
+        // the monitor to the left of the primary one: its corner is at negative x; windows are placed there, the picture is the same
+        b.set_origin((-1440, 0));
+        let moved = b.frame(&v, &live(10_000));
+        assert_eq!(moved.bar, (-1440 + at_origin.bar.0, at_origin.bar.1, at_origin.bar.2, at_origin.bar.3));
+        assert_eq!(moved.win, (-1440, at_origin.win.1, at_origin.win.2, at_origin.win.3));
+        assert_eq!(moved.rest.0, -1440 + at_origin.rest.0);
+        let r = b.screen_rect(0).expect("start");
+        let r0 = (r.0 + 1440, r.1, r.2 + 1440, r.3);
+        b.set_origin((0, 0));
+        b.frame(&v, &live(10_000));
+        assert_eq!(b.screen_rect(0), Some(r0), "buttons are found where the windows are");
+        // a monitor below the primary one
+        b.set_origin((100, 900));
+        let below = b.frame(&v, &live(10_000));
+        assert_eq!((below.bar.0, below.bar.1), (100 + at_origin.bar.0, 900 + at_origin.bar.1));
+    }
+
+    #[test]
     fn the_recording_button_stands_before_the_clock_and_takes_room_only_while_recording() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
         let mut g = Gfx::new(1.0).expect("the renderer");
         let sh = shape(Style::Classic, Side::Bottom, 1);
         let mut v = view(3);

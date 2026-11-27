@@ -100,7 +100,7 @@ pub(crate) unsafe fn bar_menu(kind: &'static str, a: panel::Anchor) {
 pub(crate) unsafe fn menu_at(items: Vec<Item>, w: f32, a: panel::Anchor, pick: impl Fn(usize) + 'static) {
     let s = SCALE.get();
     let room = match a.side {
-        Side::Bottom => a.bar.1 as f32 / s - 8.0 - 12.0,
+        Side::Bottom => (a.bar.1 - a.origin.1) as f32 / s - 8.0 - 12.0,
         _ => a.screen.1 as f32 / s - 24.0,
     };
     OPEN.set("");
@@ -230,8 +230,8 @@ pub(crate) unsafe fn winx_menu(mut a: panel::Anchor) {
         Side::Bottom => {
             let c = (a.button.0 + a.button.2) / 2;
             a.button.0 = c - (24.0 * s).round() as i32;
-            let at = (a.button.0 as f32 / s).clamp(8.0, (a.screen.0 as f32 / s - 8.0 - 296.0).max(8.0));
-            (a.bar.1 as f32 / s - 8.0 - 12.0, at + 296.0 + 6.0 + 210.0 + 8.0 > a.screen.0 as f32 / s)
+            let at = ((a.button.0 - a.origin.0) as f32 / s).clamp(8.0, (a.screen.0 as f32 / s - 8.0 - 296.0).max(8.0));
+            ((a.bar.1 - a.origin.1) as f32 / s - 8.0 - 12.0, at + 296.0 + 6.0 + 210.0 + 8.0 > a.screen.0 as f32 / s)
         }
         side => {
             let c = (a.button.1 + a.button.3) / 2;
