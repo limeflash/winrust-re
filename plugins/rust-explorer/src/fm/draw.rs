@@ -146,6 +146,7 @@ impl Fm {
         self.geo.places.clear();
         self.geo.rows.clear();
         self.geo.size = (w, h);
+        self.menu_open = f.menu_open();
         c.fill(Rect::new(0.0, 0.0, w, h), 0.0, WIN);
 
         // the preview pane opens and closes by width (its content keeps its size and is cut)
@@ -258,11 +259,12 @@ impl Fm {
         c.fill(bar, 0.0, BAR);
         c.fill(Rect::new(0.0, CAPTION_H + TOOLBAR_H - 1.0, w, 1.0), 0.0, Rgba::css(0, 0, 0, 0.35));
         let y = CAPTION_H + (TOOLBAR_H - 34.0) / 2.0;
-        // the three arrows
+        // the three arrows and Refresh
         let nav = [
             (ID_BACK, "M15 5l-7 7 7 7", self.can_back(), t!("Назад (Alt+←)", "Back (Alt+Left)", ja: "戻る (Alt+←)", pt: "Voltar (Alt+←)", zh: "后退 (Alt+←)")),
             (ID_FWD, "M9 5l7 7-7 7", self.can_forward(), t!("Вперёд (Alt+→)", "Forward (Alt+Right)", ja: "進む (Alt+→)", pt: "Avançar (Alt+→)", zh: "前进 (Alt+→)")),
             (ID_UP, "M12 19V5M6 11l6-6 6 6", self.can_up(), t!("Вверх (Alt+↑)", "Up one level (Alt+Up)", ja: "上へ (Alt+↑)", pt: "Subir (Alt+↑)", zh: "上一级 (Alt+↑)")),
+            (ID_REFRESH, "M20 12a8 8 0 1 1-2.5-5.8M20 4v5h-5", true, t!("Обновить (F5)", "Refresh (F5)", ja: "最新の情報に更新 (F5)", pt: "Atualizar (F5)", zh: "刷新 (F5)")),
         ];
         for (i, (id, d, on, tip)) in nav.into_iter().enumerate() {
             let r = Rect::new(10.0 + i as f32 * 38.0, y, 34.0, 34.0);
@@ -291,12 +293,14 @@ impl Fm {
         }
         // the search box grows when it has the focus or text
         let focused = f.focused(ID_SEARCH);
-        let sw = f.tween(ID_SEARCH, 7, if focused || !self.srch.text.is_empty() { 300.0 } else { 220.0 }, 300, EASE);
+        // the box grows with the focus or text, but never takes the address pill under 120
+        let room = (seg.x - 10.0 - (10.0 + 4.0 * 38.0 + 6.0) - 4.0 - 6.0 - 120.0).max(160.0);
+        let sw = f.tween(ID_SEARCH, 7, if focused || !self.srch.text.is_empty() { 300.0_f32 } else { 220.0 }.min(room), 300, EASE);
         let sr = Rect::new(seg.x - 6.0 - 4.0 - sw, y, sw, 34.0);
         let ph = tf!("Поиск: {}", "Search {}", ja: "{} を検索", pt: "Pesquisar {}", zh: "搜索 {}", self.label_of(&self.dir));
         field_with(c, f, ID_SEARCH, sr, &mut self.srch, &ph, &FieldStyle::SEARCH);
         // the address pill takes the rest
-        let ax = 10.0 + 3.0 * 38.0 + 6.0;
+        let ax = 10.0 + 4.0 * 38.0 + 6.0;
         let ar = Rect::new(ax, y, (sr.x - 4.0 - 6.0 - ax).max(80.0), 34.0);
         self.address(c, f, ar);
     }

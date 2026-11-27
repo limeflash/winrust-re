@@ -437,6 +437,7 @@ fn selftest() -> i32 {
 
     // the live parts, on a temp folder of its own
     live_parts(&mut rep, &o("rust_explorer_selftest_live"));
+    pick_parts(&mut rep, &o("rust_explorer_selftest_pick"));
 
     // memory: the folder's menu and an item's, thirty times
     let (fm, _) = demo::build("folder");
@@ -508,10 +509,87 @@ fn live_parts(rep: &mut Report, o: &Options) {
     plain_key(hwnd, 0x0D);
     probe::pump(200);
     rep.check(d.join("Docs").is_dir() && !d.join("New folder").exists() && !d.join("Новая папка").exists(), "typing a name and Enter renames it on disk");
+    // another thread creates, renames and deletes files: the listing follows within about a second (the watcher)
+    let count = |h: isize| (0..64).filter(|&i| has(h, row_id(ID_LIST, i))).count();
+    let follows = |h: isize, want: usize, limit: u128| {
+        let t0 = Instant::now();
+        while t0.elapsed().as_millis() < limit {
+            probe::pump(50);
+            if count(h) == want {
+                return Some(t0.elapsed().as_millis());
+            }
+        }
+        None
+    };
+    let n0 = count(hwnd);
+    let dd = d.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = std::fs::write(dd.join("w1.txt"), b"x");
+        std::thread::sleep(std::time::Duration::from_millis(1900));
+        let _ = std::fs::rename(dd.join("w1.txt"), dd.join("w2.txt"));
+        let _ = std::fs::write(dd.join("w3.txt"), b"x");
+        std::thread::sleep(std::time::Duration::from_millis(1900));
+        let _ = std::fs::remove_file(dd.join("w2.txt"));
+        let _ = std::fs::remove_file(dd.join("w3.txt"));
+    });
+    let a = follows(hwnd, n0 + 1, 1800);
+    rep.check(a.is_some(), &format!("a file made by another thread shows in the listing ({n0} -> {} rows, after {a:?} ms)", count(hwnd)));
+    probe::pump(1700);
+    let b = follows(hwnd, n0 + 2, 1800);
+    rep.check(b.is_some(), &format!("a rename and a new file: two more rows ({} rows, after {b:?} ms)", count(hwnd)));
+    let c = follows(hwnd, n0, 2500); // the worker deletes about 3.8 s after it started
+    rep.check(c.is_some(), &format!("both deleted: back to {n0} rows ({} rows, after {c:?} ms)", count(hwnd)));
+    let _ = worker.join();
     probe::destroy(hwnd);
     probe::pump(100);
     // SAFETY: a query of a handle that may be gone.
     rep.check(unsafe { IsWindow(hwnd as HWND) } == 0, "the live window is gone too");
     crate::shellwin::revoke();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Where row `i` stands in the window and whether it is inside the list's viewport (None: it is not drawn at all).
+fn row_in_view(hwnd: isize, i: usize) -> Option<bool> {
+    probe::with_core(hwnd, |c| {
+        let r = c.hits().get(row_id(ID_LIST, i)).map(|h| h.r)?;
+        let v = c.hits().get(ID_LIST).map(|h| h.r)?;
+        Some(r.y >= v.y - 0.5 && r.y + r.h <= v.y + v.h + 0.5)
+    })
+    .flatten()
+}
+
+/// "Show in folder" from another app: the file is picked and brought into view, in a window that is made on it (`/select,`) and in one
+/// that is open on another file of the same folder (the shell's `SelectItem`, which arrives as a message).
+fn pick_parts(rep: &mut Report, o: &Options) {
+    let d = temp_folder("pick", 400);
+    let be: Arc<dyn Backend> = Arc::new(Real);
+    let mut fm = Fm::new(be, d.clone());
+    fm.flags_from_backend();
+    fm.places = fm.be.places();
+    let mut cx = winrust_ui::frame::Cx::default();
+    fm.load(d.clone(), true, false, &mut cx);
+    fm.reveal_names(&["file 00350.txt".to_string()]);
+    let Some(hwnd) = probe::make(Box::new(fm), o, gfx::compose_windows(), (-5000, -5000)) else {
+        rep.check(false, "a window on a folder of 400 files can be made");
+        let _ = std::fs::remove_dir_all(&d);
+        return;
+    };
+    probe::show_off_screen(hwnd);
+    probe::pump(1200);
+    let at = |h: isize, i: usize| row_in_view(h, i);
+    rep.check(at(hwnd, 350) == Some(true), &format!("a window made with /select, shows the picked file (row 350 of 400) inside the list: {:?}", at(hwnd, 350)));
+    let picked = |h: isize, i: usize| probe::with_core(h, |c| c.hits().get(row_id(ID_LIST, i)).is_some()).unwrap_or(false);
+    rep.check(picked(hwnd, 350), "... and it is drawn");
+    // the shell asks an open window to show another file of the folder
+    let want = d.join("file 00020.txt");
+    probe::send(hwnd, crate::shellwin::WM_SHELL_SELECT, 0, Box::into_raw(Box::new(want)) as isize);
+    probe::pump(1200);
+    rep.check(at(hwnd, 20) == Some(true), &format!("SelectItem on an open window: file 20 is in view ({:?})", at(hwnd, 20)));
+    let want = d.join("file 00399.txt");
+    probe::send(hwnd, crate::shellwin::WM_SHELL_SELECT, 0, Box::into_raw(Box::new(want)) as isize);
+    probe::pump(1200);
+    rep.check(at(hwnd, 399) == Some(true), &format!("... and file 399 at the other end ({:?})", at(hwnd, 399)));
+    probe::destroy(hwnd);
+    probe::pump(100);
     let _ = std::fs::remove_dir_all(&d);
 }

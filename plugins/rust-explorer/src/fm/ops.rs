@@ -128,7 +128,7 @@ impl Fm {
         }
         let Some(name) = self.be.new_entry(&self.dir, folder) else { return };
         let d = self.dir.clone();
-        self.load(d, false, false, cx);
+        self.load(d, false, true, cx);
         self.select_names(std::slice::from_ref(&name));
         if let Some(i) = self.one() {
             self.rename_begin(i, cx);
@@ -194,7 +194,7 @@ impl Fm {
         match self.be.rename(&self.dir, &old, &new) {
             Ok(()) => {
                 let d = self.dir.clone();
-                self.load(d, false, false, cx);
+                self.load(d, false, true, cx);
                 self.select_names(std::slice::from_ref(&new));
             }
             Err(e) => cx.toast(e, None),
@@ -453,6 +453,51 @@ impl Fm {
             _ => {}
         }
         cx.invalidate();
+    }
+
+    /// Something is going on that a new listing would break: a rename, a drag, a press on a row, an open menu.
+    #[must_use]
+    pub fn busy_for_listing(&self) -> bool {
+        self.ren.is_some() || self.dragging || self.press.is_some() || self.menu_open
+    }
+
+    /// The watcher's word: the folder changed (`gone`: it is not there any more). A listing that comes out the same is no reload at all
+    /// (our own operation and its echo are one reload), one that differs keeps the scroll, the pick and the focus; while something is going
+    /// on it waits (a timer asks again).
+    pub fn watch_event(&mut self, gone: bool, cx: &mut Cx) {
+        if self.searching() || self.at_pc() {
+            return;
+        }
+        if gone {
+            return self.watch_gone(cx);
+        }
+        if self.busy_for_listing() {
+            self.watch_pending = true;
+            cx.wake_in(300);
+            return;
+        }
+        self.watch_pending = false;
+        let Some(new) = self.be.peek(&self.dir, &self.opts()) else { return self.watch_gone(cx) };
+        let same = new.len() == self.rows.len() + self.heads.len()
+            && new.iter().filter(|r| !r.hdr).zip(&self.rows).all(|(a, b)| a.name == b.name && a.dir == b.dir && a.time == b.time && (a.dir || a.size == b.size));
+        if same {
+            return;
+        }
+        self.quiet = true;
+        self.reload(cx);
+        self.quiet = false;
+    }
+
+    /// The folder is gone: the nearest one above it that is still there, or This PC.
+    fn watch_gone(&mut self, cx: &mut Cx) {
+        let mut p = self.dir.clone();
+        while let Some(up) = p.parent().map(std::path::Path::to_path_buf) {
+            if !up.as_os_str().is_empty() && self.be.is_target(&up) {
+                return self.load(up, true, false, cx);
+            }
+            p = up;
+        }
+        self.load(pc_dir(), true, false, cx);
     }
 
     /// The sort and grouping the folder's menu may change are the window's: a flag the backend keeps for next time.

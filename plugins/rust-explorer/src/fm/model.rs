@@ -39,6 +39,7 @@ pub const ID_VIEW: Id = 8; // 8 list, 9 icons
 pub const ID_PV: Id = 10;
 pub const ID_MORE: Id = 11;
 pub const ID_NEWTAB: Id = 12;
+pub const ID_REFRESH: Id = 13;
 pub const ID_TAB: Id = 20; // 20..60
 pub const ID_TAB_X: Id = 60; // 60..100
 pub const ID_CRUMB: Id = 100; // 100..140
@@ -209,6 +210,12 @@ pub struct Fm {
     pub menu_paths: Vec<PathBuf>,
     /// Space was a key of the window (a quick look): the space the keyboard types after it is not a letter to jump to.
     pub skip_space: bool,
+    /// A menu of the window is open (the last frame knew).
+    pub menu_open: bool,
+    /// The watcher said the folder changed while something was going on that a new listing would break (a rename, a drag, a menu).
+    pub watch_pending: bool,
+    /// The listing now being taken is the watcher's: what is known of the folders' sizes and of the pictures stays.
+    pub quiet: bool,
     /// How the columns were set up last (0 folder, 1 This PC, 2 search hits): their widths are reset only when that changes.
     pub col_mode: u8,
 }
@@ -271,6 +278,9 @@ impl Fm {
             hook: Hook::None,
             menu_paths: Vec::new(),
             skip_space: false,
+            menu_open: false,
+            watch_pending: false,
+            quiet: false,
             col_mode: 9,
         };
         fm.set_titles();
@@ -468,6 +478,12 @@ impl Fm {
         names.iter().filter_map(|n| self.rows.iter().position(|r| r.name.eq_ignore_ascii_case(n))).collect()
     }
 
+    /// Picks the rows called `names` and puts the cursor on the first, in the middle of the list when it is off-screen ("Show in folder").
+    pub fn reveal_names(&mut self, names: &[String]) {
+        self.select_names(names);
+        self.list.center_next = true;
+    }
+
     /// Selects the rows called `names` and puts the cursor on the first.
     pub fn select_names(&mut self, names: &[String]) {
         let idx = self.names_to_rows(names);
@@ -481,6 +497,10 @@ impl Fm {
     /// window as it is.
     pub fn load(&mut self, dir: PathBuf, record: bool, keep: bool, cx: &mut Cx) {
         let names = if keep { self.sel_names() } else { Vec::new() };
+        // the same folder read again keeps where the list was scrolled to; only another folder starts at the top
+        let same = keep && dir == self.dir && !self.searching();
+        let old_rows = if same && self.quiet { self.rows.clone() } else { Vec::new() };
+        let before = same.then(|| (self.list.scroll.clone(), self.list.cursor.or_else(|| self.list.sel.iter().next().copied())));
         let mut rows;
         if dir == pc_dir() {
             self.places = self.be.places();
@@ -508,7 +528,9 @@ impl Fm {
         self.query = None;
         self.search_info.clear();
         self.era = self.be.era();
-        self.thumbs.clear();
+        if !same || !self.quiet {
+            self.thumbs.clear();
+        }
         self.asked.clear();
         self.facts = None;
         self.ren = None;
@@ -521,21 +543,41 @@ impl Fm {
         if record {
             self.hist.visit(self.dir.clone());
         }
+        if same && self.quiet {
+            // the sizes the workers found are kept for the folders that are still there
+            let known: std::collections::HashMap<&str, u64> = old_rows.iter().filter(|r| r.dir && r.size > 0).map(|r| (r.name.as_str(), r.size)).collect();
+            for r in rows.iter_mut().filter(|r| r.dir) {
+                if let Some(s) = known.get(r.name.as_str()) {
+                    r.size = *s;
+                }
+            }
+        }
         self.set_rows(rows);
         if !names.is_empty() {
             self.select_names(&names);
+            // what was picked is gone (deleted, renamed): the item that took its place is picked, the last one's neighbour before it
+            if self.list.sel.is_empty() && !self.rows.is_empty() {
+                let at = before.as_ref().and_then(|b| b.1).unwrap_or(0).min(self.rows.len() - 1);
+                self.list.click(at, false, false);
+                self.list.shown = None;
+            }
+        }
+        if let Some((scroll, _)) = before {
+            self.list.scroll = scroll; // brought into view again only if the cursor row is off-screen
         }
         self.addr_edit = false;
         self.addr.set_text(&self.dir_text());
         self.set_titles();
         // the rows slide in, except for the first listing (the window is not there yet) and for what a render or a test draws
-        self.nav_fresh = self.hwnd != 0;
-        if !self.nav_fresh {
+        self.nav_fresh = self.hwnd != 0 && !same;
+        if self.hwnd == 0 {
             self.nav_at = 0;
         }
-        if !self.at_pc() {
+        if self.at_pc() {
+            self.be.run(self.hwnd, Do::Unwatch);
+        } else {
             self.be.run(self.hwnd, Do::Navigated(self.dir.clone()));
-            let names: Vec<String> = self.rows.iter().filter(|r| r.dir).map(|r| r.name.clone()).collect();
+            let names: Vec<String> = self.rows.iter().filter(|r| r.dir && !(same && self.quiet && r.size > 0)).map(|r| r.name.clone()).collect();
             if !names.is_empty() && self.dir.parent().is_some() {
                 self.be.run(self.hwnd, Do::Sizes { dir: self.dir.clone(), names });
             }
@@ -679,6 +721,7 @@ impl Fm {
         self.asked.clear();
         self.facts = None;
         self.ren = None;
+        self.be.run(self.hwnd, Do::Unwatch); // the hits are all over the disk
         let mut rows = found.rows;
         // the hits are sorted by the window's column like a folder's rows (without date headings)
         let o = Opts { group: false, ..self.opts() };

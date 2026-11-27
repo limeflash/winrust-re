@@ -40,6 +40,8 @@ pub const MSG_OPEN: u32 = WM_APP + 17;
 pub const MSG_NEWTAB: u32 = WM_APP + 18;
 pub const MSG_REGISTER: u32 = WM_APP + 15;
 pub const MSG_BACK: u32 = WM_APP + 19;
+/// The watcher: `wp` 0 something in the folder changed, 1 the folder is gone.
+pub const MSG_WATCH: u32 = WM_APP + 21;
 pub const MSG_FORWARD: u32 = WM_APP + 20;
 /// Posted to wake the subclass so that it runs what was queued.
 const MSG_WAKE: u32 = WM_APP + 60;
@@ -80,6 +82,8 @@ thread_local! {
     static QUEUE: RefCell<VecDeque<Job>> = const { RefCell::new(VecDeque::new()) };
     static OWNER: Cell<isize> = const { Cell::new(0) };
     static DRAINING: Cell<bool> = const { Cell::new(false) };
+    /// The folder the window shows, watched.
+    static WATCH: RefCell<Option<(PathBuf, isize, crate::watch::Watch)>> = const { RefCell::new(None) };
 }
 
 /// Queues `f` to run on the window's thread once the host has handled the message it is in.
@@ -299,7 +303,16 @@ pub fn run(owner: isize, d: Do) {
         }
         Do::Eject(_) => {}
         Do::JobCancel => crate::jobs::cancel(),
-        Do::Navigated(dir) => crate::shellwin::navigated(&dir),
+        Do::Navigated(dir) => {
+            crate::shellwin::navigated(&dir);
+            // the same folder listed again is watched already
+            if WATCH.with_borrow(|w| w.as_ref().is_some_and(|(d, o, _)| *d == dir && *o == owner)) {
+                return;
+            }
+            let w = crate::watch::Watch::start(&dir, move |e| winrust_ui::window::post(owner, MSG_WATCH, usize::from(e == crate::watch::Event::Gone), 0));
+            WATCH.set(w.map(|w| (dir, owner, w)));
+        }
+        Do::Unwatch => WATCH.set(None),
         Do::Start => {
             attach(owner);
             post(owner, MSG_REGISTER);

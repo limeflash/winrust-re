@@ -33,6 +33,7 @@ mod shellwin; // registers the window as a shell window: "Show in folder" from o
 mod menu; // the folder's own menu, painted in our colours
 mod shellmenu; // the bar's menu for files and folders: the shell's items offered to it, what it chooses run here
 mod ui; // what the desktop and the menus still use of the old look: scale, GDI helpers, the pins of Quick access
+mod watch; // a folder watcher: the window and the desktop list the folder again when something in it changed
 mod fm; // the file manager window (winrust-ui): tabs, toolbar, sidebar, table, preview
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
@@ -85,6 +86,7 @@ static SORT_ASC: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 const WM_DIRSIZE: u32 = WM_APP + 7; // folder-size worker -> UI: wp = Box<(era, folder name, bytes)> (#147)
 const WM_WALL: u32 = WM_APP + 8; // desktop: rs-shell made the new wallpaper BMP, paint it
+const WM_DESKWATCH: u32 = WM_APP + 30; // desktop: the watcher saw a change in a folder it lists
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
@@ -695,6 +697,50 @@ fn folder_sizes(h: HWND, dir: PathBuf, names: Vec<String>) {
 
 fn reload(h: HWND) { load(h, cur_dir()); }
 
+thread_local! {
+    static DESK_WATCH: RefCell<Vec<watch::Watch>> = const { RefCell::new(Vec::new()) }; // the folders the desktop lists, watched
+}
+
+/// What the desktop's list shows, as far as a listing can tell: the order of the rows, what they are, their dates, the sizes of files.
+fn same_rows(a: &[Row], b: &[Row]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.dir == y.dir && x.time == y.time && (x.dir || x.size == y.size))
+}
+
+/// The watcher saw a change in a folder of the desktop: it is listed again, unless the listing is the same (our own operation and its
+/// echo are one reload). The icons stay on their saved cells and what was selected stays selected. While a label is being edited or an
+/// icon dragged the listing waits (a timer asks again).
+fn desk_changed(h: HWND) {
+    let list = ST.with_borrow(|st| st.list);
+    if list.is_null() { return; }
+    // SAFETY: plain queries and a timer of our own windows.
+    unsafe {
+        if put(list, LVM_GETEDITCONTROL, 0, 0) != 0 || desk::dragging() {
+            SetTimer(h, 9, 300, None);
+            return;
+        }
+    }
+    let Some(new) = rows_of(&cur_dir()) else { return };
+    if ST.with_borrow(|st| same_rows(&st.rows, &new)) { return; }
+    let (_, dir, picked) = selected();
+    put(list, WM_SETREDRAW, 0, 0);
+    reload(h);
+    let rows: Vec<PathBuf> = ST.with_borrow(|st| st.rows.iter().map(|r| dir.join(&r.name)).collect());
+    for (i, _) in rows.iter().enumerate().filter(|(_, p)| picked.contains(p)) {
+        // SAFETY: a state change of one item of our own list view.
+        unsafe {
+            let mut it: LVITEMW = std::mem::zeroed();
+            it.stateMask = LVIS_SELECTED;
+            it.state = LVIS_SELECTED;
+            put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+        }
+    }
+    // SAFETY: our own list view.
+    unsafe {
+        put(list, WM_SETREDRAW, 1, 0);
+        InvalidateRect(list, ptr::null(), 1);
+    }
+}
+
 /// (list, current dir, full paths of the selected rows)
 fn selected() -> (HWND, PathBuf, Vec<PathBuf>) {
     ST.with_borrow(|st| {
@@ -1005,6 +1051,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 // and walks up from there to the desktop window: it must accept the drop too
                 let _ = sh::register_drop(h as _, h as isize);
                 load(h, desktop::desktop_dirs().into_iter().next().unwrap_or_default());
+                // the folders the desktop lists (the user's and the public one) are watched
+                DESK_WATCH.set(desktop::desktop_dirs().iter().filter_map(|d| {
+                    let hw = h as isize;
+                    watch::Watch::start(d, move |_| { PostMessageW(hw as HWND, WM_DESKWATCH, 0, 0); })
+                }).collect());
                 desktop::register_resident();
                 0
             }
@@ -1157,8 +1208,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_CONTEXTMENU if icons_hidden() || wp as HWND == h => { bg_menu(h); 0 }
             desk::SPAWN_WORKERW => { desk::spawn_workerw(h); 0 }
             WM_TIMER if wp == shellmenu::TIMER => { shellmenu::tick(h); 0 }
+            WM_DESKWATCH => { desk_changed(h); 0 }
+            WM_TIMER if wp == 9 => { KillTimer(h, 9); desk_changed(h); 0 }
             WM_TIMER if wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
-            WM_DESTROY => { shellwin::revoke(); PostQuitMessage(0); 0 }
+            WM_DESTROY => { DESK_WATCH.set(Vec::new()); shellwin::revoke(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
         }
     }
