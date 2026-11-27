@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(own_page("ms-settings:themes"), Some("personalization"));
         assert_eq!(own_page("ms-settings:powersleep"), Some("power"));
         assert_eq!(own_page("ms-settings:network-status"), Some("network"));
-        assert_eq!(own_page("ms-settings:personalization-background"), None);
+        assert_eq!(own_page("ms-settings:personalization-background"), Some("personalization"), "the wallpaper grid is ours now");
         assert_eq!(own_page("ms-settings:network-wifi"), Some("network"));
         assert_eq!(own_page("ms-settings:bluetooth"), Some("bluetooth"));
         assert_eq!(own_page("ms-settings:windowsupdate"), Some("update"));
