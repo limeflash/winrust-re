@@ -10,13 +10,14 @@
 //! `InvokeCommand` all run there; the UI thread talks to it through channels and events). The UI thread waits for the built list
 //! for [`BUDGET`], pumping messages, and not a moment longer; if Windows has not answered, the bar gets our own rows at once
 //! ([`own_items`]: Open, Run as administrator, Cut, Copy, Delete, Properties; the bar adds Copy as path, Rename, Open file
-//! location and the pins itself) and "Show more options" waits for the worker in the background ([`MORE_SUB`]). A worker that
-//! never returns is given up (its thread leaks, nothing else), and what was slow is remembered by kind for the session.
+//! location and the pins itself). The worker that did not answer is given up (its thread leaks, nothing else), what was slow is
+//! remembered by kind for the session, and "Show more options" (the submenu [`MORE_SUB`]) is made by [`more`] instead: handler by
+//! handler, each on a worker of its own with a budget of its own, the ones that hang left out.
 //!
 //! `false` from [`offer`] (no bar, or one that does not answer) leaves the caller to show the old menu.
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashSet},
     ffi::c_void,
     path::{Path, PathBuf},
     sync::{
@@ -41,6 +42,8 @@ use winrust_common::filemenu::{self, Act, MORE_SUB, Request, ShellItem, SubReply
 
 /// How long the UI thread waits for the shell's list before it shows our own rows.
 const BUDGET: Duration = Duration::from_millis(700);
+
+mod more;
 
 /// The command numbers of our own items (the shell's are 1..0x7FFF).
 mod syn {
@@ -140,8 +143,9 @@ trait Backend {
     /// One more read of every submenu being watched: what changed since the bar was told.
     fn reread(&mut self) -> Vec<(u32, Vec<ShellItem>)>;
     fn watching(&self) -> bool;
-    /// Runs item `id` of the shell's menu.
-    fn run(&mut self, h: HWND, id: u32);
+    /// Runs item `id` of the shell's menu (`session`: the menu's, for telling the window it is done). `true` = the backend has told
+    /// (or will tell) the window itself.
+    fn run(&mut self, h: HWND, id: u32, session: u32) -> bool;
 }
 
 /// The shell's menu for one selection: the `IContextMenu`, its popup menu, the submenus handed out as lazy handles.
@@ -153,6 +157,12 @@ struct Session {
     subs: Vec<(*mut c_void, u32)>,
     /// Submenus the bar opened that Windows may still be filling (Send to fills from a worker): read again for a while.
     watch: Vec<Watch>,
+    /// What the menu is for: the verbs that are ours to run ([`special`]) need the files.
+    paths: Vec<PathBuf>,
+    /// The command number the shell was given for its first command: the verb of an item is its number less this.
+    first: u32,
+    /// What goes with the session: registry keys it was given, closed (and deleted) when it ends.
+    on_drop: Vec<Box<dyn FnOnce()>>,
 }
 
 /// A submenu being read again: what the bar was last told about it and how many times it has been read since.
@@ -166,6 +176,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         // SAFETY: the menu is ours; the context menu objects go with the struct.
         unsafe { let _ = DestroyMenu(self.menu); }
+        for f in self.on_drop.drain(..) { f(); }
     }
 }
 
@@ -174,11 +185,12 @@ struct Src<'a> {
     cm: &'a IContextMenu,
     cm2: Option<&'a IContextMenu2>,
     subs: &'a mut Vec<(*mut c_void, u32)>,
+    first: u32,
 }
 
 impl menu::Source for Src<'_> {
     fn verb(&mut self, id: u32) -> String {
-        let at = id.saturating_sub(1) as usize;
+        let at = id.saturating_sub(self.first) as usize;
         let mut buf = [0u16; 128];
         // SAFETY: the buffer is as long as the call is told; a command without a verb answers an error.
         let ok = unsafe { self.cm.GetCommandString(at, GCS_VERBW, None, PSTR(buf.as_mut_ptr().cast()), buf.len() as u32) };
@@ -203,8 +215,13 @@ impl menu::Source for Src<'_> {
 }
 
 impl Session {
+    fn new(cm: IContextMenu, menu: HMENU, paths: &[PathBuf], first: u32) -> Self {
+        let cm2 = cm.cast::<IContextMenu2>().ok();
+        Session { cm, cm2, menu, subs: Vec::new(), watch: Vec::new(), paths: paths.to_vec(), first, on_drop: Vec::new() }
+    }
+
     fn src(&mut self) -> (Src<'_>, HMENU) {
-        (Src { cm: &self.cm, cm2: self.cm2.as_ref(), subs: &mut self.subs }, self.menu)
+        (Src { cm: &self.cm, cm2: self.cm2.as_ref(), subs: &mut self.subs, first: self.first }, self.menu)
     }
 
     fn tidy(mut items: Vec<ShellItem>) -> Vec<ShellItem> {
@@ -248,7 +265,15 @@ impl Backend for Session {
         !self.watch.is_empty()
     }
 
-    fn run(&mut self, h: HWND, id: u32) {
+    fn run(&mut self, h: HWND, id: u32, _session: u32) -> bool {
+        // some verbs Windows runs through explorer.exe, which does not run beside this shell: they are done here
+        let verb = {
+            let (mut src, _) = self.src();
+            menu::Source::verb(&mut src, id)
+        };
+        if special(&verb, &self.paths, &mut set_wallpaper) {
+            return false;
+        }
         let mut pt = POINT::default();
         // SAFETY: plain calls; the verb is the command's offset, which is how the shell numbers its items.
         unsafe {
@@ -258,7 +283,7 @@ impl Backend for Session {
                 cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
                 fMask: CMIC_MASK_PTINVOKE,
                 hwnd: h,
-                lpVerb: PCSTR(id.saturating_sub(1) as usize as *const u8),
+                lpVerb: PCSTR(id.saturating_sub(self.first) as usize as *const u8),
                 nShow: SW_SHOWNORMAL.0,
                 ptInvoke: pt,
                 ..Default::default()
@@ -267,7 +292,28 @@ impl Backend for Session {
             let _ = self.cm.InvokeCommand(&ci as *const _ as *const CMINVOKECOMMANDINFO);
             crate::sh::keep_on_screen(before);
         }
+        false
     }
+}
+
+/// The commands of the shell that rust-explorer does itself, by verb (whichever row or submenu of the menu they come from): `true` =
+/// done. "Set as desktop background" goes through `IDesktopWallpaper`, which lives in explorer.exe; the file's own path is what
+/// Windows' older `SPI_SETDESKWALLPAPER` takes, and it is right whether or not explorer.exe runs. Only the first of several
+/// files is used.
+fn special(verb: &str, paths: &[PathBuf], set_wallpaper: &mut dyn FnMut(&Path)) -> bool {
+    if verb.eq_ignore_ascii_case("setdesktopwallpaper") {
+        if let Some(p) = paths.first() { set_wallpaper(p); }
+        return true;
+    }
+    false
+}
+
+/// Makes `path` the desktop picture (the style stays as it is) and tells everybody: our own desktop reloads on that broadcast.
+fn set_wallpaper(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: a NUL-terminated path that outlives the call (SPI_SETDESKWALLPAPER only reads it).
+    unsafe { let _ = SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, Some(w.as_ptr() as *mut c_void), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE); }
 }
 
 /// The shell's menu for `paths` and its top level items. Runs on the worker.
@@ -281,8 +327,7 @@ fn build_session(h: HWND, paths: &[PathBuf]) -> Option<(Box<dyn Backend>, Vec<Sh
         unsafe { let _ = DestroyMenu(menu_h); }
         return None;
     }
-    let cm2 = cm.cast::<IContextMenu2>().ok();
-    let mut s = Session { cm, cm2, menu: menu_h, subs: Vec::new(), watch: Vec::new() };
+    let mut s = Session::new(cm, menu_h, paths, 1);
     let (mut src, m) = s.src();
     // SAFETY: the menu was just filled by the shell and is ours.
     let items = unsafe { menu::read(m.0, &mut src) };
@@ -303,10 +348,6 @@ enum Reply {
     Built(Option<Vec<ShellItem>>),
     Sub(u32, Vec<ShellItem>),
 }
-
-/// Workers that are still building their menu: a shell that does not answer must not pile threads up without end.
-static UNBUILT: AtomicU32 = AtomicU32::new(0);
-const MAX_UNBUILT: u32 = 4;
 
 /// The UI thread's end of a worker.
 struct Worker {
@@ -339,12 +380,10 @@ where
     let (rtx, rep) = channel::<Reply>();
     let (cmd_sig, rep_sig) = (Arc::new(Signal::new()), Arc::new(Signal::new()));
     let (cs, rs) = (Arc::clone(&cmd_sig), Arc::clone(&rep_sig));
-    UNBUILT.fetch_add(1, Relaxed);
     let started = std::thread::Builder::new().name("shell-menu".into()).spawn(move || {
         // SAFETY: an apartment of its own for the shell's objects, which live and die on this thread.
         unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); }
         let built = build();
-        UNBUILT.fetch_sub(1, Relaxed);
         let (backend, items) = match built {
             Some((b, i)) => (Some(b), Some(i)),
             None => (None, None),
@@ -367,10 +406,11 @@ where
                             next = Instant::now() + every;
                         }
                         Cmd::Run(hw, id, session) => {
-                            be.run(HWND(hw as *mut c_void), id);
-                            let (wp, lp) = Act::Item(0).encode(session);
-                            // SAFETY: a plain message to the desktop's window: it reloads its list
-                            unsafe { let _ = PostMessageW(Some(HWND(hw as *mut c_void)), filemenu::act_msg(), WPARAM(wp), LPARAM(lp)); }
+                            if !be.run(HWND(hw as *mut c_void), id, session) {
+                                let (wp, lp) = Act::Item(0).encode(session);
+                                // SAFETY: a plain message to the desktop's window: it reloads its list
+                                unsafe { let _ = PostMessageW(Some(HWND(hw as *mut c_void)), filemenu::act_msg(), WPARAM(wp), LPARAM(lp)); }
+                            }
                         }
                         Cmd::Drop => break 'life,
                     }
@@ -388,9 +428,7 @@ where
         // SAFETY: balances the call above.
         unsafe { CoUninitialize() };
     });
-    if started.is_err() {
-        UNBUILT.fetch_sub(1, Relaxed);
-    }
+    let _ = started;
     Worker { cmd, cmd_sig, rep, rep_sig }
 }
 
@@ -425,9 +463,8 @@ fn await_built(w: &Worker, budget: Duration) -> Built {
 // ---------------------------------------------------------------------------------------------------------------------
 // what was slow
 
-/// The kinds of selection the shell was slow for: never answered (`None`), or answered late (`Some(when)`, forgiven after a while).
-static SLOW: Mutex<Option<HashMap<String, Option<Instant>>>> = Mutex::new(None);
-const FORGIVE: Duration = Duration::from_secs(120);
+/// The kinds of selection the shell's menu was too slow for, for the rest of the session (their menus skip the wait).
+static SLOW: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// What the selection is, for remembering: the extensions of the files and "<dir>" for folders. (A shortcut is a `.lnk` whatever it
 /// points at: the shell's handlers go by the shortcut's own kind first.)
@@ -441,30 +478,17 @@ fn kind_of(paths: &[PathBuf]) -> String {
         .join("+")
 }
 
-fn with_slow<T>(f: impl FnOnce(&mut HashMap<String, Option<Instant>>) -> T) -> T {
+fn with_slow<T>(f: impl FnOnce(&mut HashSet<String>) -> T) -> T {
     let mut g = SLOW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    f(g.get_or_insert_with(HashMap::new))
+    f(g.get_or_insert_with(HashSet::new))
 }
 
 fn mark_slow(kind: &str) {
-    with_slow(|m| _ = m.entry(kind.to_string()).or_insert(None));
-}
-
-/// The shell did answer, late: skipped for a while yet.
-fn note_answered(kind: &str) {
-    with_slow(|m| _ = m.insert(kind.to_string(), Some(Instant::now())));
+    with_slow(|m| _ = m.insert(kind.to_string()));
 }
 
 fn known_slow(kind: &str) -> bool {
-    with_slow(|m| match m.get(kind) {
-        None => false,
-        Some(None) => true,
-        Some(Some(t)) if t.elapsed() < FORGIVE => true,
-        Some(Some(_)) => {
-            m.remove(kind);
-            false
-        }
-    })
+    with_slow(|m| m.contains(kind))
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -518,7 +542,6 @@ struct Live {
     id: u32,
     dir: PathBuf,
     paths: Vec<PathBuf>,
-    kind: String,
     worker: Option<Worker>,
     late: Late,
 }
@@ -540,7 +563,6 @@ impl Live {
                     if !matches!(self.late, Late::Waiting) { continue; }
                     match items {
                         Some(items) => {
-                            note_answered(&self.kind);
                             self.late = Late::Ready(items.clone());
                             out.push((MORE_SUB, items));
                         }
@@ -589,21 +611,26 @@ pub(crate) fn offer(hw: *mut c_void, dir: &Path, paths: &[PathBuf], key_at: Opti
 fn offer_now(hw: *mut c_void, dir: &Path, paths: &[PathBuf], key_at: Option<(i32, i32)>) -> bool {
     let kind = kind_of(paths);
     let skip = known_slow(&kind);
-    let worker = if skip && UNBUILT.load(Relaxed) >= MAX_UNBUILT {
+    // Windows' own menu for what it was slow for before is not even asked for (it is given up for good, below)
+    let first = if skip {
         None
     } else {
         let (h, ps) = (hw as isize, paths.to_vec());
         Some(spawn(move || build_session(HWND(h as *mut c_void), &ps)))
     };
-    let built = match &worker {
+    let built = match &first {
         None => Built::Slow,
-        Some(w) => await_built(w, if skip { Duration::ZERO } else { BUDGET }),
+        Some(w) => await_built(w, BUDGET),
     };
     if matches!(built, Built::Slow) && !skip { mark_slow(&kind); }
-    let late = match (&built, &worker) {
-        (Built::Ready(_), _) => Late::No,
-        (Built::Slow, Some(_)) => Late::Waiting,
-        _ => Late::Failed,
+    let (worker, late) = if let Built::Ready(_) = &built {
+        (first, Late::No)
+    } else {
+        // Windows did not answer (a stuck worker is let go of, it ends if it ever comes back): "Show more options" is made here, one
+        // handler of the shell at a time, and arrives as the submenu the bar is waiting for
+        drop(first);
+        let (h, ps) = (hw as isize, paths.to_vec());
+        (Some(spawn(move || more::build_more(h, ps))), Late::Waiting)
     };
     let (items, mut flags) = choose(built, paths);
     let mut pt = POINT::default();
@@ -617,7 +644,7 @@ fn offer_now(hw: *mut c_void, dir: &Path, paths: &[PathBuf], key_at: Option<(i32
     let id = NEXT.fetch_add(1, Relaxed);
     let req = Request { session: id, at, flags, paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(), items };
     // kept before the bar is asked: its first message back can come while it is still answering
-    SESSION.set(Some(Live { id, dir: dir.to_path_buf(), paths: paths.to_vec(), kind, worker, late }));
+    SESSION.set(Some(Live { id, dir: dir.to_path_buf(), paths: paths.to_vec(), worker, late }));
     // SAFETY: a timer of the window that is handling the click: it drains what the worker says
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(hw, TIMER, EVERY, None) };
     if filemenu::ask(hw, &req) { return true; }
@@ -785,13 +812,27 @@ mod tests {
         assert!(!worth_telling(Some(5), 0, true), "an empty read after items is not news");
     }
 
+    #[test]
+    fn set_as_desktop_background_is_done_here_by_its_verb_and_nothing_else_is() {
+        let mut set = Vec::new();
+        let paths = [PathBuf::from(r"C:\pics.png"), PathBuf::from(r"C:\pics.png")];
+        assert!(special("setdesktopwallpaper", &paths, &mut |p| set.push(p.to_path_buf())));
+        assert_eq!(set, [PathBuf::from(r"C:\pics.png")], "the first image only");
+        assert!(special("SetDesktopWallpaper", &paths, &mut |p| set.push(p.to_path_buf())), "by any case");
+        assert_eq!(set.len(), 2);
+        for other in ["open", "properties", "delete", "", "rotate90"] {
+            assert!(!special(other, &paths, &mut |_| panic!("{other} must not set the wallpaper")), "{other} is the shell's");
+        }
+        assert!(special("setdesktopwallpaper", &[], &mut |_| panic!("no files, nothing to set")), "still ours: the shell would only fail");
+    }
+
     /// A shell that answers every submenu with one item.
     struct Quiet;
     impl Backend for Quiet {
         fn fill(&mut self, h: u32) -> Option<Vec<ShellItem>> { Some(vec![ShellItem::new(h, "", "Item")]) }
         fn reread(&mut self) -> Vec<(u32, Vec<ShellItem>)> { Vec::new() }
         fn watching(&self) -> bool { false }
-        fn run(&mut self, _: HWND, _: u32) {}
+        fn run(&mut self, _: HWND, _: u32, _: u32) -> bool { false }
     }
 
     #[test]
@@ -834,7 +875,7 @@ mod tests {
             Some((Box::new(Quiet) as Box<dyn Backend>, vec![ShellItem::new(7, "open", "Open")]))
         });
         assert!(matches!(await_built(&w, Duration::from_millis(50)), Built::Slow));
-        let mut live = Live { id: 1, dir: PathBuf::new(), paths: vec![], kind: ".test-late".into(), worker: Some(w), late: Late::Waiting };
+        let mut live = Live { id: 1, dir: PathBuf::new(), paths: vec![], worker: Some(w), late: Late::Waiting };
         assert_eq!(live.fill(MORE_SUB), None, "not there yet: the bar spins");
         let end = Instant::now() + Duration::from_secs(5);
         let mut news = Vec::new();
@@ -854,22 +895,16 @@ mod tests {
             got = live.drain();
         }
         assert_eq!(got[0].0, 3);
-        with_slow(|m| _ = m.remove(".test-late"));
     }
 
     #[test]
-    fn a_kind_the_shell_was_slow_for_is_remembered_and_one_that_answered_late_is_forgiven_after_a_while() {
-        assert_eq!(kind_of(&[PathBuf::from(r"C:\a\Duet.LNK"), PathBuf::from(r"C:\a\b.lnk")]), ".lnk");
-        assert_eq!(kind_of(&[PathBuf::from(r"C:\a\x.exe"), PathBuf::from(r"C:\a\y.txt")]), ".exe+.txt");
+    fn a_kind_the_shell_was_slow_for_is_remembered() {
+        assert_eq!(kind_of(&[PathBuf::from("C:/a/Duet.LNK"), PathBuf::from("C:/a/b.lnk")]), ".lnk");
+        assert_eq!(kind_of(&[PathBuf::from("C:/a/x.exe"), PathBuf::from("C:/a/y.txt")]), ".exe+.txt");
         let k = ".test-kind-a";
         assert!(!known_slow(k));
         mark_slow(k);
-        assert!(known_slow(k), "never answered: skipped from now on");
-        let j = ".test-kind-b";
-        note_answered(j);
-        assert!(known_slow(j));
-        with_slow(|m| _ = m.insert(j.into(), Some(Instant::now() - FORGIVE - Duration::from_secs(1))));
-        assert!(!known_slow(j), "forgiven");
+        assert!(known_slow(k), "skipped from now on");
         with_slow(|m| _ = m.remove(k));
     }
 
