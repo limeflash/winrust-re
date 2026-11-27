@@ -1112,8 +1112,10 @@ name = "wiztree"
 version = "0.1.0"
 dependencies = [
  "embed-resource",
+ "windows",
  "windows-sys",
  "winrust-common",
+ "winrust-ui",
 ]
 
 [[package]]

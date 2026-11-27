@@ -101,6 +101,10 @@ pub fn merge(recs: &mut HashMap<u32, Rec>, id: u32, r: Rec) {
     }
 }
 
+fn parse_slot(recs: &mut HashMap<u32, Rec>, idx: u32, slot: &mut [u8]) {
+    if let Some((base, r)) = parse(slot) { merge(recs, if base == 0 { idx } else { base as u32 }, r); }
+}
+
 /// The open volume, closed on every way out of `scan` (the error returns used to leave it open: a rescan leaked one each time).
 struct Volume(HANDLE);
 impl Drop for Volume {
@@ -109,7 +113,41 @@ impl Drop for Volume {
     }
 }
 
+/// Tells `progress` how far a scan is, about 48 times in all: at the start, after every `step` records, and at the end.
+struct Pace {
+    total: u64,
+    step: u64,
+    next: u64,
+    last: Option<u64>,
+}
+
+impl Pace {
+    fn new(total: u64) -> Self {
+        Self { total, step: total.div_ceil(48).max(1), next: 0, last: None }
+    }
+
+    /// `read` records are done: reports when a step has been passed (`read` may jump over a sparse hole).
+    fn at(&mut self, read: u64, progress: &mut dyn FnMut(u64, u64)) {
+        if read >= self.next {
+            progress(read.min(self.total), self.total);
+            self.last = Some(read.min(self.total));
+            self.next = read.saturating_add(self.step);
+        }
+    }
+
+    /// The scan ended after `read` records: the last report is the whole table, whatever was reported before.
+    fn end(&mut self, read: u64, progress: &mut dyn FnMut(u64, u64)) {
+        if self.last != Some(read.min(self.total)) {
+            progress(read.min(self.total), self.total);
+        }
+    }
+}
+
 pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
+    scan_with(drive, &mut |_, _| {})
+}
+
+pub fn scan_with(drive: char, progress: &mut dyn FnMut(u64, u64)) -> Result<HashMap<u32, Rec>, String> {
     let path: Vec<u16> = format!("\\\\.\\{drive}:").encode_utf16().chain([0]).collect();
     let h = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ptr::null(), OPEN_EXISTING, 0, ptr::null_mut()) };
     if h == INVALID_HANDLE_VALUE { return Err(tf!("не удалось открыть том {0}: (нужны права администратора), код {1}", "cannot open volume {0}: (run as administrator), error {1}", ja: "ボリューム {0}: を開けません (管理者として実行してください)、エラー {1}", pt: "não foi possível abrir o volume {0}: (execute como administrador), erro {1}", zh: "无法打开卷 {0}:（请以管理员身份运行），错误 {1}", drive, unsafe { GetLastError() })); }
@@ -127,6 +165,9 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
     let rec0 = out[12..12 + rs].to_vec();
     // the ioctl already hands back a record with the fixups undone (raw reads below do not)
     let runs = data_runs(&rec0).ok_or_else(|| t!("в записи $MFT нет потоков $DATA", "no $DATA runs in the $MFT record", ja: "$MFT レコードに $DATA のランがありません", pt: "não há runs $DATA no registro $MFT", zh: "$MFT 记录里没有 $DATA 数据运行").to_string())?;
+    let total = (vd.MftValidDataLength as u64) / rs as u64;
+    let mut pace = Pace::new(total);
+    pace.at(0, progress);
     let mut left = vd.MftValidDataLength as u64; // bytes of the table still to read
     let mut recs = HashMap::with_capacity(left as usize / rs / 2);
     let (mut idx, mut buf) = (0u32, vec![0u8; 4 << 20]);
@@ -134,7 +175,7 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
     for (lcn, clusters) in runs {
         let mut len = (clusters * cl).min(left);
         left -= len;
-        if lcn == 0 { idx += (len / rs as u64) as u32; continue; } // sparse hole
+        if lcn == 0 { idx += (len / rs as u64) as u32; pace.at(u64::from(idx), progress); continue; } // sparse hole
         let mut pos = (lcn * cl) as i64;
         while len > 0 {
             let want = len.min(buf.len() as u64) as usize;
@@ -144,26 +185,33 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
             for c in buf[..want].chunks_exact_mut(rs) {
                 seen += 1;
                 magic += (&c[..4] == b"FILE") as u32;
-                if let Some((base, r)) = parse(c) { merge(&mut recs, if base == 0 { idx } else { base as u32 }, r); }
+                parse_slot(&mut recs, idx, c);
                 idx += 1;
             }
+            pace.at(u64::from(idx), progress);
             pos += want as i64;
             len -= want as u64;
         }
     }
+    pace.end(u64::from(idx), progress);
     recs.retain(|_, r| !r.name.is_empty()); // no $FILE_NAME anywhere (e.g. attribute list in a record we never saw)
     eprintln!("mft: {seen} slots read, {magic} with FILE magic, {} named", recs.len());
     Ok(recs)
 }
 
+/// The path of a record. A chain that does not end at the root (a lost parent, a cycle, deeper than 128) has a `?` where it was cut,
+/// which no real name has: a path made of its last names alone would be a different, shorter one that something else is at.
 pub fn path_of(recs: &HashMap<u32, Rec>, mut id: u32, drive: char) -> (String, usize) {
     let mut parts = vec![];
+    let mut ended = false;
     for _ in 0..128 {
-        if id == ROOT { break; }
-        let Some(r) = recs.get(&id) else { parts.push("?".into()); break };
+        if id == ROOT { ended = true; break; }
+        let Some(r) = recs.get(&id) else { break };
         parts.push(r.name.clone());
         id = r.parent;
     }
+    ended |= id == ROOT;
+    if !ended { parts.push("?".into()); }
     let d = parts.len();
     parts.reverse();
     (format!("{drive}:\\{}", parts.join("\\")), d)
@@ -190,4 +238,89 @@ pub fn totals(recs: &HashMap<u32, Rec>, logical: bool) -> HashMap<u32, u64> {
         }
     }
     tot
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn progress_is_about_48_steps_from_nothing_to_the_whole_table() {
+        // a table of 2,050,112 records read in chunks of 4,096, with a sparse hole in the middle
+        let total = 2_050_112u64;
+        let (mut pace, mut seen) = (Pace::new(total), Vec::new());
+        let mut note = |r: u64, t: u64| seen.push((r, t));
+        pace.at(0, &mut note);
+        let mut read = 0u64;
+        while read < total {
+            read = if read == 1_000_000 { 1_300_000 } else { (read + 4096).min(total) };
+            pace.at(read, &mut note);
+        }
+        pace.end(read, &mut note);
+        assert_eq!(seen.first(), Some(&(0, total)));
+        assert_eq!(seen.last(), Some(&(total, total)));
+        assert!((45..=52).contains(&seen.len()), "{} reports", seen.len());
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 == w[1].1), "never goes back");
+        // a table of one record still says where it started and that it ended
+        let (mut pace, mut one) = (Pace::new(1), Vec::new());
+        pace.at(0, &mut |r, t| one.push((r, t)));
+        pace.at(1, &mut |r, t| one.push((r, t)));
+        pace.end(1, &mut |r, t| one.push((r, t)));
+        assert_eq!(one.first(), Some(&(0, 1)));
+        assert_eq!(one.last(), Some(&(1, 1)));
+    }
+
+    #[test]
+    fn parsed_slots_match_with_and_without_progress() {
+        fn run(progress: &mut dyn FnMut(u64, u64)) -> HashMap<u32, Rec> {
+            let mut slots = vec![vec![0u8; 1024]; 3];
+            for slot in &mut slots {
+                slot[..4].copy_from_slice(b"FILE");
+                slot[4..6].copy_from_slice(&48u16.to_le_bytes());
+                slot[6..8].copy_from_slice(&1u16.to_le_bytes());
+                slot[0x14..0x16].copy_from_slice(&56u16.to_le_bytes());
+                slot[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+                slot[0x18..0x1c].copy_from_slice(&64u32.to_le_bytes());
+                slot[56..60].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            }
+            let mut recs = HashMap::new();
+            for (i, slot) in slots.iter_mut().enumerate() { parse_slot(&mut recs, i as u32, slot); progress(i as u64 + 1, 3); }
+            recs
+        }
+        let a = run(&mut |_, _| {});
+        let mut calls = Vec::new();
+        let b = run(&mut |read, total| calls.push((read, total)));
+        assert_eq!(a.len(), 3);
+        for (id, r) in a { let other = &b[&id]; assert_eq!((&r.name, r.parent, r.dir, r.alloc, r.logical), (&other.name, other.parent, other.dir, other.alloc, other.logical)); }
+        assert_eq!(calls.last(), Some(&(3, 3)));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn chain(n: u32) -> HashMap<u32, Rec> {
+        let mut r = HashMap::new();
+        r.insert(ROOT, Rec { parent: ROOT, name: ".".into(), dir: true, alloc: 0, logical: 0 });
+        for i in 0..n { r.insert(100 + i, Rec { parent: if i == 0 { ROOT } else { 99 + i }, name: format!("d{i}"), dir: true, alloc: 0, logical: 0 }); }
+        r
+    }
+
+    #[test]
+    fn a_path_that_was_cut_says_so_and_never_looks_like_a_shorter_whole_one() {
+        // 100 deep: the whole path; 200 deep, a cycle and a lost parent: cut, with a `?` that no name has
+        let ok = chain(100);
+        let (p, d) = path_of(&ok, 199, 'C');
+        assert!(p.starts_with("C:\\d0\\d1\\") && p.ends_with("\\d99") && !p.contains('?') && d == 100);
+        let deep = chain(200);
+        let (p, _) = path_of(&deep, 299, 'C');
+        assert!(p.starts_with("C:\\?\\"), "{p}");
+        let mut cyc = chain(3);
+        cyc.get_mut(&100).unwrap().parent = 102;
+        assert!(path_of(&cyc, 102, 'C').0.starts_with("C:\\?\\"));
+        let mut lost = chain(3);
+        lost.get_mut(&100).unwrap().parent = 7777;
+        assert!(path_of(&lost, 102, 'C').0.starts_with("C:\\?\\"));
+        assert_eq!(path_of(&lost, ROOT, 'C').0, "C:\\");
+    }
 }
