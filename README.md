@@ -47,16 +47,16 @@ If UAC asks for **another administrator's** password, the per-user settings (sta
 
 **Automatic updates:** after the first install, a `WinRust-update` scheduled task (runs as SYSTEM, no UAC prompt) checks the latest release at boot and once a day. It downloads the new `WinRust.exe` (and any program a release ships on its own), checks each file against a manifest signed with the project's key (a tampered or unsigned release is refused); the new `WinRust.exe` then replaces the installed programs that differ from the ones it carries. Only files that are already installed are replaced. A running program switches to the new version the next time it starts (sign-in or reboot). Log: `%ProgramData%\plugin-launcher\install.log` (`autoupdate:` lines). To turn it off, disable the `WinRust-update` task in Task Scheduler; **Remove WinRust** deletes it.
 
-**Manual update:** download the new `WinRust.exe` from the releases page, run it as administrator and press **Update** on the Express card (it reinstalls what is installed and adds what is missing), or use Custom. An existing `rust-explorer` stays ticked. Your settings and the saved original Windows values stay.
+**Manual update:** download the new `WinRust.exe` from the releases page, run it as administrator and press **Update** in the footer (it reinstalls what is installed); switch on what is missing and press Install to add it. An existing `rust-explorer` stays on. Your settings and the saved original Windows values stay.
 
-The installer is in English. Its corner holds a language drop-down — English, Русский, 日本語, Português (Brasil), 简体中文; the same list sits behind the gear on the bar (**Bar settings → Language**), and rust-settings has it on its Personalization page (**Interface language**). The choice is stored in `%ProgramData%\WinRust\lang.txt` (`en`, `ru`, `ja`, `pt`, `zh`); the program you switch in repaints at once, the other programs read it when they start, so restart them (or sign out) after a change.
+The installer is in English. Its title bar holds a language switch — English, Русский, 日本語, Português (Brasil), 简体中文; the same list sits behind the gear on the bar (**Bar settings → Language**), and rust-settings has it on its Personalization page (**Interface language**). The choice is stored in `%ProgramData%\WinRust\lang.txt` (`en`, `ru`, `ja`, `pt`, `zh`); the program you switch in repaints at once, the other programs read it when they start, so restart them (or sign out) after a change.
 
 ## Remove
 
-- **Remove WinRust** on the installer's first page undoes everything: Windows Search, the taskbar, Explorer and the services come back.
-- Without the installer (for example, antivirus deleted it): **Settings → Apps → Installed apps → WinRust → Uninstall** does the same as Remove WinRust.
+- **Remove all** in the installer's footer undoes everything: Windows Search, the taskbar, Explorer and the services come back.
+- Without the installer (for example, antivirus deleted it): **Settings → Apps → Installed apps → WinRust → Uninstall** does the same as Remove all.
 - One plugin at a time: `plugin-launcher uninstall <plugin>` (see [Command line](#command-line)).
-- **If the screen is left without a taskbar or desktop:** press Ctrl+Alt+Del → Task Manager → Run new task → `explorer.exe`, then run the installer and press Remove WinRust.
+- **If the screen is left without a taskbar or desktop:** press Ctrl+Alt+Del → Task Manager → Run new task → `explorer.exe`, then run the installer and press Remove all.
 
 On uninstall, `rust-explorer` restores the service startup values and the svchost grouping threshold saved before installation. Older installs without those backups keep their current values and report a warning.
 
@@ -142,9 +142,9 @@ What changed: the bar follows window events instead of listing every window twic
 ### Layout
 ```
 src/            the installer (plugin-launcher.exe)
-  main.rs         the plugin table PLUGINS: name, texts, install/uninstall pair, icon
+  main.rs         the plugin table PLUGINS: name, warning, install/uninstall pair; the window's backend
   install/        what each plugin changes and how it is undone (one file per plugin)
-  cli.rs, ui.rs   the command line and the window; both call the same install functions
+  cli.rs, ui/       the command line and the window; both call the same install functions
 common/         winrust-common: language switch (t!/tf!: English, Russian, Japanese, Brazilian Portuguese), UI styles and palettes, reg.exe output parser, NTFS MFT reader
 plugins/        sources of every plugin, each its own crate
 ReShell/        reshell (desktop hotkeys, topbar safety net), ships with topbar

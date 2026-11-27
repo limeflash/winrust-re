@@ -127,7 +127,7 @@ O que mudou: a barra segue os eventos das janelas em vez de listar todas as jane
 src/            o instalador (plugin-launcher.exe)
   main.rs         a tabela de plugins PLUGINS: nome, textos, par instalar/desinstalar, ícone
   install/        o que cada plugin altera e como é desfeito (um arquivo por plugin)
-  cli.rs, ui.rs   a linha de comando e a janela; ambos chamam as mesmas funções de instalação
+  cli.rs, ui/       a linha de comando e a janela; ambos chamam as mesmas funções de instalação
 common/         winrust-common: troca de idioma (t!/tf!: inglês, russo, japonês, português do Brasil, chinês simplificado), estilos e paletas da interface, analisador da saída do reg.exe, leitor da MFT do NTFS
 plugins/        fontes de cada plugin, cada um em seu próprio crate
 ReShell/        reshell (atalhos da área de trabalho, rede de segurança da topbar), vem com a topbar
