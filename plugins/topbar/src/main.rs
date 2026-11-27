@@ -47,6 +47,7 @@ use winrust_ui::pacing;
 mod notify;
 #[allow(dead_code)]
 mod rec;
+mod peek;
 use ui::bar::{self as barui, keys::*};
 use {tray::*, status::*, run::*, shot::*, lang::*, settings::*, qs::*, wins::*};
 use windows::{
@@ -250,7 +251,8 @@ unsafe fn tip_text(h: i32) -> String {
         TAPP => "Hidden icons".into(),
         REC_I => t!("Остановить запись (Win+Shift+R)", "Stop and save (Win+Shift+R)", ja: "録画を停止して保存 (Win+Shift+R)", pt: "Parar e salvar (Win+Shift+R)", zh: "停止并保存 (Win+Shift+R)").into(),
         GEAR => t!("Настройки панели", "Bar settings", ja: "バーの設定", pt: "Configurações da barra", zh: "任务栏设置").into(),
-        SHOWDESK => t!("Показать рабочий стол", "Show desktop", ja: "デスクトップを表示", pt: "Mostrar a área de trabalho", zh: "显示桌面").into(),
+        SHOWDESK if desk_on() => t!("Вернуть окна · Win+D · наведите, чтобы заглянуть", "Bring the windows back · Win+D · hover to peek", ja: "ウィンドウを元に戻す · Win+D · ポイントでプレビュー", pt: "Trazer as janelas de volta · Win+D · aponte para espiar", zh: "还原窗口 · Win+D · 悬停以预览").into(),
+        SHOWDESK => t!("Показать рабочий стол · Win+D · наведите, чтобы заглянуть", "Show desktop · Win+D · hover to peek", ja: "デスクトップを表示 · Win+D · ポイントでプレビュー", pt: "Mostrar a área de trabalho · Win+D · aponte para espiar", zh: "显示桌面 · Win+D · 悬停以预览").into(),
         CLOCK => {
             let mut t: SYSTEMTIME = zeroed();
             GetLocalTime(&mut t);
@@ -1255,6 +1257,52 @@ unsafe fn desktop_now(bar: &bars::BarCx) -> bool {
     bar.btns.borrow().iter().flat_map(|b| &b.wins).all(|&w| IsIconic(w) != 0)
 }
 
+/// The windows are away because of "Show desktop" and nothing has been opened since: the button is "on", the next press brings
+/// them back (a window opened since means it minimizes again, like Win+D).
+unsafe fn desk_on_for(_bar: &bars::BarCx) -> bool {
+    winrust_common::desktop::away() && bars::all().iter().all(|b| desktop_now(b))
+}
+
+unsafe fn desk_on() -> bool {
+    bars::main_bar().is_some_and(|b| desk_on_for(&b))
+}
+
+thread_local! {
+    static PEEK: RefCell<peek::Peek> = RefCell::new(peek::Peek::default());
+}
+
+/// The pointer is on / came off the show-desktop button of `bar`: the peek is due in 550 ms, or ends.
+unsafe fn peek_hover(bar: HWND, over: bool) {
+    if over {
+        PEEK.with_borrow_mut(|p| p.enter(now_ms(), desk_on()));
+        SetTimer(bar, 12, peek::DELAY_MS as u32, None);
+    } else {
+        KillTimer(bar, 12);
+        peek_end();
+    }
+}
+
+unsafe fn peek_end() {
+    if PEEK.with_borrow_mut(|p| p.stop()) {
+        peek::end();
+    }
+}
+
+/// The timer of the peek: the pointer rested on the button.
+unsafe fn peek_tick(bar: HWND) {
+    KillTimer(bar, 12);
+    let still = bars::of(bar).is_some_and(|b| b.hot.get() == SHOWDESK);
+    if still && PEEK.with_borrow_mut(|p| p.tick(now_ms(), desk_on())) && !peek::begin(bar) {
+        PEEK.with_borrow_mut(|p| p.stop()); // DWM cannot do it here: the hover look stays, nothing fades
+    }
+}
+
+/// The click: the peek ends first (the windows are back), then Win+D: minimize what is open, or bring back exactly those.
+unsafe fn show_desktop() {
+    peek_end();
+    winrust_common::desktop::toggle();
+}
+
 /// Looks at every bar's monitor: a fullscreen window hides that bar (and only that one), the desktop in front lets it slide away
 /// and the pointer at its edge brings it back.
 unsafe fn fs_update(_hwnd: HWND) {
@@ -1617,6 +1665,7 @@ unsafe fn build_view(bar: &bars::BarCx) -> barui::View {
         unread: notify::with(|s| s.badge()).unwrap_or(0),
         dnd: notify::with(|s| s.dnd()),
         rec: if full { snip::rec_time() } else { None },
+        desk_on: desk_on_for(bar),
     }
 }
 
@@ -2330,7 +2379,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 menus::bar_menu("clock", a);
             }
         }
-        SHOWDESK if left => winrust_common::desktop::toggle(),
+        SHOWDESK if left => show_desktop(),
         POW_R | POW_S if left => power_click(h),
         GEAR => settings_toggle(),
         TAPP..=-900 => {
@@ -2499,6 +2548,7 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 }
             }
         }
+        WM_TIMER if wp == 12 => peek_tick(hwnd),
         WM_TIMER if wp == 9 => preview_tick(hwnd),
         WM_TIMER if wp == 10 => reopen(hwnd),
         WM_TIMER if wp == 11 => vdesk::step(hwnd),
@@ -2590,7 +2640,11 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let h = hit(&bar, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             TrackMouseEvent(&mut tme);
-            if bar.hot.replace(h) != h {
+            let before = bar.hot.replace(h);
+            if before != h {
+                if before == SHOWDESK || h == SHOWDESK {
+                    peek_hover(hwnd, h == SHOWDESK);
+                }
                 hide_tip(hwnd);
                 if h != NONE {
                     let has_wins = h >= 1 && btn_at(h).is_some_and(|b| !b.1.is_empty());
@@ -2615,6 +2669,7 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_MOUSELEAVE => {
             hide_tip(hwnd);
+            peek_hover(hwnd, false);
             if let Some(b) = bars::of(hwnd) {
                 b.hot.set(NONE);
             }

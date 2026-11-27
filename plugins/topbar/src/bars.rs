@@ -304,6 +304,11 @@ unsafe fn create(mon: Mon, main: bool) -> Option<Rc<BarCx>> {
     RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: hi, lpszClassName: shc.as_ptr(), ..zeroed() });
     let shadow = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | ui::gfx::window_ex_through(), shc.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null());
     ui::gfx::through(whwnd(shadow));
+    // DWM's peek at the desktop (hovering the show-desktop button) keeps the bar on screen, as it does Windows' own taskbar
+    for w in [hwnd, shadow] {
+        let on = 1u32;
+        windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(w, 12 /* DWMWA_EXCLUDED_FROM_PEEK */, std::ptr::from_ref(&on).cast(), 4);
+    }
     let mut renderer = barui::Bar::new(scale).ok();
     if let Some(r) = renderer.as_mut() {
         r.set_origin((mon.rect.0, mon.rect.1));

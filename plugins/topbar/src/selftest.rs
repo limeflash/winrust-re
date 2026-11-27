@@ -128,6 +128,7 @@ fn view(style: Style, side: Side, apps: Vec<barui::AppView>) -> View {
         unread: 0,
         dnd: false,
         rec: None,
+        desk_on: false,
     }
 }
 
