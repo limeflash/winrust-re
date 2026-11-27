@@ -18,11 +18,18 @@ pub enum How {
     Permanently,
 }
 
-/// What may be handed to the shell: an absolute path of something inside a drive, which no part of is a `?` (what a broken scan
-/// shows for a folder it lost). Never a drive's root.
+/// A name the shell would read as another one: it drops a trailing dot or space (`report.txt.` is `report.txt`), `:` starts a data
+/// stream, and `? * < > | "` and control characters are no part of a name (a `?` is what a broken scan shows for a folder it lost).
+fn odd_name(n: &std::ffi::OsStr) -> bool {
+    let s = n.to_string_lossy();
+    s.ends_with(['.', ' ']) || s.chars().any(|c| c.is_control() || "?*<>|\":".contains(c))
+}
+
+/// What may be handed to the shell: an absolute path of something inside a drive, every part of which is a plain name (see
+/// [`odd_name`]). Never a drive's root.
 fn allowed(p: &Path) -> bool {
     let mut parts = p.components();
-    matches!(parts.next(), Some(Component::Prefix(_))) && matches!(parts.next(), Some(Component::RootDir)) && parts.clone().next().is_some() && parts.all(|c| matches!(c, Component::Normal(n) if n != "?"))
+    matches!(parts.next(), Some(Component::Prefix(_))) && matches!(parts.next(), Some(Component::RootDir)) && parts.clone().next().is_some() && parts.all(|c| matches!(c, Component::Normal(n) if !odd_name(n)))
 }
 
 /// What Windows or every account needs, refused even when confirmed (this program runs as administrator): the system folders at a
@@ -41,15 +48,36 @@ fn protected(p: &Path) -> bool {
     }
 }
 
-/// A path the deleter accepts: see [`allowed`] and [`protected`]. The app asks before it shows the dialog.
+/// Why a path is not deleted from here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// It is not a whole path of a drive's file or folder (a scan lost a folder on the way, or the way is too deep to have been followed).
+    Incomplete,
+    /// Windows or every account needs it.
+    Protected,
+}
+
+/// Why the deleter would say no to `p`, if it would. The app asks before it shows the dialog.
+pub fn refusal(p: &Path) -> Option<Refusal> {
+    if !allowed(p) {
+        Some(Refusal::Incomplete)
+    } else if protected(p) {
+        Some(Refusal::Protected)
+    } else {
+        None
+    }
+}
+
+/// A path the deleter accepts: see [`allowed`] and [`protected`].
+#[cfg(test)]
 pub fn deletable(p: &Path) -> bool {
-    allowed(p) && !protected(p)
+    refusal(p).is_none()
 }
 
 /// Deletes `paths`. Blocks until the shell is done, so call it from a worker thread. `confirmed` is the dialog's answer: without it
 /// nothing is touched. Fails when any path is not [`deletable`], before the shell has been asked about any, and when something is
-/// still there afterwards.
-pub fn delete(paths: &[PathBuf], how: How, confirmed: bool) -> Result<(), String> {
+/// still there afterwards. `owner` is the window the shell's own questions (the bin is too small: delete for good?) are modal to, 0 for none.
+pub fn delete(paths: &[PathBuf], how: How, confirmed: bool, owner: isize) -> Result<(), String> {
     if !confirmed {
         return Err("Deletion requires confirmation".into());
     }
@@ -78,6 +106,9 @@ pub fn delete(paths: &[PathBuf], how: How, confirmed: bool) -> Result<(), String
             How::Permanently => FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
         };
         fo.SetOperationFlags(flags).map_err(|e| e.to_string())?;
+        if owner != 0 {
+            fo.SetOwnerWindow(windows::Win32::Foundation::HWND(owner as *mut _)).map_err(|e| e.to_string())?;
+        }
         for p in &paths {
             let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
             let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(|e| e.to_string())?;
@@ -113,7 +144,7 @@ mod tests {
         let p = d.join("file");
         std::fs::write(&p, b"hello").unwrap();
         for how in [How::Permanently, How::RecycleBin] {
-            assert!(delete(std::slice::from_ref(&p), how, false).is_err());
+            assert!(delete(std::slice::from_ref(&p), how, false, 0).is_err());
             assert!(p.exists());
         }
         std::fs::remove_dir_all(d).unwrap();
@@ -128,7 +159,7 @@ mod tests {
         std::fs::write(dir.join("inner").join("x.bin"), [0u8; 1000]).unwrap();
         let keep = d.join("keep");
         std::fs::write(&keep, b"stays").unwrap();
-        delete(&[f.clone(), dir.clone()], How::Permanently, true).unwrap();
+        delete(&[f.clone(), dir.clone()], How::Permanently, true, 0).unwrap();
         assert!(!f.exists() && !dir.exists());
         assert!(keep.exists(), "what was not asked for stays");
         std::fs::remove_dir_all(d).unwrap();
@@ -141,11 +172,11 @@ mod tests {
         std::fs::write(&keep, b"stays").unwrap();
         // a drive's root, the drive without a slash, a relative path, a lost folder, a parent step, nothing at all
         for bad in ["C:\\", "C:", "keep", "C:\\?\\x.bin", "C:\\a\\..\\b", ""] {
-            assert!(delete(&[PathBuf::from(bad)], How::Permanently, true).is_err(), "{bad:?}");
+            assert!(delete(&[PathBuf::from(bad)], How::Permanently, true, 0).is_err(), "{bad:?}");
         }
-        assert!(delete(&[], How::Permanently, true).is_err());
+        assert!(delete(&[], How::Permanently, true, 0).is_err());
         // one bad path among good ones: none is deleted
-        assert!(delete(&[keep.clone(), PathBuf::from("C:\\")], How::Permanently, true).is_err());
+        assert!(delete(&[keep.clone(), PathBuf::from("C:\\")], How::Permanently, true, 0).is_err());
         assert!(keep.exists());
         assert!(allowed(&keep) && allowed(Path::new("D:\\x")) && !allowed(Path::new("D:\\")));
         std::fs::remove_dir_all(d).unwrap();
@@ -156,11 +187,33 @@ mod tests {
         for bad in ["C:\\Windows", "C:\\windows\\System32", "C:\\Windows\\WinSxS", "C:\\Program Files", "C:\\Program Files (x86)", "C:\\ProgramData", "C:\\Users", "C:\\Users\\Daniiar", "C:\\$MFT", "C:\\System Volume Information", "C:\\Recovery"] {
             assert!(!deletable(Path::new(bad)), "{bad}");
             // refused before the shell hears of it: these paths are never touched
-            assert_eq!(delete(&[PathBuf::from(bad)], How::Permanently, true), Err("Windows needs it".into()), "{bad}");
+            assert_eq!(delete(&[PathBuf::from(bad)], How::Permanently, true, 0), Err("Windows needs it".into()), "{bad}");
         }
         for ok in ["C:\\Windows\\SoftwareDistribution\\Download", "C:\\Users\\Daniiar\\Downloads", "C:\\Program Files\\Some Game", "C:\\Games", "D:\\Videos\\a.mkv"] {
             assert!(deletable(Path::new(ok)), "{ok}");
         }
+    }
+
+    #[test]
+    fn a_name_the_shell_would_read_as_another_is_refused_and_the_other_one_stays() {
+        let d = temp();
+        let real = d.join("report.txt");
+        std::fs::write(&real, b"keep me").unwrap();
+        for tail in ["report.txt.", "report.txt ", "report.txt. .", "report.txt:stream", "rep*rt.txt"] {
+            let p = PathBuf::from(format!("{}\\{tail}", d.display()));
+            assert!(!allowed(&p), "{tail}");
+            assert!(delete(&[p], How::Permanently, true, 0).is_err(), "{tail}");
+            assert!(real.exists(), "{tail} took report.txt with it");
+        }
+        assert!(allowed(&d.join("report.txt")) && allowed(&d.join(".git")) && allowed(&d.join("a b.txt")), "plain names, a leading dot and an inner space are fine");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_says_why() {
+        assert_eq!(refusal(Path::new("C:\\?\\x")), Some(Refusal::Incomplete));
+        assert_eq!(refusal(Path::new("C:\\Users")), Some(Refusal::Protected));
+        assert_eq!(refusal(Path::new("C:\\Games\\x")), None);
     }
 
     /// Touches the real Recycle Bin of the user: run by hand (`cargo test -- --ignored`).
@@ -170,7 +223,7 @@ mod tests {
         let d = temp();
         let p = d.join("file");
         std::fs::write(&p, b"hello").unwrap();
-        delete(std::slice::from_ref(&p), How::RecycleBin, true).unwrap();
+        delete(std::slice::from_ref(&p), How::RecycleBin, true, 0).unwrap();
         assert!(!p.exists());
         std::fs::remove_dir_all(d).unwrap();
     }

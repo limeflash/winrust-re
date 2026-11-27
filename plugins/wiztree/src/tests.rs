@@ -184,7 +184,7 @@ impl Backend for Refuses {
     fn scan(&self, drive: char, slow: bool, progress: &mut dyn FnMut(u64, u64)) -> Result<DiskData, String> {
         self.0.scan(drive, slow, progress)
     }
-    fn delete(&self, _: &[PathBuf], _: How, _: bool) -> Result<(), String> {
+    fn delete(&self, _: &[PathBuf], _: How, _: bool, _: isize) -> Result<(), String> {
         Err("access denied".into())
     }
     fn reveal(&self, _: &str) {}

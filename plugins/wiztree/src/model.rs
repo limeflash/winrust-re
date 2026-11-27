@@ -268,7 +268,10 @@ impl DiskData {
         for (id, s) in &sums {
             // the biggest share; a tie goes to the earlier category, so a drive reads the same twice
             let best = (0..N_CATS).rev().max_by_key(|&k| s[k]).unwrap_or(N_CATS - 1);
-            cat[*id as usize] = best as u8;
+            // (a folder the table lost is named by its children and is no record: nothing to colour)
+            if let Some(slot) = cat.get_mut(*id as usize) {
+                *slot = best as u8;
+            }
         }
         Self { tree, drive, cat, counts, totals: all }
     }
@@ -348,21 +351,48 @@ impl DiskData {
         self.tree.kids.get(&dir).into_iter().flatten().take(n.min(300)).filter_map(|id| self.tree.tot.get(id).map(|&size| (*id, size))).collect()
     }
 
+    /// What is under `id` by category (the files themselves), if it is a whole tree: `id` hangs from the root by a chain of at most 128
+    /// folders, and below it nothing comes back to a folder already seen nor goes deeper than 128. A broken scan (a parent that is its
+    /// own child) is none, and nothing of it is taken off or deleted.
+    fn subtree_cats(&self, id: u32) -> Option<[u64; N_CATS]> {
+        let mut up = id;
+        for _ in 0..128 {
+            if up == ROOT {
+                break;
+            }
+            up = self.tree.recs.get(&up)?.parent;
+        }
+        if up != ROOT {
+            return None;
+        }
+        let mut cats = [0u64; N_CATS];
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(id, 0u32)];
+        while let Some((n, depth)) = stack.pop() {
+            if depth > 128 || !seen.insert(n) {
+                return None;
+            }
+            match self.tree.kids.get(&n) {
+                Some(ks) => stack.extend(ks.iter().map(|&k| (k, depth + 1))),
+                None => cats[self.category(n) as usize] += self.size(n),
+            }
+        }
+        Some(cats)
+    }
+
+    /// `remove` would take `id`: it is a whole tree (see `subtree_cats`).
+    #[must_use]
+    pub fn can_remove(&self, id: u32) -> bool {
+        id != ROOT && self.tree.recs.contains_key(&id) && self.subtree_cats(id).is_some()
+    }
+
     /// Takes `id` and everything under it off the tree and off every total above it (the folder, its parents, the drive, the
-    /// legend). None for the root and for what is not here.
+    /// legend). None for the root, for what is not here and for what is not a whole tree.
     pub fn remove(&mut self, id: u32) -> Option<Removed> {
         let parent = self.tree.recs.get(&id).filter(|_| id != ROOT)?.parent;
         let pos = self.tree.kids.get(&parent)?.iter().position(|&k| k == id)?;
         let size = self.size(id);
-        // what is under it, by category (the files themselves); how many there are is what the counts already say
-        let mut cats = [0u64; N_CATS];
-        let mut stack = vec![id];
-        while let Some(n) = stack.pop() {
-            match self.tree.kids.get(&n) {
-                Some(ks) => stack.extend(ks.iter().copied()),
-                None => cats[self.category(n) as usize] += self.size(n),
-            }
-        }
+        let cats = self.subtree_cats(id)?;
         let (files, dirs) = if self.is_dir(id) { (self.counts(id).0, self.counts(id).1 + 1) } else { (1, 0) };
         self.tree.kids.get_mut(&parent)?.remove(pos);
         self.shift(parent, size, (files, dirs), &cats, false);
@@ -610,6 +640,35 @@ mod tests {
         assert_eq!((d.used(), d.size(12), d.counts(ROOT), d.totals, d.children(13)), before);
         assert!(d.remove(ROOT).is_none() && d.remove(999).is_none());
         assert!(d.remove(14).is_some() && d.remove(14).is_none(), "a second removal of the same thing is nothing");
+    }
+
+    #[test]
+    fn a_broken_chain_of_parents_is_refused_and_does_not_hang() {
+        // two folders that are each other's parent, as a damaged file table can say, with a file in one of them
+        let mut r = HashMap::new();
+        r.insert(ROOT, rec(ROOT, ".", true, 0));
+        r.insert(20, rec(21, "a", true, 0));
+        r.insert(21, rec(20, "b", true, 0));
+        r.insert(22, rec(21, "f.bin", false, 10));
+        let mut d = DiskData::read(build(r), 'C');
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let before = d.size(21);
+            let can = (d.can_remove(20), d.can_remove(22));
+            let gone = d.remove(20).is_some();
+            let _ = tx.send((can, gone, d.size(21) == before));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("remove did not come back: a cycle hangs it");
+        assert_eq!(got, ((false, false), false, true), "refused, and nothing was taken off");
+        // a tree that is too deep to be followed to the root is refused as well
+        let mut r = HashMap::new();
+        r.insert(ROOT, rec(ROOT, ".", true, 0));
+        for i in 0..200u32 {
+            r.insert(100 + i, rec(if i == 0 { ROOT } else { 99 + i }, "d", true, 0));
+        }
+        r.insert(900, rec(299, "f.bin", false, 5));
+        let d = DiskData::read(build(r), 'C');
+        assert!(!d.can_remove(900) && !d.can_remove(299), "too deep to follow to the root");
     }
 
     #[test]

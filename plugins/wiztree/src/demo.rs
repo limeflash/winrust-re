@@ -314,6 +314,8 @@ pub struct Fake {
 pub struct Log {
     pub scans: Vec<(char, bool)>,
     pub deletes: Vec<(Vec<PathBuf>, How, bool)>,
+    /// The owner window each deletion was given.
+    pub owners: Vec<isize>,
     pub reveals: Vec<String>,
     pub elevations: Vec<char>,
 }
@@ -341,8 +343,11 @@ impl Backend for Fake {
         Ok(mock_data(drive))
     }
 
-    fn delete(&self, paths: &[PathBuf], how: How, confirmed: bool) -> Result<(), String> {
-        self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).deletes.push((paths.to_vec(), how, confirmed));
+    fn delete(&self, paths: &[PathBuf], how: How, confirmed: bool, _owner: isize) -> Result<(), String> {
+        let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.deletes.push((paths.to_vec(), how, confirmed));
+        log.owners.push(_owner);
+        drop(log);
         if confirmed { Ok(()) } else { Err("not confirmed".into()) }
     }
 

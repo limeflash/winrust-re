@@ -199,14 +199,19 @@ pub fn scan_with(drive: char, progress: &mut dyn FnMut(u64, u64)) -> Result<Hash
     Ok(recs)
 }
 
+/// The path of a record. A chain that does not end at the root (a lost parent, a cycle, deeper than 128) has a `?` where it was cut,
+/// which no real name has: a path made of its last names alone would be a different, shorter one that something else is at.
 pub fn path_of(recs: &HashMap<u32, Rec>, mut id: u32, drive: char) -> (String, usize) {
     let mut parts = vec![];
+    let mut ended = false;
     for _ in 0..128 {
-        if id == ROOT { break; }
-        let Some(r) = recs.get(&id) else { parts.push("?".into()); break };
+        if id == ROOT { ended = true; break; }
+        let Some(r) = recs.get(&id) else { break };
         parts.push(r.name.clone());
         id = r.parent;
     }
+    ended |= id == ROOT;
+    if !ended { parts.push("?".into()); }
     let d = parts.len();
     parts.reverse();
     (format!("{drive}:\\{}", parts.join("\\")), d)
@@ -287,5 +292,35 @@ mod progress_tests {
         assert_eq!(a.len(), 3);
         for (id, r) in a { let other = &b[&id]; assert_eq!((&r.name, r.parent, r.dir, r.alloc, r.logical), (&other.name, other.parent, other.dir, other.alloc, other.logical)); }
         assert_eq!(calls.last(), Some(&(3, 3)));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn chain(n: u32) -> HashMap<u32, Rec> {
+        let mut r = HashMap::new();
+        r.insert(ROOT, Rec { parent: ROOT, name: ".".into(), dir: true, alloc: 0, logical: 0 });
+        for i in 0..n { r.insert(100 + i, Rec { parent: if i == 0 { ROOT } else { 99 + i }, name: format!("d{i}"), dir: true, alloc: 0, logical: 0 }); }
+        r
+    }
+
+    #[test]
+    fn a_path_that_was_cut_says_so_and_never_looks_like_a_shorter_whole_one() {
+        // 100 deep: the whole path; 200 deep, a cycle and a lost parent: cut, with a `?` that no name has
+        let ok = chain(100);
+        let (p, d) = path_of(&ok, 199, 'C');
+        assert!(p.starts_with("C:\\d0\\d1\\") && p.ends_with("\\d99") && !p.contains('?') && d == 100);
+        let deep = chain(200);
+        let (p, _) = path_of(&deep, 299, 'C');
+        assert!(p.starts_with("C:\\?\\"), "{p}");
+        let mut cyc = chain(3);
+        cyc.get_mut(&100).unwrap().parent = 102;
+        assert!(path_of(&cyc, 102, 'C').0.starts_with("C:\\?\\"));
+        let mut lost = chain(3);
+        lost.get_mut(&100).unwrap().parent = 7777;
+        assert!(path_of(&lost, 102, 'C').0.starts_with("C:\\?\\"));
+        assert_eq!(path_of(&lost, ROOT, 'C').0, "C:\\");
     }
 }

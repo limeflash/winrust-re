@@ -139,6 +139,9 @@ struct Job {
     id: u32,
     name: String,
     size: u64,
+    /// Which tree `id` is in, and which drive the path is on: a rescan or another drive in the meantime must not take it for its own.
+    epoch: u64,
+    drive: char,
 }
 
 /// What was moved to the Recycle Bin from the screen but still waits for its toast to end (so that Undo is nothing but a redraw).
@@ -154,6 +157,7 @@ struct Sent {
     ticket: u64,
     removed: Removed,
     name: String,
+    epoch: u64,
 }
 
 /// What a state of the design needs by hand.
@@ -226,6 +230,10 @@ pub struct Disk {
     pub side_h: f32,
     /// How long what was moved to the Recycle Bin waits for its toast (a test makes it short).
     pub bin_delay_ms: u64,
+    /// Which tree the data is: a new one each time it is dropped or replaced (a scan, another drive).
+    tree_epoch: u64,
+    /// What was said while the toast of an armed Recycle Bin deletion had to stay (it has the Undo).
+    queued: Vec<(String, bool, bool)>,
 }
 
 fn columns() -> Columns {
@@ -287,6 +295,8 @@ impl Disk {
             building: false,
             side_h: 0.0,
             bin_delay_ms: TOAST_MS + 200,
+            tree_epoch: 0,
+            queued: Vec::new(),
         }
     }
 
@@ -414,6 +424,7 @@ impl Disk {
     /// Reads the drive on screen from the beginning: on a worker, with what it finds coming back through the inbox.
     pub fn start_scan(&mut self) {
         let Some(d) = self.cur().cloned() else { return };
+        self.retire_tree();
         let slow = self.slow_for(&d);
         self.scan_gen += 1;
         let epoch = self.scan_gen;
@@ -463,6 +474,7 @@ impl Disk {
     }
 
     fn after_drive_change(&mut self) {
+        self.retire_tree();
         self.sel = None;
         self.dlg = None;
         self.zoom = None;
@@ -510,6 +522,7 @@ impl Disk {
                     }
                     match result {
                         Ok(d) => {
+                            self.tree_epoch += 1;
                             self.data = Some(*d);
                             self.data_gen += 1;
                             self.phase = Phase::Ready;
@@ -568,9 +581,41 @@ impl Disk {
         self.data.as_ref().map_or_else(String::new, |d| d.path(id))
     }
 
+    /// A toast. While a deletion to the Recycle Bin is armed its toast, which has the Undo, stays: what else there is to say waits for it.
     fn say(&mut self, text: impl Into<String>, undo: bool, ok: bool) {
+        if self.pending.is_some() {
+            if self.queued.len() < 4 {
+                self.queued.push((text.into(), undo, ok));
+            }
+            return;
+        }
         self.toast_serial += 1;
         self.toast = Some(Toast { text: text.into(), undo, ok, born: None, serial: self.toast_serial });
+    }
+
+    /// A plain message, as Copy path says one (the clipboard is the host's, so a test says it directly).
+    #[cfg(test)]
+    pub fn say_for_test(&mut self, text: &str) {
+        self.say(text, false, true);
+    }
+
+    /// The Undo of a deletion is over: its toast goes, and the newest of what waited for it is said.
+    fn undo_over(&mut self) {
+        if self.toast.as_ref().is_some_and(|t| t.undo) {
+            self.toast = None;
+        }
+        if self.pending.is_none()
+            && let Some((text, undo, ok)) = self.queued.pop()
+        {
+            self.queued.clear();
+            self.say(text, undo, ok);
+        }
+    }
+
+    /// The data is about to be dropped or replaced: what waits for its Undo goes to the bin now, against the tree it was taken from.
+    fn retire_tree(&mut self) {
+        self.flush_pending();
+        self.tree_epoch += 1;
     }
 
     // -----------------------------------------------------------------------------------------------------------------
@@ -582,9 +627,15 @@ impl Disk {
         if !d.tree.recs.contains_key(&id) || id == ROOT {
             return;
         }
-        if !crate::delete::deletable(std::path::Path::new(&d.path(id))) {
-            let name = d.name(id).to_string();
-            self.say(format!("Windows needs {name}: it isn’t deleted from here"), false, false);
+        let name = d.name(id).to_string();
+        let refused = match crate::delete::refusal(std::path::Path::new(&d.path(id))) {
+            Some(crate::delete::Refusal::Protected) => Some(format!("Windows needs {name}: it isn’t deleted from here")),
+            Some(crate::delete::Refusal::Incomplete) => Some(format!("The path of {name} is incomplete (the scan lost a folder on the way): it isn’t deleted from here")),
+            None if !d.can_remove(id) => Some(format!("The records of {name} don’t add up (the scan is damaged): it isn’t deleted from here")),
+            None => None,
+        };
+        if let Some(text) = refused {
+            self.say(text, false, false);
             return;
         }
         let parent = d.tree.recs[&id].parent;
@@ -600,7 +651,8 @@ impl Disk {
         let ticket = self.ticket;
         match dlg.how {
             How::Permanently => {
-                self.job = Some(Job { ticket, id: dlg.id, name: dlg.name, size: dlg.size });
+                let drive = self.data.as_ref().map_or(self.letter(), |d| d.drive);
+                self.job = Some(Job { ticket, id: dlg.id, name: dlg.name, size: dlg.size, epoch: self.tree_epoch, drive });
                 self.run_delete(ticket, path, How::Permanently);
             }
             How::RecycleBin => {
@@ -622,7 +674,7 @@ impl Disk {
     fn run_delete(&self, ticket: u64, path: PathBuf, how: How) {
         let (be, inbox, hwnd) = (self.be.clone(), self.inbox.clone(), self.hwnd);
         self.be.spawn(Box::new(move || {
-            let result = be.delete(&[path], how, true);
+            let result = be.delete(&[path], how, true, hwnd);
             inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Event::Deleted { ticket, result });
             if hwnd != 0 {
                 winrust_ui::window::post(hwnd, MSG_WAKE, 0, 0);
@@ -639,25 +691,32 @@ impl Disk {
     fn flush_pending(&mut self) {
         let Some(p) = self.pending.take() else { return };
         self.ticket += 1;
-        self.sent.push(Sent { ticket: self.ticket, removed: p.removed, name: p.name });
+        self.sent.push(Sent { ticket: self.ticket, removed: p.removed, name: p.name, epoch: self.tree_epoch });
         let ticket = self.ticket;
         self.run_delete(ticket, p.path, How::RecycleBin);
+        self.undo_over();
     }
 
     fn deleted(&mut self, ticket: u64, result: Result<(), String>) {
-        if let Some(j) = self.job.take().filter(|j| j.ticket == ticket) {
+        // the answer of the job in flight, and only of it: another deletion's answer (a bin's) is not this job's
+        if self.job.as_ref().is_some_and(|j| j.ticket == ticket) {
+            let Some(j) = self.job.take() else { return };
             match result {
                 Ok(()) => {
-                    if self.data.as_mut().is_some_and(|d| d.remove(j.id).is_some()) {
+                    // the tree it was in is still the one on screen
+                    let here = j.epoch == self.tree_epoch;
+                    if here && self.data.as_mut().is_some_and(|d| d.remove(j.id).is_some()) {
                         self.data_gen += 1;
                     }
-                    // what was deleted for good is free on the drive now
-                    if let Some(d) = self.drives.get_mut(self.drive) {
+                    // what was deleted for good is free on the drive its path names
+                    if let Some(d) = self.drives.iter_mut().find(|d| d.letter == j.drive) {
                         d.free = d.free.saturating_add(j.size).min(d.total);
                     }
-                    self.sel = None;
-                    self.zoom = Some(Zoom::Fade);
-                    self.zoom_serial += 1;
+                    if here {
+                        self.sel = None;
+                        self.zoom = Some(Zoom::Fade);
+                        self.zoom_serial += 1;
+                    }
                     self.say(format!("{} freed · {} deleted", human(j.size), j.name), false, true);
                 }
                 Err(e) => self.say(format!("Couldn’t delete {}: {e}", j.name), false, false),
@@ -667,8 +726,10 @@ impl Disk {
         if let Some(i) = self.sent.iter().position(|s| s.ticket == ticket) {
             let s = self.sent.remove(i);
             if let Err(e) = result {
-                // the shell refused: what was taken off the screen is back
-                if let Some(d) = self.data.as_mut() {
+                // the shell refused: what was taken off the screen is back, if the tree it was taken from is the one on screen
+                if s.epoch == self.tree_epoch
+                    && let Some(d) = self.data.as_mut()
+                {
                     d.restore(&s.removed);
                     self.data_gen += 1;
                 }
@@ -686,7 +747,7 @@ impl Disk {
             self.zoom = Some(Zoom::Fade);
             self.zoom_serial += 1;
         }
-        self.toast = None;
+        self.undo_over();
     }
 
     // -----------------------------------------------------------------------------------------------------------------
@@ -1093,7 +1154,7 @@ impl App for Disk {
     fn close(&mut self, _cx: &mut Cx) -> bool {
         // what is waiting for its toast to end goes to the bin now: the process ends with the window, and nothing may be left half done
         if let Some(p) = self.pending.take() {
-            let _ = self.be.delete(&[p.path], How::RecycleBin, true);
+            let _ = self.be.delete(&[p.path], How::RecycleBin, true, self.hwnd);
         }
         true
     }

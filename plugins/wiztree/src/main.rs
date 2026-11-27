@@ -19,6 +19,8 @@ mod look;
 mod model;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_review;
 
 use std::sync::Arc;
 

@@ -3,6 +3,7 @@
 //! on a fake that touches nothing; only [`Real`] ever reads a drive or deletes a file.
 use std::{
     collections::HashMap,
+    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
 };
@@ -46,8 +47,8 @@ pub trait Backend: Send + Sync {
     /// Reads a whole drive. `slow` walks the folders instead of reading the NTFS file table. `progress(done, of)`. Blocks: call it
     /// from a worker.
     fn scan(&self, drive: char, slow: bool, progress: &mut dyn FnMut(u64, u64)) -> Result<DiskData, String>;
-    /// See [`delete::delete`]; blocks too.
-    fn delete(&self, paths: &[PathBuf], how: How, confirmed: bool) -> Result<(), String>;
+    /// See [`delete::delete`]; blocks too. `owner` is the window the shell's own questions are modal to.
+    fn delete(&self, paths: &[PathBuf], how: How, confirmed: bool, owner: isize) -> Result<(), String>;
     /// Shows `path` in the file manager.
     fn reveal(&self, path: &str);
     /// Starts this program again with administrator rights (the UAC prompt) for `drive`; whether the user agreed.
@@ -112,8 +113,8 @@ impl Backend for Real {
         Ok(DiskData::read(build(recs), drive))
     }
 
-    fn delete(&self, paths: &[PathBuf], how: How, confirmed: bool) -> Result<(), String> {
-        delete::delete(paths, how, confirmed)
+    fn delete(&self, paths: &[PathBuf], how: How, confirmed: bool, owner: isize) -> Result<(), String> {
+        delete::delete(paths, how, confirmed, owner)
     }
 
     fn reveal(&self, path: &str) {
@@ -145,10 +146,14 @@ pub fn walk(root: &Path, used: u64, progress: &mut dyn FnMut(u64, u64)) -> HashM
     while let Some((dir, parent)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for e in entries.flatten() {
-            let Ok(kind) = e.file_type() else { continue };
-            if kind.is_symlink() {
-                continue;
+            // The entry's own attributes, not its target's: a link to a folder of any kind (symlink, junction, mount point) is not
+            // walked, what it points at is somewhere else on the map and deleting the link takes the link alone. A file that is a
+            // reparse point (a OneDrive placeholder, a deduplicated file) is a file like any other.
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.file_type().is_symlink() || (meta.is_dir() && meta.file_attributes() & 0x400 != 0) {
+                continue; // 0x400: FILE_ATTRIBUTE_REPARSE_POINT
             }
+            let kind = meta.file_type();
             let id = next;
             next += 1;
             let name = e.file_name().to_string_lossy().into_owned();
@@ -156,7 +161,7 @@ pub fn walk(root: &Path, used: u64, progress: &mut dyn FnMut(u64, u64)) -> HashM
                 recs.insert(id, Rec { parent, name, dir: true, alloc: 0, logical: 0 });
                 stack.push((e.path(), id));
             } else {
-                let len = e.metadata().map_or(0, |m| m.len());
+                let len = meta.len();
                 // ponytail: a 4 KB cluster for every drive; exFAT cards have bigger ones, the sizes are a little short there
                 let alloc = len.div_ceil(4096) * 4096;
                 recs.insert(id, Rec { parent, name, dir: false, alloc, logical: len });
@@ -192,6 +197,26 @@ mod tests {
         assert_eq!(t.kids[&ROOT].len(), 2, "the folder and the file of some size; the empty file is no tile");
         assert_eq!(seen.last(), Some(&(4, 4)), "it ends with the whole count");
         assert!(t.recs.keys().all(|&id| id == ROOT || id >= 16));
+    }
+
+    #[test]
+    fn a_junction_is_a_link_and_is_not_followed_like_a_symlink() {
+        let d = std::env::temp_dir().join(format!("winrust-disk-junction-{}", std::process::id()));
+        let (real, other) = (d.join("real"), d.join("other"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(real.join("big.bin"), [0u8; 9000]).unwrap();
+        std::fs::write(other.join("own.bin"), [0u8; 10]).unwrap();
+        // a directory junction needs no rights: `mklink /J`
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(other.join("link")).arg(&real).output().is_ok_and(|o| o.status.success());
+        assert!(made, "the junction could not be made");
+        let t = build(walk(&other, 0, &mut |_, _| {}));
+        let removed = std::fs::remove_dir(other.join("link")); // (only the link goes, never what it points at)
+        let still = real.join("big.bin").exists();
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(removed.is_ok() && still);
+        assert_eq!(t.tot[&ROOT], 4096, "only the folder's own file: nothing of what the junction points to is under it");
+        assert!(t.recs.values().all(|r| r.name != "big.bin" && r.name != "link"), "the link is not on the map at all");
     }
 
     #[test]
