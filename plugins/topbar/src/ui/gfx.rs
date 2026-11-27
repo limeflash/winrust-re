@@ -2029,6 +2029,19 @@ impl Canvas<'_> {
                 cm.SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32, D2D1_PROPERTY_TYPE_MATRIX_5X4, &bytes).ok()?;
                 out = cm.GetOutput().ok()?;
             }
+            // Light glass over a dark desktop: a light tint at the design's alpha over the blurred picture comes out muddy grey.
+            // Like the light acrylic of Windows, the blurred picture is first lifted towards white, so the glass reads frosted
+            // and still lets the colours through.
+            let lift = if winrust_common::style::light() { 0.5 } else { 0.0 };
+            if lift > 0.0 {
+                let k = 1.0 - lift;
+                let m = [k, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 0.0, 1.0, lift, lift, lift, 0.0];
+                let bytes: Vec<u8> = m.iter().flat_map(|v: &f32| v.to_le_bytes()).collect();
+                let cm = ctx.CreateEffect(&CLSID_D2D1ColorMatrix).ok()?;
+                cm.SetInput(0, &out, true);
+                cm.SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32, D2D1_PROPERTY_TYPE_MATRIX_5X4, &bytes).ok()?;
+                out = cm.GetOutput().ok()?;
+            }
             let baked = rt.CreateCompatibleRenderTarget(Some(&size), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE).ok()?;
             let bctx = baked.cast::<ID2D1DeviceContext>().ok()?;
             bctx.BeginDraw();
