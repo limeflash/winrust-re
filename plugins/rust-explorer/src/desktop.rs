@@ -18,6 +18,17 @@ pub(crate) fn reload_wall() {
     let old = WALL.replace((wall::load(vx, vy, cw, ch), cw, ch)).0;
     if old != 0 { unsafe { windows_sys::Win32::Graphics::Gdi::DeleteObject(old as _) }; }
 }
+/// The wallpaper changed (Settings, the Photo viewer): rs-shell, which owns the conversion, makes the new BMP off the UI
+/// thread (a second or two), then the window paints it (WM_WALL). Without rs-shell next to us nothing changes, as before.
+pub(crate) fn wallpaper_changed(h: HWND) {
+    let h = h as isize;
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        let Some(exe) = env::current_exe().ok().map(|e| e.with_file_name("rs-shell.exe")).filter(|e| e.exists()) else { return };
+        let made = std::process::Command::new(exe).arg("--wallpaper").creation_flags(0x0800_0000).status().is_ok_and(|s| s.success()); // CREATE_NO_WINDOW
+        if made { unsafe { PostMessageW(h as HWND, WM_WALL, 0, 0) }; }
+    });
+}
 /// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
 fn work_strips() -> (i32, i32) {
     let mut r: RECT = unsafe { std::mem::zeroed() };

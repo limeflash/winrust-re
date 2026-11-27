@@ -94,6 +94,7 @@ static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
 const WM_DIRSIZE: u32 = WM_APP + 7; // folder-size worker -> UI: wp = Box<(era, folder name, bytes)> (#147)
+const WM_WALL: u32 = WM_APP + 8; // desktop: rs-shell made the new wallpaper BMP, paint it
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
@@ -1261,7 +1262,15 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     InvalidateRect(h, ptr::null(), 1);
                 } else if wp == SPI_SETWORKAREA as usize {
                     place_desk_list(ST.with_borrow(|st| st.list));
+                } else if wp == SPI_SETDESKWALLPAPER as usize {
+                    wallpaper_changed(h); // Settings or the Photo viewer set a new picture
                 }
+                0
+            }
+            WM_WALL if desk() => {
+                use windows_sys::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow};
+                reload_wall();
+                RedrawWindow(h, ptr::null(), ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
                 0
             }
             // mouse buttons 4 / 5 (and keyboard media keys) arrive as APPCOMMAND_BROWSER_BACKWARD / _FORWARD

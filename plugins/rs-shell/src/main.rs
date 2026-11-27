@@ -193,6 +193,13 @@ fn wallpaper_bmp() -> Option<PathBuf> {
     bmp.is_file().then_some(bmp)
 }
 
+/// `rs-shell --wallpaper`: the rust-explorer desktop asks for a new BMP after the wallpaper changed (Settings, the Photo
+/// viewer). The old conversion goes first: the new picture may be older than it, and `wallpaper_bmp` would keep it.
+fn refresh_wallpaper() {
+    if let Some(bmp) = bmp_copy() { let _ = std::fs::remove_file(bmp); }
+    let _ = wallpaper_bmp();
+}
+
 fn bmp_copy() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|b| PathBuf::from(b).join("rs-shell").join("wallpaper.bmp"))
 }
@@ -466,6 +473,7 @@ fn main() {
     let code = match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => { if !bootstrap() { run_shell(); } 0 }
         ["--overlay"] => { overlay(); 0 }
+        ["--wallpaper"] => { refresh_wallpaper(); 0 }
         ["--dry-run"] => {
             println!("wallpaper: {:?}", reg(&["query", r"HKCU\Control Panel\Desktop", "/v", "WallPaper"]).map(|o| parse_run(&o)));
             autostart().iter().for_each(|c| println!("autostart: {c}"));
