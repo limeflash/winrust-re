@@ -6,7 +6,11 @@
 //! Under `cargo test` the default is the demo one too, so a test that forgets to pick a source still touches nothing.
 use std::{cell::RefCell, rc::Rc};
 
-use crate::{audio, bt, display, ext, net, power, sys, wifi, wu};
+use crate::{
+    audio, bt, display, ext,
+    more::{Cap, Consent, Flag, Gauge, Layout, NotifyApp, Opt, Security},
+    net, power, sys, sysx, wifi, wu,
+};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
@@ -141,6 +145,31 @@ pub trait Os {
     fn set_lang(&self, l: winrust_common::Lang) -> bool;
     /// Picks the demo's picture `k` of the Personalization page (nothing in the real one: it has only the picker).
     fn wallpaper_select(&self, k: usize);
+
+    // ---- Notifications, Privacy & security, Keyboard & mouse, Date & time (more.rs)
+    /// The entries of a list and the current one.
+    fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>);
+    /// Picks entry `i`; false when Windows did not take it (usually: it needs administrator rights).
+    fn opt_set(&self, o: Opt, i: usize) -> bool;
+    fn gauge(&self, g: Gauge) -> Option<f32>;
+    fn gauge_set(&self, g: Gauge, v: f32);
+    fn flag(&self, f: &Flag) -> Option<bool>;
+    fn flag_set(&self, f: &Flag, on: bool) -> bool;
+    fn notify_apps(&self) -> Vec<NotifyApp>;
+    fn notify_set(&self, id: &str, mode: usize) -> bool;
+    fn consent(&self, cap: Cap) -> Consent;
+    fn security(&self) -> Security;
+    /// Starts Defender's quick scan off the window's thread; `done` says it ended.
+    fn quick_scan(&self, done: Ping);
+    fn open_security(&self);
+    fn layouts(&self) -> Vec<Layout>;
+    /// The bar's clock as the formats say it now.
+    fn clock_text(&self) -> String;
+    fn region_text(&self) -> String;
+    fn numbers_text(&self) -> String;
+    /// The line under "Sync now".
+    fn time_server(&self) -> String;
+    fn time_sync(&self, done: Note);
 
     // ---- the window
     /// Called once at the start of a normal run (COM for the volume).
@@ -456,6 +485,60 @@ impl Os for Live {
         winrust_common::set_lang(l)
     }
     fn wallpaper_select(&self, _k: usize) {}
+    fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>) {
+        sysx::opt_list(o)
+    }
+    fn opt_set(&self, o: Opt, i: usize) -> bool {
+        sysx::opt_set(o, i)
+    }
+    fn gauge(&self, g: Gauge) -> Option<f32> {
+        sysx::gauge(g)
+    }
+    fn gauge_set(&self, g: Gauge, v: f32) {
+        sysx::gauge_set(g, v);
+    }
+    fn flag(&self, f: &Flag) -> Option<bool> {
+        sysx::flag(f)
+    }
+    fn flag_set(&self, f: &Flag, on: bool) -> bool {
+        sysx::flag_set(f, on)
+    }
+    fn notify_apps(&self) -> Vec<NotifyApp> {
+        sysx::notify_apps()
+    }
+    fn notify_set(&self, id: &str, mode: usize) -> bool {
+        sysx::notify_set(id, mode)
+    }
+    fn consent(&self, cap: Cap) -> Consent {
+        sysx::consent(cap)
+    }
+    fn security(&self) -> Security {
+        sysx::security()
+    }
+    fn quick_scan(&self, done: Ping) {
+        sysx::quick_scan(done);
+    }
+    fn open_security(&self) {
+        sysx::open_security();
+    }
+    fn layouts(&self) -> Vec<Layout> {
+        sysx::layouts()
+    }
+    fn clock_text(&self) -> String {
+        sysx::clock_text()
+    }
+    fn region_text(&self) -> String {
+        sysx::region_text()
+    }
+    fn numbers_text(&self) -> String {
+        sysx::numbers_text()
+    }
+    fn time_server(&self) -> String {
+        sysx::time_server()
+    }
+    fn time_sync(&self, done: Note) {
+        sysx::time_sync(done);
+    }
     fn init(&self) {
         audio::init();
     }

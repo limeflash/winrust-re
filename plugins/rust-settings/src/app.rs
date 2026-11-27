@@ -21,7 +21,7 @@ use winrust_ui::{
 use windows_sys::Win32::NetworkManagement::WiFi::wlan_notification_acm_connection_complete;
 
 use crate::{
-    Cmd, Done, GAct, Line, Op, Page, Row, audio, choices, choose, display, finish_confirm, forget_programs, listed, os::{Note, Ping, os}, page, pages, search, slider_value, toggle_adapter, wifi,
+    Cmd, Done, GAct, Line, Op, Page, Row, audio, choices, choose, display, finish_confirm, forget_programs, is_seg, listed, more, os::{Note, Ping, os}, page, pages, search, slider_value, toggle_adapter, wifi,
     APPS_PAGE, BT_PAGE, CONFIRM_SECS, NET_PAGE, PAGES, PERSONALIZE, POWER_PAGE,
 };
 
@@ -35,7 +35,7 @@ pub const ID_PROFILE: Id = 3;
 pub const ID_SEARCH: Id = 200; // and 201, its clear button
 pub const ID_AQ: Id = 202; // the Apps page's own search box, and 203, its clear button
 pub const ID_NAV: Id = 10; // + the page
-pub const ID_SCROLL: Id = 20; // and 21, its bar
+pub const ID_SCROLL: Id = 40; // and 41, its bar
 pub const ID_DLG_SCRIM: Id = 30;
 pub const ID_DLG_REVERT: Id = 31;
 pub const ID_DLG_KEEP: Id = 32;
@@ -102,6 +102,8 @@ pub enum Fid {
     Pass2,
     Proxy,
     Pac,
+    /// The Keyboard page's "Try it" field (nothing is done with what is typed).
+    Try,
 }
 
 pub struct Fields {
@@ -111,11 +113,12 @@ pub struct Fields {
     pub pass2: TextField,
     pub proxy: TextField,
     pub pac: TextField,
+    pub tryit: TextField,
 }
 
 impl Fields {
     fn new() -> Self {
-        Self { user: TextField::new(), pass: TextField::password(), ssid: TextField::new(), pass2: TextField::password(), proxy: TextField::new(), pac: TextField::new() }
+        Self { user: TextField::new(), pass: TextField::password(), ssid: TextField::new(), pass2: TextField::password(), proxy: TextField::new(), pac: TextField::new(), tryit: TextField::new() }
     }
 
     pub fn get(&mut self, f: Fid) -> &mut TextField {
@@ -126,6 +129,7 @@ impl Fields {
             Fid::Pass2 => &mut self.pass2,
             Fid::Proxy => &mut self.proxy,
             Fid::Pac => &mut self.pac,
+            Fid::Try => &mut self.tryit,
         }
     }
 
@@ -155,6 +159,8 @@ pub enum Hold {
     Volume(audio::Src),
     /// The night-light strength.
     Night,
+    /// A gauge of the Keyboard page.
+    Gauge,
 }
 
 /// The countdown of a display change that waits for "Keep".
@@ -191,6 +197,8 @@ pub struct Settings {
     pub pairing: Option<String>,
     pub pin_err: Option<String>,
     pub cleaning: bool,
+    /// "Sync now" is waiting for the time service.
+    pub syncing: bool,
     pub confirm: Option<Confirm>,
     pub arr: Option<ArrDrag>,
     pub mons: Vec<display::Mon>,
@@ -256,6 +264,7 @@ impl Settings {
             pairing: None,
             pin_err: None,
             cleaning: false,
+            syncing: false,
             confirm: None,
             arr: None,
             mons: Vec::new(),
@@ -431,6 +440,7 @@ impl Settings {
                 let m = crate::lang_note(written);
                 self.say(m, cx);
             }
+            Done::Denied => self.say(denied(), cx),
         }
         self.read_page();
         cx.invalidate();
@@ -544,7 +554,22 @@ impl Settings {
                     }
                     Cmd::Check => o.wu_check(ping()),
                     Cmd::Install => o.wu_install(ping()),
-                    Cmd::Uninstall(_) | Cmd::BtUnpair(_) => {}
+                    Cmd::NotifyMode(id, mode) => {
+                        if !o.notify_set(&id, mode) {
+                            self.say(denied(), cx);
+                        }
+                    }
+                    Cmd::PrivGo(cap) => {
+                        more::set_pv_tab(cap);
+                        self.reveal = Some("pvtab".into());
+                    }
+                    Cmd::QuickScan => o.quick_scan(ping()),
+                    Cmd::OpenSecurity => o.open_security(),
+                    Cmd::SyncTime => {
+                        self.syncing = true;
+                        o.time_sync(note());
+                    }
+                    Cmd::NotifyApp(_) | Cmd::Uninstall(_) | Cmd::BtUnpair(_) => {}
                 }
             }
         }
@@ -710,6 +735,7 @@ impl Settings {
             Op(Op),
             Flip(&'static str, &'static str, u32),
             Cmd(Cmd),
+            Flag(more::Flag),
             WifiConnect(wifi::Net),
             Adapter(String),
             Forget(String),
@@ -720,16 +746,21 @@ impl Settings {
         }
         let seg = (P_SEG..P_SEG + 8).contains(&part);
         let act = match (&line.row, part) {
+            (Row::Toggle { .. }, P_CTL) if line.dis => Do::Nothing,
             (Row::Toggle { key, name, on_when, .. }, P_CTL) => Do::Flip(key, name, if line.on == Some(true) { 1 - on_when } else { *on_when }),
             (Row::Switch(_, _, op), P_CTL) if line.on.is_some() => Do::Op(*op),
             (Row::Cycle(_, _, Op::Primary), P_CTL) => Do::Op(Op::Primary),
-            (Row::Cycle(_, _, op @ (Op::Topology | Op::Plan)), p) if seg => Do::Choose(*op, (p - P_SEG) as usize),
+            (Row::Flag(_, f), P_CTL) if line.on.is_some() && !line.dis => Do::Flag(f.clone()),
+            (Row::Cycle(_, _, op), p) if seg && (matches!(op, Op::Topology | Op::Plan) || is_seg(*op)) => Do::Choose(*op, (p - P_SEG) as usize),
             (Row::Cycle(_, _, Op::Hidden), P_BODY) => Do::Toggle,
             (Row::Cycle(_, _, Op::Hidden), P_ACT) => Do::Hidden,
             (Row::Cycle(_, _, op), P_CTL) if listed(*op) && !matches!(op, Op::Night | Op::Topology) => Do::Pick(*op),
             (Row::Slider(..), P_MUTE) => line.mute.map_or(Do::Nothing, |(op, _)| Do::Op(op)),
-            (Row::Item(_, _, Cmd::BtUnpair(_)), P_BODY) => Do::Toggle,
+            (Row::Item(_, _, Cmd::BtUnpair(_) | Cmd::NotifyApp(_)), P_BODY) => Do::Toggle,
+            (Row::Item(_, _, Cmd::NotifyApp(id)), p) if p >= P_ACT => Do::Cmd(Cmd::NotifyMode(id.clone(), (p - P_ACT) as usize)),
+            (Row::Item(_, _, cmd @ (Cmd::PrivGo(_) | Cmd::OpenSecurity)), P_BODY) => Do::Cmd(cmd.clone()),
             (Row::Item(_, _, cmd @ Cmd::BtUnpair(_)), P_ACT) => Do::Cmd(cmd.clone()),
+            (Row::Item(_, _, Cmd::SyncTime), P_CTL) if self.syncing => Do::Nothing,
             (Row::Item(..), P_CTL) if line.restart => Do::Later,
             (Row::Item(..), P_CTL2) if line.restart => Do::Restart,
             (Row::Item(_, _, cmd), P_CTL) if !line.busy && !(matches!(cmd, Cmd::BtPair(_)) && self.pairing.is_some()) => Do::Cmd(cmd.clone()),
@@ -759,6 +790,13 @@ impl Settings {
             Do::Choose(op, i) => self.pick_value(op, i, cx),
             Do::Op(op) => self.do_op(op, cx),
             Do::Flip(k, n, v) => self.flip(k, n, v, cx),
+            Do::Flag(f) => {
+                let on = os().flag(&f).unwrap_or(false);
+                if !os().flag_set(&f, !on) {
+                    self.say(denied(), cx);
+                }
+                self.read_page();
+            }
             Do::Cmd(c) => self.run_cmd(&key, &label, c, cx),
             Do::WifiConnect(n) => self.wifi_connect(&n, cx),
             Do::Adapter(name) => {
@@ -784,6 +822,17 @@ impl Settings {
                 os().audio_set_volume(src, v);
                 self.hold = Some(Hold::Volume(src));
                 self.set_vol_cache(flat, v);
+            }
+            Row::Gauge(_, g) => {
+                let g = *g;
+                os().gauge_set(g, v);
+                self.hold = Some(Hold::Gauge);
+                if let Some(&(gi, r)) = self.flat.get(flat)
+                    && let Some(l) = self.pg.groups.get_mut(gi).and_then(|g| g.rows.get_mut(r))
+                {
+                    l.vol = os().gauge(g);
+                    l.sub = more::gauge_text(g, l.vol);
+                }
             }
             Row::Cycle(_, _, Op::Night) => {
                 // four steps from Low to Maximum
@@ -852,6 +901,11 @@ impl Settings {
     }
 }
 
+/// What the toast says when Windows did not take a change.
+fn denied() -> String {
+    t!("Windows не приняла изменение: возможно, нужны права администратора", "Windows did not take that change \u{b7} it may need administrator rights").into()
+}
+
 /// The copy of a network (`wifi::Net` is Clone; this keeps the call sites short).
 fn clone_net(n: &wifi::Net) -> wifi::Net {
     n.clone()
@@ -891,7 +945,7 @@ pub fn page_sig(pg: &Page) -> String {
             _ => {}
         }
         for l in &g.rows {
-            let _ = write!(s, "{{{}|{}|{}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}", l.key, l.sub, l.val, l.on, l.vol, l.busy, l.bars, l.row.label(), l.cur, l.badge);
+            let _ = write!(s, "{{{}|{}|{}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{}", l.key, l.sub, l.val, l.on, l.vol, l.busy, l.bars, l.row.label(), l.cur, l.badge, l.dis);
             if let Row::Adapter(a, open) = &l.row {
                 let _ = write!(s, "|{}{open}", a.summary());
             }
@@ -911,7 +965,7 @@ impl App for Settings {
     }
 
     fn min_size(&self) -> (f32, f32) {
-        (720.0, 480.0)
+        (720.0, 640.0) // the sidebar of thirteen pages ends at 620: every page stays in reach
     }
 
     fn caption_height(&self) -> f32 {
@@ -999,7 +1053,7 @@ impl App for Settings {
             _ => {}
         }
         self.hold = None;
-        for f in [Fid::User, Fid::Pass, Fid::Ssid, Fid::Pass2, Fid::Proxy, Fid::Pac] {
+        for f in [Fid::User, Fid::Pass, Fid::Ssid, Fid::Pass2, Fid::Proxy, Fid::Pac, Fid::Try] {
             self.fields.get(f).mouse_up();
         }
         if let Some(d) = self.arr.take() {
@@ -1263,6 +1317,7 @@ impl App for Settings {
                 // SAFETY: `note()` posted a `Box<String>` for this message and nobody else takes it back.
                 let m = *unsafe { Box::from_raw(lp as *mut String) };
                 self.cleaning = false;
+                self.syncing = false;
                 self.say(m, cx);
                 self.refresh(cx);
                 cx.invalidate();
@@ -1415,6 +1470,7 @@ impl Settings {
             Row::Cycle(_, _, Op::Hidden) if self.open.as_deref() == Some(l.key.as_str()) => vec![Fid::Ssid, Fid::Pass2],
             Row::Cycle(_, _, Op::Proxy) => vec![Fid::Proxy],
             Row::Cycle(_, _, Op::Pac) => vec![Fid::Pac],
+            Row::Cycle(_, _, Op::Try) => vec![Fid::Try],
             _ => Vec::new(),
         }
     }
@@ -1424,6 +1480,7 @@ impl Settings {
             Fid::Proxy => self.commit_proxy(false, cx),
             Fid::Pac => self.commit_proxy(true, cx),
             Fid::Ssid | Fid::Pass2 => self.connect_hidden(cx),
+            Fid::Try => {}
             Fid::User | Fid::Pass => {
                 let n = self.open.as_deref().and_then(|k| self.pg.groups.iter().flat_map(|g| &g.rows).find(|l| l.key == k)).and_then(|l| if let Row::Wifi(n, _) = &l.row { Some(clone_net(n)) } else { None });
                 if let Some(n) = n {
