@@ -331,6 +331,101 @@ pub fn msg() -> u32 {
     }
 }
 
+/// Light or dark: one flag per process, dark until a program sets it. The topbar follows Windows (`follow_system` at start and on
+/// the "ImmersiveColorSet" `WM_SETTINGCHANGE`); `pal()` and the colour tokens below read it, so one switch repaints everything.
+static LIGHT: AtomicU8 = AtomicU8::new(0);
+
+pub fn light() -> bool {
+    LIGHT.load(Relaxed) == 1
+}
+
+/// Sets the mode of this process; true when it changed.
+pub fn set_light(on: bool) -> bool {
+    LIGHT.swap(on as u8, Relaxed) != on as u8
+}
+
+pub const PERSONALIZE: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+/// What `SystemUsesLightTheme` says: light only when it is 1 (a missing value keeps the dark bar the shell always had).
+pub fn light_from(dword: Option<u32>) -> bool {
+    dword == Some(1)
+}
+
+/// Reads Windows' choice into this process (once at start, and again on the "ImmersiveColorSet" broadcast); true when it changed.
+pub fn follow_system() -> bool {
+    set_light(light_from(crate::reg::get_dword(PERSONALIZE, "SystemUsesLightTheme")))
+}
+
+/// Switches this process now and Windows after it: writes `SystemUsesLightTheme` and `AppsUseLightTheme` (apps follow, like the
+/// system switch) and broadcasts "ImmersiveColorSet" from a thread of its own (the broadcast waits for every window).
+pub fn set_system_light(on: bool) {
+    set_light(on);
+    crate::reg::set_dword(PERSONALIZE, "SystemUsesLightTheme", on as u32);
+    crate::reg::set_dword(PERSONALIZE, "AppsUseLightTheme", on as u32);
+    std::thread::spawn(|| {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
+        let what: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
+        // SAFETY: `what` outlives the call, which waits (at most 200 ms per window) for the receivers.
+        unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 200, std::ptr::null_mut()) };
+    });
+}
+
+/// True when the `WM_SETTINGCHANGE` a window got says "ImmersiveColorSet" (`lparam` is a wide string, or null).
+///
+/// # Safety
+/// `lparam` is the message's own: null, or a NUL-terminated UTF-16 string valid for the call.
+pub unsafe fn is_color_change(lparam: isize) -> bool {
+    let p = lparam as *const u16;
+    let want = "ImmersiveColorSet";
+    // SAFETY: the string ends with NUL, and the loop stops at the first difference, so nothing past that NUL is read.
+    !p.is_null() && unsafe { want.encode_utf16().enumerate().all(|(i, w)| *p.add(i) == w) && *p.add(want.len()) == 0 }
+}
+
+/// The colour tokens of the mockup (`--ink`, `--t1`.., `--s16_17_24`.., `--h0b0d14`..): every literal dark colour of the design
+/// became a variable named after it, and light mode redefines the variable. Here a colour built from a dark literal
+/// (`Rgba::css`, `Rgba::hex`) remembers its token, and the renderer swaps in the light value while `light()` is on.
+/// (dark RRGGBB, light RRGGBB); entry 0 is `--ink`, the white of hover fills and rings (only `Rgba::white` is it), entry 1 the
+/// white that the design turned into `--t1` (selected labels: only `Rgba::strong` is it).
+pub const TOKENS: &[(u32, u32)] = &[
+    (0xffffff, 0x14161e),
+    (0xffffff, 0x1b1d23),
+    // text: --t1, --t1b, --t2, --t3, --t4, --t1c; then the near twins the mockup folded into --t3, --t1b and --t4
+    (0xeceef4, 0x1b1d23), (0xc9cdd8, 0x343844), (0xa3a9b8, 0x4a4f5c), (0x8a90a2, 0x6a7080), (0x6f7486, 0x8d93a1), (0xe6e8f0, 0xd8dbe3),
+    (0x9aa0b0, 0x6a7080), (0xc4c8d2, 0x343844), (0x7d8394, 0x8d93a1),
+    // surfaces the design wrote as rgba(r,g,b,a): --s12_13_18, --s16_17_24, --s27_28_34, --s20_21_28, --s30_31_38, --s12_13_17,
+    // --s24_25_31, --s20_21_27, --s18_19_26, --s10_11_16, --s5_7_12
+    (0x0c0d12, 0xf5f6f8), (0x101118, 0xf3f4f6), (0x1b1c22, 0xeeeff1), (0x14151c, 0xf1f2f4), (0x1e1f26, 0xedeef0), (0x0c0d11, 0xf5f6f8),
+    (0x18191f, 0xeff0f2), (0x14151b, 0xf1f2f4), (0x12131a, 0xf2f3f5), (0x0a0b10, 0xf6f7f9), (0x05070c, 0xeceef4),
+    // surfaces the design wrote as #rrggbb: --h0b0d14, --h1d1e24, --h26272f, --h2a2b33, ...
+    (0x0b0d14, 0xf5f6f8), (0x1d1e24, 0xedeef0), (0x26272f, 0xe9eaec), (0x2a2b33, 0xe7e8ea), (0x313239, 0xe4e5e7), (0x222329, 0xebecee),
+    (0x23252e, 0xeaebed), (0x17181e, 0xf0f1f3), (0x212229, 0xebecee), (0x2f3038, 0xe5e6e8), (0x16171c, 0xf1f2f4), (0x2c2d34, 0xe6e7e9),
+    (0x25262c, 0xeaebed), (0x22252d, 0xeaebed), (0x0c0d10, 0xf5f6f8), (0x15161b, 0xf1f2f4),
+];
+
+/// The token (1-based; 0 = none) of the dark literal `r,g,b`. `const`: colours are built in constants. White is never found
+/// here: it is the ink or the strong text only when `Rgba::white` or `Rgba::strong` says so.
+pub const fn token(r: u8, g: u8, b: u8) -> u8 {
+    let v = (r as u32) << 16 | (g as u32) << 8 | b as u32;
+    let mut i = 2;
+    while i < TOKENS.len() {
+        if TOKENS[i].0 == v {
+            return i as u8 + 1;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// The token `--ink`, and the white that is `--t1` in light mode.
+pub const INK_TOKEN: u8 = 1;
+pub const STRONG_TOKEN: u8 = 2;
+
+/// A token's value in the current mode, as 0xRRGGBB.
+pub fn token_rgb(tok: u8) -> u32 {
+    let t = TOKENS[tok as usize - 1];
+    if light() { t.1 } else { t.0 }
+}
+
 /// Colours of one style, as COLORREF (0x00BBGGRR) like GDI wants them.
 #[derive(Clone, Copy)]
 pub struct Pal {
@@ -358,16 +453,30 @@ pub const BASE: Pal = Pal {
     dim: rgb(0xa3, 0xa9, 0xb8),
 };
 
-/// `BASE` in each accent, in the order of `Accent::ALL`.
-static TINTED: [Pal; 5] = {
-    let mut p = [BASE; 5];
+/// The light palette (the mockup's `BASE` in light mode): the same accent on paper.
+pub const BASE_LIGHT: Pal = Pal {
+    bg: rgb(0xf3, 0xf4, 0xf7),
+    line: rgb(0xd9, 0xdc, 0xe3),
+    hover: rgb(0xe4, 0xe6, 0xec),
+    active: rgb(0xd8, 0xdb, 0xe2),
+    accent: Accent::Blue.color(),
+    text: rgb(0x1b, 0x1d, 0x23),
+    dim: rgb(0x4a, 0x4f, 0x5c),
+};
+
+/// A palette in each accent, in the order of `Accent::ALL`.
+const fn tinted(base: Pal) -> [Pal; 5] {
+    let mut p = [base; 5];
     let mut i = 0;
     while i < 5 {
         p[i].accent = Accent::ALL[i].color();
         i += 1;
     }
     p
-};
+}
+
+static TINTED: [Pal; 5] = tinted(BASE);
+static TINTED_LIGHT: [Pal; 5] = tinted(BASE_LIGHT);
 
 /// Status colours shared by every style (Apple's dark-mode system green, yellow, red).
 pub const GOOD: u32 = rgb(48, 209, 88);
@@ -375,7 +484,7 @@ pub const WARN: u32 = rgb(255, 214, 10);
 pub const BAD: u32 = rgb(255, 69, 58);
 
 pub fn pal() -> &'static Pal {
-    let base = &TINTED[accent() as usize];
+    let base = &(if light() { &TINTED_LIGHT } else { &TINTED })[accent() as usize];
     let Some(o) = custom_colors() else { return base };
     // one leaked copy per (accent, overrides): a handful at most, and pal() has to hand out a reference
     static CACHE: std::sync::Mutex<Vec<(usize, [u32; 7], &'static Pal)>> = std::sync::Mutex::new(Vec::new());
@@ -643,6 +752,59 @@ mod tests {
         let mut one = [u32::MAX; 7];
         one[0] = rgb(1, 2, 3);
         assert_eq!(parse_colors("bg=010203\nzz=1;text=GG"), one);
+    }
+
+    #[test]
+    fn tokens_are_distinct_and_light_differs_from_dark() {
+        for (i, a) in TOKENS.iter().enumerate() {
+            assert!(a.0 != a.1 && a.0 != 0, "token {i} must change between modes");
+            assert!(i < 2 || TOKENS[2..i].iter().all(|b| b.0 != a.0), "dark value {:06x} listed twice", a.0);
+            let lum = |v: u32| (v >> 16 & 255) * 3 + (v >> 8 & 255) * 6 + (v & 255);
+            assert!(i < 11 || lum(a.0) < lum(a.1), "token {i}: a dark surface becomes a light one");
+        }
+        assert_eq!(token(236, 238, 244), 3); // --t1
+        assert_eq!(token(16, 17, 24) as usize, 12 + 1); // --s16_17_24
+        assert_eq!(token(255, 255, 255), 0, "white is the ink only by `Rgba::white`");
+        assert_eq!(token(0, 0, 0), 0, "shadows stay black");
+        assert_eq!(token(11, 18, 32), 0, "text on an accent fill stays as it is");
+    }
+
+    #[test]
+    fn mode_follows_the_system_value() {
+        assert!(light_from(Some(1)) && !light_from(Some(0)) && !light_from(None) && !light_from(Some(7)));
+        let was = light();
+        assert_eq!(token_rgb(INK_TOKEN), if was { 0x14161e } else { 0xffffff });
+        set_light(true);
+        assert_eq!(token_rgb(STRONG_TOKEN), 0x1b1d23);
+        assert_eq!(pal().text, BASE_LIGHT.text);
+        assert_eq!(pal().bg, rgb(0xf3, 0xf4, 0xf7));
+        set_light(false);
+        assert_eq!(token_rgb(STRONG_TOKEN), 0xffffff);
+        assert_eq!(pal().text, BASE.text);
+        set_light(was);
+    }
+
+    #[test]
+    fn the_theme_value_round_trips_through_a_temp_key() {
+        let key = format!(r"HKCU\Software\WinRustTest\light-{}", std::process::id());
+        assert_eq!(crate::reg::get_dword(&key, "SystemUsesLightTheme"), None);
+        assert!(crate::reg::set_dword(&key, "SystemUsesLightTheme", 1));
+        assert!(light_from(crate::reg::get_dword(&key, "SystemUsesLightTheme")));
+        assert!(crate::reg::set_dword(&key, "SystemUsesLightTheme", 0));
+        assert!(!light_from(crate::reg::get_dword(&key, "SystemUsesLightTheme")));
+        crate::reg::delete_key(&key);
+        assert_eq!(crate::reg::get_dword(&key, "SystemUsesLightTheme"), None);
+    }
+
+    #[test]
+    fn the_broadcast_text_is_recognised() {
+        let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        // SAFETY: NUL-terminated buffers that live for the call
+        unsafe {
+            assert!(is_color_change(w("ImmersiveColorSet").as_ptr() as isize));
+            assert!(!is_color_change(w("ImmersiveColorSetX").as_ptr() as isize) && !is_color_change(w("Environment").as_ptr() as isize));
+            assert!(!is_color_change(w("Immersive").as_ptr() as isize) && !is_color_change(0));
+        }
     }
 
     #[test]

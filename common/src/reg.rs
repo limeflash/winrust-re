@@ -21,6 +21,43 @@ pub fn get_dword(path: &str, name: &str) -> Option<u32> {
     raw(path, Some(name)).and_then(|(ty, b)| (ty == 4 && b.len() >= 4).then(|| u32::from_le_bytes(b[..4].try_into().unwrap())))
 }
 
+/// Writes a REG_DWORD (creating the key); true when it was written.
+pub fn set_dword(path: &str, name: &str, v: u32) -> bool {
+    use windows_sys::Win32::System::Registry::*;
+    let Some((root, sub)) = split(path) else { return false };
+    let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (sub, name) = (w(sub), w(name));
+    unsafe {
+        let mut k = std::ptr::null_mut();
+        if RegCreateKeyExW(root, sub.as_ptr(), 0, std::ptr::null(), 0, KEY_SET_VALUE, std::ptr::null(), &mut k, std::ptr::null_mut()) != 0 {
+            return false;
+        }
+        let ok = RegSetValueExW(k, name.as_ptr(), 0, REG_DWORD, v.to_le_bytes().as_ptr(), 4) == 0;
+        RegCloseKey(k);
+        ok
+    }
+}
+
+/// Deletes a key with everything under it (the tests' temporary keys).
+pub fn delete_key(path: &str) {
+    use windows_sys::Win32::System::Registry::RegDeleteTreeW;
+    if let Some((root, sub)) = split(path) {
+        let sub: Vec<u16> = sub.encode_utf16().chain([0]).collect();
+        unsafe { RegDeleteTreeW(root, sub.as_ptr()) };
+    }
+}
+
+fn split(path: &str) -> Option<(windows_sys::Win32::System::Registry::HKEY, &str)> {
+    use windows_sys::Win32::System::Registry::*;
+    let (root, sub) = path.split_once('\\').unwrap_or((path, ""));
+    let root = match root.to_ascii_uppercase().as_str() {
+        "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+        "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+        _ => return None,
+    };
+    Some((root, sub))
+}
+
 fn raw(path: &str, name: Option<&str>) -> Option<(u32, Vec<u8>)> {
     use windows_sys::Win32::System::Registry::*;
     let (root, sub) = path.split_once('\\').unwrap_or((path, ""));
