@@ -123,8 +123,14 @@ pub enum Op {
     Opt(more::Opt),
     /// The tab of the Privacy page's App access list.
     PvTab,
+    /// The default app of a kind of file or link (the Default apps page).
+    Def(more::DefKind),
+    /// The default app of the file type typed in that page's box.
+    DefExt,
     /// The accent colour of every WinRust program (the swatches of Personalization).
     Accent,
+    /// How the Apps page orders its programs (name, size, install date).
+    AppSort,
     /// The Keyboard page's "Try it" field: nothing to do, the field is only there to hold keys down in.
     Try,
 }
@@ -258,7 +264,7 @@ impl Line {
                 l.val = value();
                 if is_seg(*op) {
                     (l.opts, l.cur) = choices(*op).unwrap_or_default();
-                } else if matches!(op, Op::Opt(_)) {
+                } else if matches!(op, Op::Opt(_) | Op::Def(_) | Op::DefExt | Op::AppSort) {
                     l.val = choices(*op).and_then(|(v, c)| c.and_then(|c| v.get(c).cloned())).unwrap_or_else(|| "?".into());
                 }
             }
@@ -465,13 +471,14 @@ pub fn gb(bytes: u64) -> String {
 }
 
 /// Words that select each page, in the order of `pages()`.
-const PAGE_KEYS: [&[&str]; 13] = [
+const PAGE_KEYS: [&[&str]; 14] = [
     &["display"],
     &["sound"],
     &["power", "battery", "storage"],
     &["network", "wifi", "ethernet"],
     &["bluetooth", "airplane"],
     &["apps"],
+    &["defaultapps"],
     &["notification"],
     &["personal", "color", "theme"],
     &["privacy", "webcam", "microphone", "location", "windowsdefender"],
@@ -484,7 +491,16 @@ const PAGE_KEYS: [&[&str]; 13] = [
 /// The page a name or an ms-settings: address points at; the first page when nothing matches.
 pub fn page_for(arg: &str) -> usize {
     let a = arg.to_ascii_lowercase();
-    PAGE_KEYS.iter().position(|ks| ks.iter().any(|k| a.contains(k))).unwrap_or(0)
+    // the longest key that matches wins ("defaultapps" is not the Apps page)
+    let mut best: Option<(usize, usize)> = None;
+    for (i, ks) in PAGE_KEYS.iter().enumerate() {
+        if let Some(len) = ks.iter().filter(|k| a.contains(**k)).map(|k| k.len()).max()
+            && best.is_none_or(|b| len > b.1)
+        {
+            best = Some((i, len));
+        }
+    }
+    best.map_or(0, |b| b.0)
 }
 
 fn res_text() -> String {
@@ -550,8 +566,18 @@ fn orient_names() -> [&'static str; 4] {
 
 /// Rows whose value is picked from a list (the others act on a click). Screen modes need a second screen.
 pub fn listed(op: Op) -> bool {
-    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab)
+    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab | Op::Def(_) | Op::DefExt | Op::AppSort)
         || (matches!(op, Op::Topology) && os().display_connected() > 1)
+}
+
+/// What Windows is asked about for a Default apps row.
+#[must_use]
+pub fn def_assoc(op: Op) -> Option<more::Assoc> {
+    match op {
+        Op::Def(k) => k.assoc(),
+        Op::DefExt => more::clean_ext(&more::ext_query()).map(|name| more::Assoc { name, protocol: false }),
+        _ => None,
+    }
 }
 
 /// Rows drawn as a segmented control whenever they have a list (a click on a segment picks it).
@@ -590,6 +616,11 @@ pub fn choices(op: Op) -> Option<(Vec<String>, Option<usize>)> {
         }
         Op::Night => (night_labels(), ext::NIGHT_STEPS.iter().position(|&k| k == o.night_kelvin())),
         Op::Opt(x) => o.opt_list(x),
+        Op::Def(_) | Op::DefExt => {
+            let (apps, cur) = o.assoc_apps(&def_assoc(op)?);
+            (apps.into_iter().map(|a| a.name).collect(), cur)
+        }
+        Op::AppSort => (APP_SORTS.iter().map(|s| s().to_string()).collect(), Some(APP_SORT.get())),
         Op::Accent => (winrust_common::style::Accent::ALL.iter().map(|a| a.name().to_string()).collect(), Some(o.accent())),
         Op::PvTab => (more::Cap::ALL.iter().map(|c| c.name().to_string()).collect(), more::Cap::ALL.iter().position(|&c| c == more::pv_tab())),
         Op::Plan => o.power_plans(),
@@ -661,6 +692,7 @@ pub fn choose(op: Op, i: usize) -> Done {
             }
         }
         (Op::Accent, _) => o.accent_set(i),
+        (Op::AppSort, _) => APP_SORT.set(i.min(APP_SORTS.len() - 1)),
         (Op::PvTab, _) => {
             if let Some(&c) = more::Cap::ALL.get(i) {
                 more::set_pv_tab(c);
@@ -757,18 +789,33 @@ fn pac_text() -> String {
 pub const NET_PAGE: usize = 3;
 pub const BT_PAGE: usize = 4;
 pub const APPS_PAGE: usize = 5;
-pub const NOTIFY_PAGE: usize = 6;
-pub const PERSONAL_PAGE: usize = 7;
-pub const PRIVACY_PAGE: usize = 8;
-pub const KEYBOARD_PAGE: usize = 9;
-pub const TIME_PAGE: usize = 10;
-pub const WU_PAGE: usize = 11;
-pub const ABOUT_PAGE: usize = 12;
+pub const DEFAULTS_PAGE: usize = 6;
+pub const NOTIFY_PAGE: usize = 7;
+pub const PERSONAL_PAGE: usize = 8;
+pub const PRIVACY_PAGE: usize = 9;
+pub const KEYBOARD_PAGE: usize = 10;
+pub const TIME_PAGE: usize = 11;
+pub const WU_PAGE: usize = 12;
+pub const ABOUT_PAGE: usize = 13;
 pub const POWER_PAGE: usize = 2;
 
 thread_local! { static EXPANDED: RefCell<Option<String>> = const { RefCell::new(None) } } // the adapter whose details show
 thread_local! { static RADIO: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) } }
 thread_local! { static PROGRAMS: RefCell<Option<Vec<ext::App>>> = const { RefCell::new(None) } } // read when the Apps page opens
+thread_local! { static APP_SORT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) } } // 0 name, 1 size, 2 install date
+
+/// The ways the Apps page orders its list.
+const APP_SORTS: [fn() -> &'static str; 3] = [|| t!("Названию", "Name"), || t!("Размеру", "Size"), || t!("Дате установки", "Install date")];
+
+/// "612 MB", "1.2 GB" (KB in); empty when the installer did not say.
+fn size_text(kb: u64) -> String {
+    match kb {
+        0 => String::new(),
+        k if k >= 1 << 20 => format!("{:.1} GB", k as f64 / f64::from(1 << 20)),
+        k => format!("{} MB", (k / 1024).max(1)),
+    }
+}
+
 thread_local! { static APP_QUERY: RefCell<String> = const { RefCell::new(String::new()) } } // what the Apps page's own search box holds
 
 /// The Apps page's own search box now holds `q` (the page shows the programs whose name or publisher has it).
@@ -1102,16 +1149,28 @@ fn apps_rows(q: &str) -> Vec<Group> {
     let list = PROGRAMS.with_borrow_mut(|p| p.get_or_insert_with(|| os().programs()).clone());
     let q = q.trim().to_lowercase();
     let shown: Vec<&ext::App> = list.iter().filter(|a| q.is_empty() || format!("{} {}", a.name, a.publisher).to_lowercase().contains(&q)).collect();
+    let mut shown = shown;
+    match APP_SORT.get() {
+        1 => shown.sort_by_key(|a| std::cmp::Reverse(a.size_kb)),
+        2 => shown.sort_by_key(|a| std::cmp::Reverse(a.date)),
+        _ => {}
+    }
     let rows = shown
         .iter()
         .take(400)
         .map(|a| {
             let sub = if a.publisher.is_empty() { a.version.clone() } else { format!("{} · {}", a.publisher, a.version) };
-            Line::new(Row::Item(a.name.clone(), a.version.clone(), Cmd::Uninstall(a.uninstall.clone()))).subtitle(sub).tile(Tile::Solid(look::APP_GRID, 0x6b7187))
+            // "612 MB · 21 Jul" at the right, as the design has it
+            let val = [Some(size_text(a.size_kb)).filter(|s| !s.is_empty()), a.date.map(|(_, m, d)| format!("{d} {}", more::month_name(m as u8)))].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ");
+            Line::new(Row::Item(a.name.clone(), val, Cmd::Uninstall(a.uninstall.clone()))).subtitle(sub).tile(Tile::Solid(look::APP_GRID, 0x6b7187))
         })
         .collect();
     let count = if q.is_empty() { String::new() } else { tf!("{} из {}", "{} of {}", ja: "{} / {}", pt: "{} de {}", zh: "{} / {}", shown.len(), list.len()) };
-    let head = Group::new(tf!("Приложений: {}", "{} apps", list.len())).extra(Extra::Search(count));
+    let total: u64 = list.iter().map(|a| a.size_kb).sum();
+    let mut head = Group::new(tf!("Приложений: {}", "{} apps", list.len())).extra(Extra::Search(count)).rows(vec![Line::new(Row::Cycle(t!("Сортировать по", "Sort by", ja: "並べ替え", pt: "Ordenar por", zh: "排序方式").into(), String::new, Op::AppSort)).key("app-sort")]);
+    if total > 0 {
+        head = head.note(tf!("{} всего", "{} in total", size_text(total)));
+    }
     let mut g = Group::new("").rows(rows);
     if shown.is_empty() && !list.is_empty() {
         g = g.empty(tf!("Нет приложений по запросу «{}». Попробуйте часть названия или издателя.", "No apps match “{}”. Try part of the name or the publisher.", ja: "「{}」に一致するアプリはありません。名前または発行元の一部をお試しください。", pt: "Nenhum app corresponde a “{}”. Tente parte do nome ou do editor.", zh: "没有与“{}”匹配的应用。请尝试名称或发布者的一部分。", q));
@@ -1247,6 +1306,7 @@ pub fn page_title(i: usize) -> String {
         3 => t!("Сеть", "Network", ja: "ネットワーク", pt: "Rede", zh: "网络"),
         4 => "Bluetooth",
         5 => t!("Приложения", "Apps", ja: "アプリ", pt: "Apps", zh: "应用"),
+        DEFAULTS_PAGE => t!("Приложения по умолчанию", "Default apps", ja: "既定のアプリ", pt: "Apps padrão", zh: "默认应用"),
         NOTIFY_PAGE => t!("Уведомления", "Notifications", ja: "通知", pt: "Notificações", zh: "通知"),
         PERSONAL_PAGE => t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização", zh: "个性化"),
         PRIVACY_PAGE => t!("Конфиденциальность и защита", "Privacy & security", ja: "プライバシーとセキュリティ", pt: "Privacidade e segurança", zh: "隐私和安全"),
@@ -1275,6 +1335,7 @@ fn page_with(i: usize, apps: &str) -> Page {
         NET_PAGE => network_rows(),
         BT_PAGE => bt_rows(),
         APPS_PAGE => apps_rows(apps),
+        DEFAULTS_PAGE => more::defaults_rows(),
         NOTIFY_PAGE => more::notify_rows(),
         PERSONAL_PAGE => personal_rows(),
         PRIVACY_PAGE => more::privacy_rows(),

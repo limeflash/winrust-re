@@ -12,7 +12,7 @@ use crate::{
     Fill, Wall, audio, bt,
     display::{Mode, Mon, Topo},
     ext,
-    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NotifyApp, Opt, RawDesk, Security, When, Who, fmt_date, group_desktop},
+    more::{Assoc, CApp, Cap, Consent, DATE_PATS, DefApp, DefKind, Flag, Gauge, Layout, NotifyApp, Opt, RawDesk, Security, When, Who, fmt_date, group_desktop},
     net,
     os::{Battery, Note, Os, Ping, WuExtra, set_os},
     power, wifi, wu,
@@ -20,12 +20,12 @@ use crate::{
 use windows_sys::core::GUID;
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, the pages, and a few more.
-pub const STATES: [&str; 59] = [
+pub const STATES: [&str; 62] = [
     "display", "sound", "power", "network", "bluetooth", "apps", "update", "personal", "about", "battery-charging", "battery-on-battery", "battery-low", "battery-none", "net-wifi", "net-ethernet", "net-no-wifi-adapter",
     "net-offline", "net-airplane", "identify", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
     "appearance-light", "appearance-night-light", "wifi-password", "wifi-connected-open", "adapter-open", "dropdown", "search", "search-page", "search-none", "display-single", "sound-muted", "power-plans-many", "update-checking",
     "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many", "apps-search", "apps-none", "notify", "notify-open", "notify-off", "keyboard", "time", "privacy", "privacy-camera-off", "privacy-scanning",
-    "privacy-location",
+    "privacy-location", "defaults", "defaults-lookup", "defaults-none",
 ];
 
 fn guid() -> GUID {
@@ -92,6 +92,8 @@ struct State {
     accent: usize,
     /// A rename waits for a restart.
     pc_pending: Option<String>,
+    /// The default app of each group of types (by `demo_assoc`'s group name): the index in its list.
+    assoc: std::collections::HashMap<&'static str, usize>,
 }
 
 /// The demo source. `log` says what a test or a render asked it to change.
@@ -173,8 +175,24 @@ fn demo_consent() -> Vec<(Cap, Vec<CApp>)> {
     ]
 }
 
+/// The demo's handlers for a type: the group it belongs to and the apps (the design's lists); an unknown type has none.
+fn demo_assoc(a: &Assoc) -> Option<(&'static str, &'static [&'static str])> {
+    let n = a.name.trim_start_matches('.');
+    Some(match n {
+        "http" | "html" | "htm" | "url" => ("web", &["Microsoft Edge", "Google Chrome", "Firefox"]),
+        "mailto" => ("mail", &["Microsoft Outlook", "Microsoft Edge"]),
+        "jpg" | "jpeg" | "png" | "webp" | "heic" | "gif" | "bmp" => ("photos", &["WinRust Photos", "Windows Photos", "Paint"]),
+        "mp4" | "mkv" | "mov" | "avi" => ("video", &["Media Player", "VLC media player"]),
+        "pdf" => ("pdf", &["Microsoft Edge", "Adobe Acrobat", "Google Chrome"]),
+        "txt" | "md" | "toml" | "json" | "log" | "rs" => ("text", &["Visual Studio Code", "Notepad"]),
+        _ => return None,
+    })
+}
+
 fn app_entry(name: &str, version: &str, publisher: &str) -> ext::App {
-    ext::App { name: name.into(), version: version.into(), publisher: publisher.into(), uninstall: format!("demo-uninstall {name}") }
+    // a size and a day of the demo's own, the same for the same name
+    let h: u64 = name.bytes().map(u64::from).sum();
+    ext::App { name: name.into(), version: version.into(), publisher: publisher.into(), uninstall: format!("demo-uninstall {name}"), size_kb: 20_000 + (h % 90) * 13_000, date: Some((2026, 1 + (h % 11) as u32, 1 + (h % 27) as u32)) }
 }
 
 impl Demo {
@@ -272,6 +290,7 @@ impl Demo {
             deny_admin: false,
             accent: 0,
             pc_pending: None,
+            assoc: std::collections::HashMap::new(),
         };
         Self { s: RefCell::new(s), log: RefCell::new(Vec::new()) }
     }
@@ -775,6 +794,21 @@ impl Os for Demo {
     fn computer_name(&self) -> String {
         "DANIIAR-PC".into()
     }
+    fn assoc_apps(&self, a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
+        let Some((group, list)) = demo_assoc(a) else { return (Vec::new(), None) };
+        let cur = self.with(|s| s.assoc.get(group).copied().unwrap_or(0));
+        (list.iter().map(|n| DefApp { name: (*n).into(), exe: format!("{}.exe", n.to_lowercase().replace(' ', "")) }).collect(), Some(cur))
+    }
+    fn assoc_pick(&self, a: &Assoc, i: usize, _owner: isize, _done: Ping) {
+        self.note(format!("assoc_pick {} {i}", a.name));
+        // the demo's dialog is over at once, and the user confirmed
+        if let Some((group, list)) = demo_assoc(a) {
+            self.with(|s| s.assoc.insert(group, i.min(list.len() - 1)));
+        }
+    }
+    fn own_default(&self, k: DefKind) -> String {
+        if k == DefKind::Files { "WinRust Explorer" } else { "WinRust Terminal" }.into()
+    }
     fn about_info(&self) -> crate::more::AboutInfo {
         crate::more::AboutInfo {
             cpu: "AMD Ryzen 7 7840HS \u{b7} 3.8 GHz".into(),
@@ -921,6 +955,7 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
     let d = Rc::new(Demo::for_state(name));
     set_os(d.clone());
     crate::set_app_query(""); // the Apps page's own search box starts empty in every state
+    crate::more::set_ext_query("");
     crate::more::set_pv_tab(Cap::Mic); // and the Privacy page's tab is the design's first one
     let page = match name {
         "sound" | "sound-muted" => 1,
@@ -929,6 +964,7 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "bluetooth" | "bt-paired" | "bt-searching" | "bt-needs-pin" | "bt-off" | "bt-pairing" => 4,
         "apps" | "apps-many" | "apps-search" | "apps-none" => 5,
         "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => crate::WU_PAGE,
+        "defaults" | "defaults-lookup" | "defaults-none" => crate::DEFAULTS_PAGE,
         "notify" | "notify-open" | "notify-off" => crate::NOTIFY_PAGE,
         "personal" | "appearance-dark" | "appearance-light" | "personal-light" => crate::PERSONAL_PAGE,
         "privacy" | "privacy-camera-off" | "privacy-scanning" | "privacy-location" => crate::PRIVACY_PAGE,
@@ -951,6 +987,8 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "apps-search" => s.demo_app_search("micro"),
         "apps-none" => s.demo_app_search("photoshop"),
         "notify-open" => s.demo_open("na:telegram", None),
+        "defaults-lookup" => s.demo_app_search(".webp"),
+        "defaults-none" => s.demo_app_search(".xyz"),
         "privacy-camera-off" => crate::more::set_pv_tab(Cap::Cam),
         "privacy-location" => crate::more::set_pv_tab(Cap::Loc),
         "search" => s.demo_search("net"),

@@ -322,6 +322,12 @@ impl Settings {
             }
         }
         (self.open, self.armed, self.field_err) = (None, None, String::new());
+        if i != self.page {
+            // the page's own search box starts empty (the Apps and Default apps pages share it)
+            self.aq.set_text("");
+            crate::set_app_query("");
+            more::set_ext_query("");
+        }
         self.fields.wipe_wifi();
         self.page = i;
         self.scroll = Scroll::default();
@@ -441,6 +447,14 @@ impl Settings {
 
     /// Applies entry `i` of `choices(op)` and does what the window must after it.
     pub fn pick_value(&mut self, op: Op, i: usize, cx: &mut Cx) {
+        // a default app is Windows' to set: its own chooser opens and the user confirms there
+        if let Some(a) = crate::def_assoc(op) {
+            os().assoc_pick(&a, i, self.hwnd, ping());
+            self.say(if a.protocol { t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there") } else { t!("Windows спросит, чем открывать: подтвердите «Всегда использовать это приложение»", "Windows asks which app to use: confirm \u{201c}Always use this app\u{201d}") }, cx);
+            self.read_page();
+            cx.invalidate();
+            return;
+        }
         match choose(op, i) {
             Done::Nothing => {}
             Done::Confirm => self.begin_confirm(op, cx),
@@ -946,6 +960,7 @@ impl Settings {
     /// The Apps page's own search box changed: the list is built again with it.
     fn edited_apps(&mut self, cx: &mut Cx) {
         crate::set_app_query(&self.aq.text);
+        more::set_ext_query(&self.aq.text);
         self.armed = None;
         self.scroll = Scroll::default();
         self.read_page();
@@ -1031,7 +1046,7 @@ impl App for Settings {
     }
 
     fn min_size(&self) -> (f32, f32) {
-        (720.0, 640.0) // the sidebar of thirteen pages ends at 620: every page stays in reach
+        (720.0, 660.0) // the sidebar of fourteen pages ends at 654: every page stays in reach
     }
 
     fn caption_height(&self) -> f32 {
@@ -1476,6 +1491,7 @@ impl Settings {
     pub fn demo_app_search(&mut self, q: &str) {
         self.aq.set_text(q);
         crate::set_app_query(q);
+        more::set_ext_query(q);
     }
 
     /// The search box holds `q`.

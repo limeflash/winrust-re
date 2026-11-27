@@ -41,13 +41,14 @@ pub const fn rgb(c: u32) -> Rgba {
 }
 
 /// Icons of the pages, in the order of `pages()`: tile colour and the 24 x 24 glyph (the mockup's `NAV`).
-pub const NAV: [(u32, &str); 13] = [
+pub const NAV: [(u32, &str); 14] = [
     (0x3b82f6, "M3 4h18v12H3zM8 20h8M12 16v4"),
     (0xe2477a, "M11 5L6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"),
     (0x2f9e5b, "M6 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zM21 10v4M8 10v4M11 10v4"),
     (0x2f7bf6, WIFI),
     (0x2563eb, BLUETOOTH),
     (0x8b5cf6, "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"),
+    (0x0891b2, "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM14.5 16.5l2 2 4-4"),
     (0xc026d3, BELL),
     (0xf08c1a, "M18 3l3 3-9 9-4 1 1-4zM4 21c0-2 1.5-4 4-4"),
     (0x15803d, "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6zM9 12l2 2 4-4"),

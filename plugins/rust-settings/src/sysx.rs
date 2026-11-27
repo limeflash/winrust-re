@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    more::{AboutInfo, CApp, Cap, Consent, RawDesk, group_desktop, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
+    more::{AboutInfo, Assoc, CApp, Cap, Consent, DefApp, DefKind, RawDesk, group_desktop, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
     os::{Note, Ping},
     sys::{self, wide},
 };
@@ -552,40 +552,6 @@ pub fn time_sync(done: Note) {
     });
 }
 
-#[cfg(test)]
-mod live {
-    use super::*;
-
-    /// Reads only, by hand: `cargo test -p rust-settings --release --offline -- --ignored print_reads --nocapture`. Nothing is set.
-    #[test]
-    #[ignore = "reads the real machine"]
-    fn print_reads() {
-        for o in [Opt::Toast, Opt::LangKey, Opt::Hand, Opt::Wheel, Opt::Clock, Opt::Date, Opt::Week, Opt::Zone] {
-            let (l, c) = opt_list(o);
-            println!("{o:?}: {} entries, current {:?} = {:?}", l.len(), c, c.and_then(|c| l.get(c)));
-        }
-        for g in [Gauge::KeyDelay, Gauge::KeyRate, Gauge::Pointer] {
-            println!("{g:?}: {:?}", gauge(g));
-        }
-        for f in [Flag::Dnd, Flag::MouseAccel, Flag::AutoTime] {
-            println!("{f:?}: {:?}", flag(&f));
-        }
-        for cap in Cap::ALL {
-            let c = consent(cap);
-            println!("{cap:?}: pc {:?} user {:?} desktop {:?}, {} apps", flag(&Flag::Access(cap, Who::Pc)), flag(&Flag::Access(cap, Who::User)), flag(&Flag::Access(cap, Who::Desktop)), c.apps.len());
-            for a in c.apps.iter().filter(|a| a.desktop).take(6) {
-                println!("   {} ({}) desktop={} last={:?} live={}", a.name, a.id, a.desktop, a.last, a.live);
-            }
-        }
-        println!("{:?}", security());
-        println!("about {:?}", about_info());
-        println!("layouts {:?}", layouts());
-        println!("clock {:?} | region {:?} | numbers {:?} | server {:?}", clock_text(), region_text(), numbers_text(), time_server());
-        let n = notify_apps();
-        println!("{} notifying apps: {:?}", n.len(), n.iter().take(6).collect::<Vec<_>>());
-    }
-}
-
 // ---------------------------------------------------------------------------------------------------------------------
 // About
 
@@ -683,4 +649,173 @@ pub fn rename_pc(name: &str) -> Result<(), String> {
     }
     // SAFETY: a plain read of the thread's last error.
     Err(if unsafe { GetLastError() } == ERROR_ACCESS_DENIED { t!("Нужны права администратора: запустите «Параметры» от имени администратора", "Administrator rights are needed: run Settings as administrator").into() } else { t!("Windows не приняла имя", "Windows did not take the name").into() })
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Default apps: what Windows has registered for a kind of file or link, and its own dialog for choosing (nothing here writes UserChoice)
+
+type Handlers = (std::time::Instant, Vec<DefApp>, Option<usize>);
+
+fn handlers_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Handlers>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Handlers>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// One string Windows keeps for an association (`what`: ASSOCSTR_EXECUTABLE 2, ASSOCSTR_FRIENDLYAPPNAME 4); None when nothing is linked.
+fn assoc_string(a: &Assoc, what: i32) -> Option<String> {
+    use windows_sys::Win32::UI::Shell::AssocQueryStringW;
+    const NOTRUNCATE: u32 = 0x20;
+    const IS_PROTOCOL: u32 = 0x1000;
+    let mut buf = [0u16; 520];
+    let mut n = buf.len() as u32;
+    // SAFETY: the text goes into a local buffer of the size given.
+    let rc = unsafe { AssocQueryStringW(NOTRUNCATE | if a.protocol { IS_PROTOCOL } else { 0 }, what, wide(&a.name).as_ptr(), null(), buf.as_mut_ptr(), &mut n) };
+    (rc == 0 && n > 1).then(|| String::from_utf16_lossy(&buf[..(n as usize - 1).min(buf.len())]))
+}
+
+fn exe_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
+}
+
+/// The apps Windows offers for `a` (its recommended handlers) and which one is the default now. An unknown type has none.
+pub fn assoc_apps(a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
+    use windows::Win32::{
+        System::Com::{CoTaskMemFree, CoInitializeEx, COINIT_APARTMENTTHREADED},
+        UI::Shell::{ASSOC_FILTER_RECOMMENDED, IAssocHandler, IEnumAssocHandlers, SHAssocEnumHandlers, SHAssocEnumHandlersForProtocolByApplication},
+    };
+    use windows::core::{HSTRING, PWSTR};
+    let key = format!("{}|{}", a.name, a.protocol);
+    if let Some(h) = handlers_cache().lock().ok().and_then(|c| c.get(&key).filter(|h| h.0.elapsed().as_secs() < 30).cloned()) {
+        return (h.1, h.2);
+    }
+    let text = |p: windows::core::Result<PWSTR>| {
+        let p = p.ok()?;
+        // SAFETY: Windows allocated the text with CoTaskMemAlloc; it is copied and freed.
+        let s = unsafe { p.to_string().ok() };
+        unsafe { CoTaskMemFree(Some(p.0.cast())) };
+        s
+    };
+    let mut apps: Vec<DefApp> = Vec::new();
+    // SAFETY: shell COM objects made and used here.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let en: Option<IEnumAssocHandlers> = if a.protocol { SHAssocEnumHandlersForProtocolByApplication(&HSTRING::from(a.name.as_str())).ok() } else { SHAssocEnumHandlers(&HSTRING::from(a.name.as_str()), ASSOC_FILTER_RECOMMENDED).ok() };
+        if let Some(en) = en {
+            loop {
+                let mut one: [Option<IAssocHandler>; 1] = [None];
+                let mut got = 0u32;
+                if en.Next(&mut one, Some(&mut got)).is_err() || got == 0 {
+                    break;
+                }
+                let Some(h) = one[0].take() else { break };
+                let (name, exe) = (text(h.GetUIName()), text(h.GetName()));
+                if let (Some(name), Some(exe)) = (name, exe) {
+                    let d = DefApp { name, exe: exe_name(&exe) };
+                    // "Pick an app" (openwith.exe) is Windows' own way of saying nothing is linked
+                    if d.exe != "openwith.exe" && !apps.iter().any(|x| x.exe == d.exe) {
+                        apps.push(d);
+                    }
+                }
+            }
+        }
+    }
+    let cur_exe = assoc_string(a, 2).map(|p| exe_name(&p)).filter(|e| e != "openwith.exe");
+    let mut cur = cur_exe.as_ref().and_then(|e| apps.iter().position(|x| x.exe == *e));
+    if cur.is_none()
+        && let (Some(exe), Some(name)) = (cur_exe, assoc_string(a, 4))
+    {
+        apps.insert(0, DefApp { name, exe }); // the default is not among the recommended: it is still the default
+        cur = Some(0);
+    }
+    if let Ok(mut c) = handlers_cache().lock() {
+        c.insert(key, (std::time::Instant::now(), apps.clone(), cur));
+    }
+    (apps, cur)
+}
+
+/// Opens Windows' own chooser for `a` so the user confirms it ("Always use this app"); never sets the default itself. A file type gets the
+/// open-with dialog (registering the choice for the extension, nothing is run); a link scheme goes to Windows' default-apps page.
+pub fn assoc_pick(a: &Assoc, owner: isize, done: Ping) {
+    if a.protocol {
+        winrust_common::settings::open("ms-settings:defaultapps");
+        return;
+    }
+    if !valid_ext(&a.name) {
+        return;
+    }
+    let file = format!("file{}", a.name);
+    std::thread::spawn(move || {
+        use windows::Win32::{
+            Foundation::HWND,
+            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_FORCE_REGISTRATION, OAIF_REGISTER_EXT, OPENASINFO, SHOpenWithDialog},
+        };
+        use windows::core::HSTRING;
+        let name = HSTRING::from(file.as_str());
+        let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_FORCE_REGISTRATION };
+        // SAFETY: a modal shell dialog on this thread, over our window; the file name is a placeholder that is never opened (no OAIF_EXEC).
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let _ = SHOpenWithDialog(Some(HWND(owner as *mut _)), &info);
+        }
+        if let Ok(mut c) = handlers_cache().lock() {
+            c.clear(); // what it was is read again
+        }
+        done();
+    });
+}
+
+fn valid_ext(e: &str) -> bool {
+    e.len() > 1 && e.len() <= 21 && e.starts_with('.') && e[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')
+}
+
+/// What WinRust's own file manager and terminal are on this PC: not a Windows setting, what is installed.
+pub fn own_default(k: DefKind) -> String {
+    let pf = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default());
+    match k {
+        DefKind::Files => if pf.join(r"rust-explorer\rust-explorer.exe").is_file() { "WinRust Explorer" } else { "Windows Explorer" }.into(),
+        _ => {
+            let wt = std::env::var_os("LOCALAPPDATA").map(|b| std::path::PathBuf::from(b).join(r"Microsoft\WindowsApps\wt.exe")).is_some_and(|p| p.is_file());
+            if pf.join(r"rust-term\rust-term.exe").is_file() { "WinRust Terminal" } else if wt { "Windows Terminal" } else { "PowerShell" }.into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Reads only, by hand: `cargo test -p rust-settings --release --offline -- --ignored print_reads --nocapture`. Nothing is set.
+    #[test]
+    #[ignore = "reads the real machine"]
+    fn print_reads() {
+        for o in [Opt::Toast, Opt::LangKey, Opt::Hand, Opt::Wheel, Opt::Clock, Opt::Date, Opt::Week, Opt::Zone] {
+            let (l, c) = opt_list(o);
+            println!("{o:?}: {} entries, current {:?} = {:?}", l.len(), c, c.and_then(|c| l.get(c)));
+        }
+        for g in [Gauge::KeyDelay, Gauge::KeyRate, Gauge::Pointer] {
+            println!("{g:?}: {:?}", gauge(g));
+        }
+        for f in [Flag::Dnd, Flag::MouseAccel, Flag::AutoTime] {
+            println!("{f:?}: {:?}", flag(&f));
+        }
+        for cap in Cap::ALL {
+            let c = consent(cap);
+            println!("{cap:?}: pc {:?} user {:?} desktop {:?}, {} apps", flag(&Flag::Access(cap, Who::Pc)), flag(&Flag::Access(cap, Who::User)), flag(&Flag::Access(cap, Who::Desktop)), c.apps.len());
+            for a in c.apps.iter().filter(|a| a.desktop).take(6) {
+                println!("   {} ({}) desktop={} last={:?} live={}", a.name, a.id, a.desktop, a.last, a.live);
+            }
+        }
+        println!("{:?}", security());
+        println!("about {:?}", about_info());
+        for a in [(".pdf", false), (".jpg", false), (".mp4", false), (".txt", false), ("http", true), ("mailto", true), (".xyz", false)] {
+            let (l, c) = assoc_apps(&Assoc { name: a.0.into(), protocol: a.1 });
+            println!("assoc {}: {} handlers, current {:?}: {:?}", a.0, l.len(), c, l.iter().map(|x| format!("{}={}", x.name, x.exe)).collect::<Vec<_>>());
+        }
+        println!("own {} / {}", own_default(DefKind::Files), own_default(DefKind::Term));
+        println!("layouts {:?}", layouts());
+        println!("clock {:?} | region {:?} | numbers {:?} | server {:?}", clock_text(), region_text(), numbers_text(), time_server());
+        let n = notify_apps();
+        println!("{} notifying apps: {:?}", n.len(), n.iter().take(6).collect::<Vec<_>>());
+    }
 }

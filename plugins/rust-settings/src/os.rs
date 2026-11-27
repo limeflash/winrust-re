@@ -8,7 +8,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::{
     audio, bt, display, ext,
-    more::{Cap, Consent, Flag, Gauge, Layout, NotifyApp, Opt, Security},
+    more::{Assoc, Cap, Consent, DefApp, DefKind, Flag, Gauge, Layout, NotifyApp, Opt, Security},
     net, power, sys, sysx, wifi, wu,
 };
 use windows_sys::Win32::Foundation::HWND;
@@ -149,6 +149,13 @@ pub trait Os {
     fn computer_name(&self) -> String;
     /// Processor, memory, graphics, system type, build revision, WinRust version, a rename waiting for a restart.
     fn about_info(&self) -> crate::more::AboutInfo;
+    /// The apps Windows has registered for a kind of file or link and the index of the default (None: nothing is linked).
+    fn assoc_apps(&self, a: &Assoc) -> (Vec<DefApp>, Option<usize>);
+    /// The user chose app `i` of `assoc_apps`: Windows' own chooser opens so they confirm it (the real one never sets the default itself);
+    /// `done` says the dialog closed.
+    fn assoc_pick(&self, a: &Assoc, i: usize, owner: isize, done: Ping);
+    /// What WinRust's own file manager or terminal is here (not a Windows setting).
+    fn own_default(&self, k: DefKind) -> String;
     /// Sets the computer's name (applies after a restart); the error is a line for the user.
     fn rename_pc(&self, name: &str) -> Result<(), String>;
     fn user_name(&self) -> String;
@@ -502,6 +509,15 @@ impl Os for Live {
     }
     fn about_info(&self) -> crate::more::AboutInfo {
         sysx::about_info()
+    }
+    fn assoc_apps(&self, a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
+        sysx::assoc_apps(a)
+    }
+    fn assoc_pick(&self, a: &Assoc, _i: usize, owner: isize, done: Ping) {
+        sysx::assoc_pick(a, owner, done);
+    }
+    fn own_default(&self, k: DefKind) -> String {
+        sysx::own_default(k)
     }
     fn rename_pc(&self, name: &str) -> Result<(), String> {
         sysx::rename_pc(name)

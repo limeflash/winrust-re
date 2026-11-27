@@ -4,7 +4,7 @@
 //! pages, the automatic Do-not-disturb rules, the layout editor, the touchpad, the screen-recording switches.
 use std::cell::Cell;
 
-use crate::{Cmd, Group, Line, Op, Row, Tile, Tone, is_on, look, os::os};
+use crate::{Cmd, Extra, Group, Line, Op, Row, Tile, Tone, is_on, look, os::os};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // what the pages ask of the system
@@ -287,7 +287,7 @@ pub fn fmt_date(pat: &str, y: u32, m: u32, d: u32) -> String {
     out
 }
 
-fn month_name(m: u8) -> &'static str {
+pub fn month_name(m: u8) -> &'static str {
     const EN: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const RU: [&str; 12] = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
     let i = usize::from(m.clamp(1, 12)) - 1;
@@ -611,4 +611,138 @@ pub fn privacy_rows() -> Vec<Group> {
         Group::new(t!("Безопасность Windows", "Windows Security", ja: "Windows セキュリティ", pt: "Segurança do Windows", zh: "Windows 安全中心")).note(t!("Встроена в Windows · WinRust только показывает", "Built into Windows \u{b7} WinRust only shows it")).rows(sec_rows),
         Group::new(t!("Доступ приложений", "App access", ja: "アプリのアクセス", pt: "Acesso dos apps", zh: "应用访问")).rows(rows),
     ]
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Default apps
+
+/// The kinds of file and link the Default apps page lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DefKind {
+    Web,
+    Files,
+    Photos,
+    Video,
+    Pdf,
+    Text,
+    Term,
+    Mail,
+}
+
+impl DefKind {
+    pub const ALL: [DefKind; 8] = [DefKind::Web, DefKind::Files, DefKind::Photos, DefKind::Video, DefKind::Pdf, DefKind::Text, DefKind::Term, DefKind::Mail];
+
+    /// What Windows is asked about: a file type (".jpg") or a link scheme ("http"); None for the two WinRust keeps itself.
+    #[must_use]
+    pub fn assoc(self) -> Option<Assoc> {
+        let (name, protocol) = match self {
+            DefKind::Web => ("http", true),
+            DefKind::Photos => (".jpg", false),
+            DefKind::Video => (".mp4", false),
+            DefKind::Pdf => (".pdf", false),
+            DefKind::Text => (".txt", false),
+            DefKind::Mail => ("mailto", true),
+            DefKind::Files | DefKind::Term => return None,
+        };
+        Some(Assoc { name: name.into(), protocol })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DefKind::Web => t!("Браузер", "Web browser", ja: "Web ブラウザー", pt: "Navegador", zh: "网页浏览器"),
+            DefKind::Files => t!("Файловый менеджер", "File manager", ja: "ファイル マネージャー", pt: "Gerenciador de arquivos", zh: "文件管理器"),
+            DefKind::Photos => t!("Фото", "Photos", ja: "フォト", pt: "Fotos", zh: "照片"),
+            DefKind::Video => t!("Видео", "Video", ja: "ビデオ", pt: "Vídeo", zh: "视频"),
+            DefKind::Pdf => "PDF",
+            DefKind::Text => t!("Текст и код", "Text and code", ja: "テキストとコード", pt: "Texto e código", zh: "文本和代码"),
+            DefKind::Term => t!("Терминал", "Terminal", ja: "ターミナル", pt: "Terminal", zh: "终端"),
+            DefKind::Mail => t!("Почта", "Email", ja: "メール", pt: "E-mail", zh: "电子邮件"),
+        }
+    }
+
+    fn sub(self) -> &'static str {
+        match self {
+            DefKind::Web => t!("Ссылки, .html, .htm", "Links, .html, .htm"),
+            DefKind::Files => t!("Папки, Win + E, «Показать в папке»", "Folders, Win + E, \u{201c}Show in folder\u{201d}"),
+            DefKind::Photos => ".jpg, .png, .webp, .heic, .gif",
+            DefKind::Video => ".mp4, .mkv, .mov",
+            DefKind::Pdf => ".pdf",
+            DefKind::Text => ".txt, .md, .toml, .json, .log",
+            DefKind::Term => t!("Win + T, «Открыть в терминале»", "Win + T, \u{201c}Open in terminal\u{201d}"),
+            DefKind::Mail => t!("Ссылки mailto:", "mailto: links"),
+        }
+    }
+}
+
+/// A kind of file (".pdf") or link ("http") whose default app Windows keeps.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Assoc {
+    pub name: String,
+    pub protocol: bool,
+}
+
+/// An app Windows has registered for an association: its name and its exe's file name (lower case).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DefApp {
+    pub name: String,
+    pub exe: String,
+}
+
+thread_local! { static EXT_QUERY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) } } // the Default apps page's own box
+
+pub fn set_ext_query(q: &str) {
+    EXT_QUERY.with_borrow_mut(|e| *e = q.to_string());
+}
+
+#[must_use]
+pub fn ext_query() -> String {
+    EXT_QUERY.with_borrow(Clone::clone)
+}
+
+/// ".webp", "webp" and "*.webp" are one file type; anything that is not a plain extension (a path, spaces, symbols) is none.
+#[must_use]
+pub fn clean_ext(q: &str) -> Option<String> {
+    let e = q.trim().trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
+    (!e.is_empty() && e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')).then(|| format!(".{e}"))
+}
+
+pub fn defaults_rows() -> Vec<Group> {
+    let o = os();
+    let q = ext_query();
+    let select = |label: &str, sub: String, op: Op, key: String, a: &Assoc| {
+        let (apps, cur) = o.assoc_apps(a);
+        let name = cur.and_then(|c| apps.get(c)).map_or_else(|| "\u{2014}".to_string(), |x| x.name.clone());
+        let mut l = Line::new(Row::Cycle(label.into(), String::new, op)).key(key).subtitle(sub).tile(app_tile(&name));
+        l.val = name;
+        (l, !apps.is_empty())
+    };
+    let mut head = Group::new(t!("Открыть в", "Open with", ja: "開くアプリ", pt: "Abrir com", zh: "打开方式"))
+        .note(t!("Выберите приложение для каждого вида файлов", "Pick an app for each kind of file"))
+        .extra(Extra::Search(String::new()))
+        .foot(t!("Windows попросит подтвердить выбор («Всегда использовать это приложение»).", "Windows asks you to confirm the choice (\u{201c}Always use this app\u{201d})."));
+    if q.trim().is_empty() {
+        head.rows = DefKind::ALL
+            .iter()
+            .map(|&k| match k.assoc() {
+                Some(a) => select(k.label(), k.sub().into(), Op::Def(k), format!("def:{k:?}"), &a).0,
+                // WinRust's own file manager and terminal are fixed by what is installed, not a setting of Windows: shown, not offered
+                None => {
+                    let own = o.own_default(k);
+                    Line::new(Row::Info(k.label().into(), own.clone())).key(format!("def:{k:?}")).subtitle(format!("{} \u{b7} {}", k.sub(), t!("задаёт WinRust", "set by WinRust"))).tile(app_tile(&own))
+                }
+            })
+            .collect();
+    } else if let Some(e) = clean_ext(&q) {
+        let (l, known) = select(&e, tf!("Приложение по умолчанию для файлов {}", "Default app for {} files", e), Op::DefExt, format!("def:{e}"), &Assoc { name: e.clone(), protocol: false });
+        head.extra = Extra::Search(if known { t!("1 совпадение", "1 match").to_string() } else { t!("нет совпадений", "no match").to_string() });
+        if known {
+            head.rows = vec![l];
+        } else {
+            head = head.empty(tf!("{} пока не связан ни с одним приложением. Windows спросит, чем открыть, при первом открытии.", "{} isn\u{2019}t linked to any app yet. Windows will ask which app to use the first time you open one.", e));
+        }
+    } else {
+        head.extra = Extra::Search(t!("нет совпадений", "no match").to_string());
+        head = head.empty(tf!("«{}» не похоже на расширение файла.", "\u{201c}{}\u{201d} doesn\u{2019}t look like a file extension.", q.trim()));
+    }
+    vec![head]
 }

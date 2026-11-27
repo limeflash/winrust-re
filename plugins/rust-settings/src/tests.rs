@@ -113,7 +113,7 @@ fn names_and_pages() {
     assert_eq!(gb(16 << 30), "16.0 GB");
     assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (ABOUT_PAGE, 0, 0, 0));
     assert_eq!((page_for("ms-settings:notifications"), page_for("ms-settings:privacy-microphone"), page_for("ms-settings:keyboard"), page_for("ms-settings:dateandtime")), (NOTIFY_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE));
-    assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 7));
+    assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, PERSONAL_PAGE));
     assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
     assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (2, 2));
 }
@@ -201,9 +201,9 @@ fn a_page_whose_title_matches_and_has_no_line_hits_shows_itself_as_a_page() {
     let own = f.iter().find(|f| f.page == WU_PAGE);
     assert!(own.is_some(), "{word}: {f:?}");
     // a page that matches by title only: Personalization (no line says it)
-    let t = pgs[7].title.to_lowercase();
+    let t = pgs[PERSONAL_PAGE].title.to_lowercase();
     let f = search::search(&pgs, &t);
-    let hit = f.iter().find(|f| f.page == 7).and_then(|f| f.hits.first()).expect("the page itself");
+    let hit = f.iter().find(|f| f.page == PERSONAL_PAGE).and_then(|f| f.hits.first()).expect("the page itself");
     assert_eq!((hit.key.as_deref(), hit.sub.as_str()), (None, search::page_word()));
     assert!(search::search(&pgs, "zzzq").is_empty(), "nothing matches: no groups");
 }
@@ -557,7 +557,7 @@ fn a_destructive_row_needs_a_second_click_on_the_same_row() {
 #[test]
 fn the_apps_page_has_a_search_box_of_its_own() {
     let (mut s, d) = win("apps");
-    let names = |s: &Settings| s.pg.groups.iter().flat_map(|g| g.rows.iter().map(|l| l.row.label().to_string())).collect::<Vec<_>>();
+    let names = |s: &Settings| s.pg.groups.iter().flat_map(|g| g.rows.iter().filter(|l| l.key != "app-sort").map(|l| l.row.label().to_string())).collect::<Vec<_>>();
     assert_eq!(names(&s).len(), 12);
     let count = |s: &Settings| s.pg.groups.iter().find_map(|g| if let Extra::Search(c) = &g.extra { Some(c.clone()) } else { None }).expect("the box is on the page");
     assert_eq!(count(&s), "", "nothing typed: no count");
@@ -570,7 +570,7 @@ fn the_apps_page_has_a_search_box_of_its_own() {
     assert!(invalidated(&cx));
     // the title still says how many there are in all, and the sidebar's search does not see the filter
     assert!(s.pg.groups[0].title.contains("12"));
-    assert_eq!(pages()[APPS_PAGE].groups.iter().map(|g| g.rows.len()).sum::<usize>(), 12);
+    assert_eq!(pages()[APPS_PAGE].groups.iter().flat_map(|g| &g.rows).filter(|l| l.key != "app-sort").count(), 12);
     // a click on Uninstall arms the row; typing disarms it, and the second click does not uninstall what was armed before
     let edge = id(&s, |l| l.row.label() == "Microsoft Edge", P_CTL);
     click(&mut s, edge);
@@ -987,8 +987,8 @@ fn light_and_dark_draw_every_state_of_the_design() {
 
 #[test]
 fn the_new_pages_are_in_the_sidebars_order_and_the_search_finds_their_lines() {
-    assert_eq!(PAGES, 13);
-    assert_eq!((NOTIFY_PAGE, PERSONAL_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE, WU_PAGE, ABOUT_PAGE), (6, 7, 8, 9, 10, 11, 12));
+    assert_eq!(PAGES, 14);
+    assert_eq!((NOTIFY_PAGE, PERSONAL_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE, WU_PAGE, ABOUT_PAGE), (7, 8, 9, 10, 11, 12, 13));
     assert_eq!(look::NAV.len(), PAGES);
     let pgs = pages();
     assert!(pgs.iter().all(|p| !p.groups.is_empty()));
@@ -1341,4 +1341,80 @@ fn a_computer_name_is_checked_before_windows_sees_it_and_a_refusal_is_told() {
     press(&mut s, at, P_CTL);
     press(&mut s, at, P_ACT + 1);
     assert!(s.open.is_none() && d.log().is_empty());
+}
+
+#[test]
+fn default_apps_list_what_windows_has_and_a_pick_opens_windows_own_chooser() {
+    assert_eq!((page_for("ms-settings:defaultapps"), page_for("ms-settings:appsfeatures")), (DEFAULTS_PAGE, APPS_PAGE));
+    assert_eq!((more::clean_ext("*.WebP"), more::clean_ext(".mkv"), more::clean_ext("a b"), more::clean_ext("C:/x"), more::clean_ext(" ")), (Some(".webp".into()), Some(".mkv".into()), None, None, None));
+    let (mut s, d) = win("defaults");
+    let rows = &s.pg.groups[0].rows;
+    assert_eq!(rows.len(), 8, "the design's eight rows");
+    assert!(matches!(&rows[1].row, Row::Info(..)) && matches!(&rows[6].row, Row::Info(..)), "the file manager and the terminal are WinRust's own: shown, not offered");
+    let photos = |s: &Settings| s.pg.groups[0].rows.iter().find(|l| l.key == "def:Photos").map(|l| l.val.clone()).unwrap();
+    assert_eq!(photos(&s), "WinRust Photos");
+    // the list is the one Windows gave, the default is ticked; a pick asks Windows, which asks the user
+    let at = id(&s, |l| l.key == "def:Photos", P_CTL);
+    let cx = click(&mut s, at);
+    let (tag, items) = menu(&cx).expect("a list of the registered apps");
+    assert_eq!((tag, items.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()), (TAG_PICK, vec!["WinRust Photos", "Windows Photos", "Paint"]));
+    assert_eq!(items.iter().position(|m| m.radio == Some(true)), Some(0));
+    let mut cx = Cx::default();
+    s.command(TAG_PICK, 2, &mut cx);
+    assert_eq!(d.log(), vec!["assoc_pick .jpg 2"]);
+    assert_eq!(toasts(&cx).len(), 1, "the toast says Windows asks to confirm");
+    assert_eq!(photos(&s), "Paint", "read again after the dialog");
+    // the rows that are WinRust's own do nothing
+    d.clear_log();
+    press(&mut s, |l| l.key == "def:Files", P_CTL);
+    assert!(d.log().is_empty());
+    // a link scheme goes to the same call (Live sends it to Windows' settings page)
+    let at = id(&s, |l| l.key == "def:Web", P_CTL);
+    click(&mut s, at);
+    s.command(TAG_PICK, 1, &mut Cx::default());
+    assert_eq!(d.log(), vec!["assoc_pick http 1"]);
+}
+
+#[test]
+fn a_typed_file_type_shows_its_own_row_and_an_unknown_one_says_so() {
+    let (mut s, d) = win("defaults-lookup");
+    let g = &s.pg.groups[0];
+    assert_eq!(g.rows.len(), 1);
+    assert_eq!(g.rows[0].row.label(), ".webp");
+    assert!(matches!(&g.extra, Extra::Search(c) if !c.is_empty()), "the box says how many matched");
+    assert_eq!(choices(Op::DefExt).unwrap().0, vec!["WinRust Photos", "Windows Photos", "Paint"]);
+    let at = id(&s, |l| l.key == "def:.webp", P_CTL);
+    click(&mut s, at);
+    s.command(TAG_PICK, 1, &mut Cx::default());
+    assert_eq!(d.log(), vec!["assoc_pick .webp 1"]);
+    // nothing is linked to .xyz: no row, a line that says Windows will ask
+    let (s, _d) = win("defaults-none");
+    assert!(s.pg.groups[0].rows.is_empty() && !s.pg.groups[0].empty.is_empty());
+    // typing in the page's box searches; leaving the page empties it
+    let (mut s, _d) = win("defaults");
+    let mut cx = Cx { focus: Some(app::ID_AQ), ..Cx::default() };
+    s.text(".mkv", &mut cx);
+    assert_eq!(s.pg.groups[0].rows.len(), 1);
+    click(&mut s, ID_NAV);
+    click(&mut s, ID_NAV + DEFAULTS_PAGE as Id);
+    assert!(s.aq.text.is_empty() && s.pg.groups[0].rows.len() == 8);
+}
+
+#[test]
+fn the_apps_page_shows_size_and_date_and_sorts_by_them() {
+    let (mut s, _d) = win("apps");
+    let first = |s: &Settings| s.pg.groups[1].rows[0].row.label().to_string();
+    let first_line = s.pg.groups[1].rows[0].val.clone();
+    assert!(first_line.contains("MB") && first_line.contains('\u{b7}'), "size and day at the right: {first_line}");
+    assert!(s.pg.groups[0].note.contains("GB"), "the title's note says what they take in all: {}", s.pg.groups[0].note);
+    assert_eq!(first(&s), "7-Zip", "by name");
+    press(&mut s, |l| l.key == "app-sort", P_CTL);
+    s.command(TAG_PICK, 1, &mut Cx::default());
+    let biggest = os().programs().into_iter().max_by_key(|a| a.size_kb).unwrap();
+    assert_eq!(first(&s), biggest.name, "by size, the biggest first");
+    press(&mut s, |l| l.key == "app-sort", P_CTL);
+    s.command(TAG_PICK, 0, &mut Cx::default());
+    assert_eq!(first(&s), "7-Zip");
+    assert_eq!(ext::install_date("20260721"), Some((2026, 7, 21)));
+    assert_eq!((ext::install_date("2026-07-21"), ext::install_date("")), (None, None));
 }

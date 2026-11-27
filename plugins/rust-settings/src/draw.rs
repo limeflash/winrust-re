@@ -349,7 +349,7 @@ impl Settings {
         let searching = !self.q.text.trim().is_empty();
         let wu_count = self.wu_badge;
         for i in 0..PAGES {
-            let y = 122.0 + 36.0 * i as f32 + 10.0 * [5, 9, 11].iter().filter(|&&g| i >= g).count() as f32;
+            let y = 122.0 + 36.0 * i as f32 + 10.0 * [5, 10, 12].iter().filter(|&&g| i >= g).count() as f32;
             let r = Rect::new(10.0, y, 215.0, 34.0);
             let cur = !searching && i == self.page;
             let hot = f.focusable(ID_NAV + i as Id, r);
@@ -697,6 +697,9 @@ impl Settings {
                 }
                 Cmd::Uninstall(_) => {
                     let armed = self.is_armed(l);
+                    if !l.val.is_empty() {
+                        v.push(RItem::Val(l.val.clone()));
+                    }
                     v.push(RItem::Btns(vec![RBtn { label: if armed { t!("Нажмите ещё раз, чтобы удалить", "Click again to uninstall").into() } else { t!("Удалить", "Uninstall").into() }, kind: if armed { BKind::Danger } else { BKind::Quiet }, busy: false, dis: false }]));
                 }
                 Cmd::Vpn(v2) => v.push(RItem::Btns(vec![RBtn { label: if v2.on { t!("Отключить", "Disconnect").into() } else { t!("Подключить", "Connect").into() }, kind: BKind::Quiet, busy: false, dis: false }])),
@@ -1004,7 +1007,7 @@ impl Settings {
         }
         let st = winrust_ui::widgets::field::FieldStyle { font: BODY, icon: Some(look::SEARCH), clear: false, bare: true, radius: 10.0, pad: 0.0 };
         let fr = Rect::new(b.x + 12.0, b.y, (right - b.x - 12.0).max(40.0), b.h);
-        field_with(c, f, ID_AQ, fr, &mut self.aq, t!("Поиск приложений по названию или издателю", "Search apps by name or publisher", ja: "名前または発行元でアプリを検索", pt: "Pesquisar apps por nome ou editor", zh: "按名称或发布者搜索应用"), &st);
+        field_with(c, f, ID_AQ, fr, &mut self.aq, if self.page == crate::DEFAULTS_PAGE { t!("Найти тип файла, например .webp или .mkv", "Look up a file type, like .webp or .mkv") } else { t!("Поиск приложений по названию или издателю", "Search apps by name or publisher", ja: "名前または発行元でアプリを検索", pt: "Pesquisar apps por nome ou editor", zh: "按名称或发布者搜索应用") }, &st);
     }
 
     fn paint_arrange(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, ex: Rect) {
