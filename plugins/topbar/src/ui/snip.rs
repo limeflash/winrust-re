@@ -5,7 +5,7 @@
 //! The model is in device pixels of the virtual desktop, the chrome in DIPs: the mockup's numbers (toolbar 550 x 48 at the top
 //! middle, handles 10 x 10, the action bar 40 high, ...) are used as they are.
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use winrust_common::style::{self, pal};
 
@@ -156,6 +156,170 @@ pub fn window_at(wins: &[Win], p: (i32, i32)) -> Option<usize> {
 pub struct Win {
     pub rect: IRect,
     pub title: String,
+    /// The window's handle (0 for the demo's); the strip's card of the same window lights up with it.
+    pub hwnd: isize,
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the strip of windows (`shpick`): Window mode's "Or pick a window"
+
+/// Where a window of the strip is; the tag on its card says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Where {
+    /// On this screen with (almost) nothing over it: no tag.
+    Visible,
+    /// On this screen, mostly hidden behind other windows.
+    Covered,
+    Minimized,
+    /// On another monitor (its index).
+    Monitor(usize),
+}
+
+impl Where {
+    /// The order of the strip: what is in sight, then what is covered, then what has to be brought here first.
+    const fn rank(self) -> (u8, usize) {
+        match self {
+            Self::Visible => (0, 0),
+            Self::Covered => (1, 0),
+            Self::Minimized => (2, 0),
+            Self::Monitor(i) => (3, i),
+        }
+    }
+
+    /// The tag of the card (`None`: it has none).
+    #[must_use]
+    pub fn tag(self) -> Option<String> {
+        match self {
+            Self::Visible => None,
+            Self::Covered => Some(t!("Закрыто", "Covered", ja: "隠れています", pt: "Coberta", zh: "被遮挡").into()),
+            Self::Minimized => Some(t!("Свёрнуто", "Minimized", ja: "最小化", pt: "Minimizada", zh: "已最小化").into()),
+            Self::Monitor(i) => Some(winrust_common::tf!("Монитор {}", "Monitor {}", ja: "モニター {}", pt: "Monitor {}", zh: "显示器 {}", i + 1)),
+        }
+    }
+}
+
+/// A window as the enumeration finds it; the list is topmost first.
+#[derive(Clone, Debug)]
+pub struct RawWin {
+    pub hwnd: isize,
+    pub title: String,
+    /// Its frame on the virtual desktop; for a minimized window where it would come back to.
+    pub rect: IRect,
+    pub minimized: bool,
+}
+
+/// A card of the strip.
+#[derive(Clone, Debug)]
+pub struct PickWin {
+    pub hwnd: isize,
+    pub title: String,
+    pub rect: IRect,
+    pub at: Where,
+    /// The app's icon (an `HICON`, 0 until it is loaded) and the colour the card's gradient comes from (`None`: the accent).
+    pub icon: isize,
+    pub tint: Option<Rgba>,
+}
+
+/// A window with less than this much of it uncovered counts as covered.
+const COVERED_BELOW: f32 = 0.85;
+
+/// What is left of `r` when `cut` is taken out of it, as up to four rectangles.
+fn minus(r: IRect, cut: IRect) -> Vec<IRect> {
+    let Some(c) = r.intersect(cut) else { return vec![r] };
+    let mut v = Vec::with_capacity(4);
+    if c.t > r.t {
+        v.push(IRect::new(r.l, r.t, r.r, c.t));
+    }
+    if c.b < r.b {
+        v.push(IRect::new(r.l, c.b, r.r, r.b));
+    }
+    if c.l > r.l {
+        v.push(IRect::new(r.l, c.t, c.l, c.b));
+    }
+    if c.r < r.r {
+        v.push(IRect::new(c.r, c.t, r.r, c.b));
+    }
+    v
+}
+
+/// The share (0..1) of `r` that none of `above` covers.
+fn uncovered(r: IRect, above: &[IRect]) -> f32 {
+    let mut left = vec![r];
+    for &a in above {
+        left = left.iter().flat_map(|&p| minus(p, a)).collect();
+    }
+    let area = |r: &IRect| i64::from(r.w()) * i64::from(r.h());
+    left.iter().map(area).sum::<i64>() as f32 / area(&r).max(1) as f32
+}
+
+/// The strip's cards from the windows of the desktop (topmost first), seen from monitor `active`: in sight first, then covered,
+/// then minimized, then those of other monitors (each group in z-order, the other monitors one after the other).
+#[must_use]
+pub fn strip_of(raw: &[RawWin], mons: &[Mon], active: usize) -> Vec<PickWin> {
+    let mut above: Vec<IRect> = Vec::new();
+    let mut out: Vec<PickWin> = Vec::new();
+    for w in raw {
+        let mon = mon_at(mons, ((w.rect.l + w.rect.r) / 2, (w.rect.t + w.rect.b) / 2));
+        let at = if w.minimized {
+            Where::Minimized
+        } else if mon != active {
+            Where::Monitor(mon)
+        } else {
+            match mons.get(mon).and_then(|m| w.rect.intersect(m.rect)) {
+                Some(on) if uncovered(on, &above) >= COVERED_BELOW => Where::Visible,
+                _ => Where::Covered,
+            }
+        };
+        if !w.minimized {
+            above.push(w.rect);
+        }
+        out.push(PickWin { hwnd: w.hwnd, title: w.title.clone(), rect: w.rect, at, icon: 0, tint: None });
+    }
+    out.sort_by_key(|w| w.at.rank());
+    out
+}
+
+/// A window's picture as its card shows it.
+#[derive(Clone, Debug)]
+pub struct Thumb {
+    pub w: i32,
+    pub h: i32,
+    pub px: Vec<u32>,
+}
+
+/// The card's picture box, DIPs.
+const THUMB_W: f32 = 140.0;
+const THUMB_H: f32 = 84.0;
+
+/// A picture of a window (`sw` x `sh` opaque pixels) cut for a card: scaled to cover the 140 x 84 box, kept to its top left corner
+/// (`object-fit: cover; object-position: top left`), at `scale` device pixels per DIP. Averaged: the window is several times the card.
+#[must_use]
+pub fn thumb_of(src: &[u32], sw: i32, sh: i32, scale: f32) -> Option<Thumb> {
+    if sw <= 0 || sh <= 0 || src.len() < (sw as usize) * (sh as usize) {
+        return None;
+    }
+    let (dw, dh) = (((THUMB_W * scale).round() as i32).max(1), ((THUMB_H * scale).round() as i32).max(1));
+    let k = (dw as f32 / sw as f32).max(dh as f32 / sh as f32); // destination pixels per source pixel
+    let mut px = Vec::with_capacity((dw * dh) as usize);
+    for y in 0..dh {
+        let y0 = ((y as f32 / k) as i32).min(sh - 1);
+        let y1 = (((y + 1) as f32 / k).ceil() as i32).clamp(y0 + 1, sh);
+        for x in 0..dw {
+            let x0 = ((x as f32 / k) as i32).min(sw - 1);
+            let x1 = (((x + 1) as f32 / k).ceil() as i32).clamp(x0 + 1, sw);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for sy in y0..y1 {
+                for &p in &src[(sy * sw + x0) as usize..(sy * sw + x1) as usize] {
+                    r += (p >> 16) & 255;
+                    g += (p >> 8) & 255;
+                    b += p & 255;
+                    n += 1;
+                }
+            }
+            px.push(0xff00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n));
+        }
+    }
+    Some(Thumb { w: dw, h: dh, px })
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -313,6 +477,11 @@ pub enum Ctl {
     Go,
     Switch(usize),
     Wait(usize),
+    /// The strip of windows as a whole (it takes the press and does nothing), one of its cards (an index into `Snip::strip`),
+    /// and the "Record the full screen" button of its empty state.
+    Strip,
+    Pick(usize),
+    ToFull,
 }
 
 /// What a pointer press landed on.
@@ -331,6 +500,8 @@ pub enum Act {
     None,
     Cancel,
     Capture { copy_only: bool },
+    /// A card of the strip was picked (an index into `Snip::strip`): the host brings the window and takes it.
+    Window(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,6 +521,12 @@ pub struct Layout {
     pub items: Vec<(Ctl, Rect)>,
     /// The size label and, in the action bar's place, where the coordinates tip goes.
     pub label: Option<Rect>,
+    /// The strip of windows, the part of it the cards scroll in, each card (its index into `Snip::strip`) where it stands now, and
+    /// how far they can scroll.
+    pub strip: Option<Rect>,
+    pub view: Option<Rect>,
+    pub cards: Vec<(usize, Rect)>,
+    pub scroll_max: f32,
 }
 
 impl Layout {
@@ -388,6 +565,20 @@ const F_SUB: Font = Font::new(11.5, 400);
 const F_SEG: Font = Font::new(12.0, 500);
 const F_ATK: Font = Font::new(11.0, 500);
 const F_FOOT: Font = Font::new(12.0, 400);
+const F_HEAD: Font = Font::new(12.0, 600);
+const F_CARD: Font = Font::new(12.0, 500);
+const F_TAG: Font = Font::new(11.0, 500);
+const F_BODY: Font = Font::new(13.0, 400);
+const F_BTN: Font = Font::new(13.0, 500);
+/// The strip (`.shpick`): 20 from the bottom, 10 / 12 / 12 of padding, a 32 high head, cards of 150 x 117 with 8 between, 1160 at most.
+const STRIP_BOTTOM: f32 = 20.0;
+const STRIP_MAX: f32 = 1160.0;
+const STRIP_HEAD: f32 = 32.0;
+const CARD_W: f32 = 150.0;
+const CARD_H: f32 = 117.0;
+const CARD_GAP: f32 = 8.0;
+/// The height the scrollbar takes under the cards when they do not all fit.
+const SCROLL_H: f32 = 10.0;
 
 const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
 const DIM_INK: Rgba = Rgba::css(163, 169, 184, 1.0);
@@ -451,6 +642,9 @@ enum Ani {
     WinW,
     WinH,
     WinR,
+    /// 1 while the window of a strip card is the one pointed at (on the card or on the screen), and while the card is pressed.
+    Lit(usize),
+    Press(usize),
 }
 
 struct Drag {
@@ -483,6 +677,17 @@ pub struct Snip {
     /// A countdown is running over the picker (a recording about to start): the action bar goes away, as in the mockup.
     pub counting: bool,
     pub dirty: bool,
+    /// The strip of windows (Window mode), the pictures the host made of them, and those pictures on this device.
+    pub strip: Vec<PickWin>,
+    thumbs: HashMap<isize, Thumb>,
+    pics: RefCell<HashMap<isize, Picture>>,
+    /// The card the pointer is on, how far the cards are scrolled (DIPs), when the strip came up, whether it is up, and whether the
+    /// pointer is on it (the screen under it is then not pointed at).
+    strip_hover: Option<usize>,
+    scroll: f32,
+    strip_at: u64,
+    strip_up: bool,
+    on_strip: bool,
 }
 
 fn dur(ms: u32) -> f32 {
@@ -501,6 +706,7 @@ impl Snip {
         let mut s = Self {
             mons, wins, opts, sel: None, cur: None, opts_open: false, active, hover: None, hot: None, drag: None, ani: HashMap::new(),
             opened: now, tool_at: now, bar_at: None, pop_at: now, flash: None, closing: None, counting: false, dirty: true,
+            strip: Vec::new(), thumbs: HashMap::new(), pics: RefCell::new(HashMap::new()), strip_hover: None, scroll: 0.0, strip_at: now, strip_up: false, on_strip: false,
         };
         if opts.mode == Mode::Full {
             s.sel = s.mons.get(active).map(|m| m.rect);
@@ -548,6 +754,98 @@ impl Snip {
         self.mons.get(i).map_or_else(IRect::default, |m| m.rect)
     }
 
+    // -----------------------------------------------------------------------------------------------------------------
+    // the strip of windows
+
+    /// The strip's cards (set once the windows are listed; the host fills in their icons and pictures as it gets them).
+    pub fn set_strip(&mut self, strip: Vec<PickWin>, now: u64) {
+        self.strip = strip;
+        self.thumbs.clear();
+        self.pics.borrow_mut().clear();
+        self.scroll = 0.0;
+        self.sync_strip(now);
+    }
+
+    /// A card's picture arrived.
+    pub fn set_thumb(&mut self, hwnd: isize, t: Thumb) {
+        self.pics.borrow_mut().remove(&hwnd);
+        self.thumbs.insert(hwnd, t);
+        self.dirty = true;
+    }
+
+    /// A card's icon (an `HICON`) and gradient colour arrived.
+    pub fn set_icon(&mut self, hwnd: isize, icon: isize, tint: Option<Rgba>) {
+        if let Some(w) = self.strip.iter_mut().find(|w| w.hwnd == hwnd) {
+            (w.icon, w.tint) = (icon, tint);
+            self.dirty = true;
+        }
+    }
+
+    /// The cards the strip shows: a recording only takes what is on this screen.
+    fn shown(&self) -> Vec<usize> {
+        (0..self.strip.len()).filter(|&i| self.opts.kind == Kind::Shot || !matches!(self.strip[i].at, Where::Monitor(_))).collect()
+    }
+
+    /// The strip is up: Window mode with nothing chosen yet, the popover and the countdown out of the way. A recording that has no
+    /// window to take still shows it (its empty state offers the whole screen); a screenshot with none has nothing to offer.
+    #[must_use]
+    pub fn strip_on(&self) -> bool {
+        self.opts.mode == Mode::Window && self.sel.is_none() && !self.counting && !self.opts_open && (self.opts.kind == Kind::Rec || !self.strip.is_empty())
+    }
+
+    /// The strip comes up with its slide each time it appears (`shpickIn`).
+    fn sync_strip(&mut self, now: u64) {
+        let up = self.strip_on();
+        if up && !self.strip_up {
+            self.strip_at = now;
+        }
+        self.strip_up = up;
+        if !up {
+            self.strip_hover = None;
+            self.on_strip = false;
+        }
+        self.sync_lit(now);
+    }
+
+    /// The cards of the windows that are pointed at (on their card or on the screen) light up (`.14s`).
+    fn sync_lit(&mut self, now: u64) {
+        let hw = self.hover.and_then(|h| self.wins.get(h)).map_or(0, |w| w.hwnd);
+        let (d, _) = anim::timing(style::anim(), 140, 0);
+        for i in 0..self.strip.len() {
+            let on = self.strip_hover == Some(i) || (hw != 0 && self.strip[i].hwnd == hw);
+            self.ani.entry(Ani::Lit(i)).or_insert_with(|| Transition::new(0.0)).set(f32::from(on), now, d, 0, EASE);
+        }
+        self.dirty = true;
+    }
+
+    /// The strip's size: the box, all the cards in a row, and the part of it the cards show in.
+    fn strip_dims(n: usize, screen_w: f32) -> (f32, f32, f32) {
+        let content = n as f32 * CARD_W + n.saturating_sub(1) as f32 * CARD_GAP;
+        let w = (24.0 + content).min(STRIP_MAX).min(screen_w - 24.0).max(24.0);
+        (w, content, w - 24.0)
+    }
+
+    /// The pointer is on the strip (the wheel moves its cards).
+    #[must_use]
+    pub const fn over_strip(&self) -> bool {
+        self.on_strip
+    }
+
+    /// A card was picked and its window is the selection, as if it had been clicked on the screen.
+    pub fn choose(&mut self, r: IRect, now: u64) {
+        self.sel = Some(r);
+        self.hover = None;
+        self.sync_strip(now);
+    }
+
+    /// The wheel over the strip moves the cards sideways.
+    pub fn scroll_by(&mut self, dx: f32) {
+        let Some(m) = self.mons.get(self.active) else { return };
+        let (_, content, view) = Self::strip_dims(self.shown().len(), m.rect.w() as f32 / m.scale);
+        self.scroll = (self.scroll + dx).clamp(0.0, (content - view).max(0.0));
+        self.dirty = true;
+    }
+
     /// Whether the pointer is over a selection that can be dragged about (a region).
     #[must_use]
     pub fn editable(&self) -> bool {
@@ -569,6 +867,8 @@ impl Snip {
         if self.ready() {
             self.bar_at = Some(now);
         }
+        self.scroll = 0.0;
+        self.sync_strip(now);
     }
 
     pub fn set_mode(&mut self, m: Mode, now: u64) {
@@ -581,6 +881,7 @@ impl Snip {
         for mm in MODES {
             self.go(Ani::Tint(Ctl::Mode(mm)), f32::from(mm == m), now, 160, EASE);
         }
+        self.sync_strip(now);
     }
 
     /// The window under `p` as the highlight shows it: its frame, kept to the monitor the pointer is on.
@@ -590,6 +891,10 @@ impl Snip {
 
     /// Where the highlight of Window mode is going, in device pixels.
     fn hover_rect(&self) -> Option<IRect> {
+        if let Some(w) = self.strip_hover.and_then(|i| self.strip.get(i)) {
+            // a card is pointed at: its window is outlined where it is (on its own monitor), whatever covers it
+            return w.rect.intersect(self.mon_rect(mon_at(&self.mons, ((w.rect.l + w.rect.r) / 2, (w.rect.t + w.rect.b) / 2))));
+        }
         let (i, p) = (self.hover?, self.cur?);
         self.win_rect(i, p)
     }
@@ -609,12 +914,17 @@ impl Snip {
             return;
         }
         match self.opts.mode {
+            Mode::Window if self.on_strip => {}
             Mode::Window => {
                 let h = window_at(&self.wins, p).filter(|&i| self.win_rect(i, p).is_some());
                 if h != self.hover || h.is_some() {
+                    let changed = h != self.hover;
                     self.hover = h;
                     if let Some(r) = self.hover_rect() {
                         self.glide(r, now);
+                    }
+                    if changed {
+                        self.sync_lit(now);
                     }
                 }
             }
@@ -642,7 +952,7 @@ impl Snip {
         if let Some(s) = self.sel {
             return Some(s);
         }
-        if self.opts.mode != Mode::Window || self.hover.is_none() {
+        if self.opts.mode != Mode::Window || (self.hover.is_none() && self.strip_hover.is_none()) {
             return None;
         }
         let v = |k| self.val(k, now);
@@ -654,12 +964,18 @@ impl Snip {
         self.cur = Some(p);
         self.dirty = true;
         match hit {
-            Hit::Ctl(c) => return self.click(c, now),
+            Hit::Ctl(c) => {
+                if let Ctl::Pick(i) = c {
+                    self.go(Ani::Press(i), 1.0, now, 140, SPRING);
+                }
+                return self.click(c, now);
+            }
             Hit::Chrome => return Act::None,
             Hit::Canvas => {}
         }
         if self.opts_open {
             self.opts_open = false;
+            self.sync_strip(now);
             return Act::None;
         }
         let mon = mon_at(&self.mons, p);
@@ -706,6 +1022,11 @@ impl Snip {
     }
 
     pub fn release(&mut self, now: u64) {
+        for i in 0..self.strip.len() {
+            if self.ani.get(&Ani::Press(i)).is_some_and(|t| t.target() > 0.5) {
+                self.go(Ani::Press(i), 0.0, now, 140, SPRING);
+            }
+        }
         let Some(d) = self.drag.take() else { return };
         self.dirty = true;
         let k = self.mons[mon_at(&self.mons, d.from)].scale;
@@ -725,7 +1046,11 @@ impl Snip {
             Ctl::Gear => {
                 self.opts_open = !self.opts_open;
                 self.pop_at = now;
+                self.sync_strip(now);
             }
+            Ctl::Strip => {}
+            Ctl::Pick(i) => return Act::Window(i),
+            Ctl::ToFull => self.set_mode(Mode::Full, now),
             Ctl::Close | Ctl::Cancel => return Act::Cancel,
             Ctl::Copy => return Act::Capture { copy_only: true },
             Ctl::Go => return Act::Capture { copy_only: false },
@@ -742,7 +1067,10 @@ impl Snip {
     pub fn key(&mut self, k: Key, now: u64) -> Act {
         self.dirty = true;
         match k {
-            Key::Esc if self.opts_open => self.opts_open = false,
+            Key::Esc if self.opts_open => {
+                self.opts_open = false;
+                self.sync_strip(now);
+            }
             Key::Esc => return Act::Cancel,
             Key::Enter if self.sel.is_some() => return Act::Capture { copy_only: false },
             Key::Enter => {}
@@ -760,6 +1088,19 @@ impl Snip {
 
     /// The pointer is over `c` (or over none).
     pub fn point_at(&mut self, c: Option<Ctl>, now: u64) {
+        let on = matches!(c, Some(Ctl::Strip | Ctl::Pick(_) | Ctl::ToFull));
+        let card = if let Some(Ctl::Pick(i)) = c { Some(i) } else { None };
+        if on != self.on_strip || card != self.strip_hover {
+            self.on_strip = on;
+            if on {
+                self.hover = None; // the screen under the strip is not pointed at
+            }
+            self.strip_hover = card;
+            if let Some(r) = self.hover_rect().filter(|_| card.is_some()) {
+                self.glide(r, now);
+            }
+            self.sync_lit(now);
+        }
         if self.hot == c {
             return;
         }
@@ -805,6 +1146,7 @@ impl Snip {
             || early(self.opened, 180)
             || early(self.tool_at, 300)
             || self.bar_at.is_some_and(|a| early(a, 220))
+            || (self.strip_up && early(self.strip_at, 280))
             || (self.opts_open && early(self.pop_at, 200))
             || self.flash.is_some_and(|a| early(a, 320))
             || self.closing.is_some()
@@ -853,6 +1195,11 @@ impl Snip {
                 lay.pop = Some(pop);
             }
         }
+        if i == self.active && self.strip_on() {
+            self.strip_layout(&mut lay, measure);
+        }
+        // the strip takes the bottom of the monitor: the label of a window above it does not go under it
+        let free = lay.strip.map_or(h, |r| r.y - 8.0);
         if let Some(s) = self.sel.or_else(|| self.hover_rect())
             && let Some(vis) = s.intersect(m.rect)
         {
@@ -884,7 +1231,7 @@ impl Snip {
                     lay.bar = Some(bar);
                 }
                 let lw = measure(&self.label_text(), F_LABEL) + 18.0;
-                let ly = if sd.y + sd.h + 36.0 < h && self.opts.mode != Mode::Full {
+                let ly = if sd.y + sd.h + 36.0 < free && self.opts.mode != Mode::Full {
                     sd.y + sd.h + if ready && self.opts.mode == Mode::Region { 60.0 } else { 10.0 }
                 } else {
                     (sd.y + 8.0).max(8.0)
@@ -894,9 +1241,60 @@ impl Snip {
         lay
     }
 
+    /// The strip of windows at the bottom middle of the active monitor, and where each card of it stands now.
+    fn strip_layout(&self, lay: &mut Layout, measure: &mut dyn FnMut(&str, Font) -> f32) {
+        let (w, h) = lay.size;
+        let cards = self.shown();
+        if cards.is_empty() {
+            // a recording with no window to take: the sentence and the button that records the whole screen
+            let (tw, bw) = (measure(empty_text(), F_BODY), measure(full_label(), F_BTN) + 24.0);
+            let sw = 12.0 + 4.0 + tw + 12.0 + bw + 4.0 + 12.0;
+            let r = Rect::new(((w - sw) / 2.0).round(), h - STRIP_BOTTOM - 56.0, sw, 56.0);
+            lay.items.push((Ctl::Strip, r));
+            lay.items.push((Ctl::ToFull, Rect::new(r.x + 12.0 + 4.0 + tw + 12.0, r.y + 12.0, bw, 30.0)));
+            lay.strip = Some(r);
+            return;
+        }
+        let (sw, content, view_w) = Self::strip_dims(cards.len(), w);
+        let over = content > view_w + 0.5;
+        let row = CARD_H + if over { SCROLL_H } else { 0.0 };
+        let sh = 10.0 + STRIP_HEAD + row + 12.0;
+        let r = Rect::new(((w - sw) / 2.0).round(), h - STRIP_BOTTOM - sh, sw, sh);
+        let view = Rect::new(r.x + 12.0, r.y + 10.0 + STRIP_HEAD, view_w, row);
+        let max = (content - view_w).max(0.0);
+        let at = self.scroll.clamp(0.0, max);
+        lay.items.push((Ctl::Strip, r));
+        for (k, &idx) in cards.iter().enumerate() {
+            let c = Rect::new(view.x + k as f32 * (CARD_W + CARD_GAP) - at, view.y, CARD_W, CARD_H);
+            lay.cards.push((idx, c));
+            // the part of a card that is in view takes the pointer
+            let (l, rr) = (c.x.max(view.x), (c.x + c.w).min(view.x + view.w));
+            if rr > l {
+                lay.items.push((Ctl::Pick(idx), Rect::new(l, c.y, rr - l, c.h)));
+            }
+        }
+        (lay.strip, lay.view, lay.scroll_max) = (Some(r), Some(view), max);
+    }
+
+    /// What the hint says: Window mode adds the strip when there is one.
+    fn hint(&self) -> &'static str {
+        let cards = !self.shown().is_empty();
+        match (self.opts.kind, self.opts.mode) {
+            (Kind::Shot, Mode::Window) if cards => t!("Щёлкните окно, чтобы снять его, или выберите ниже", "Click a window to capture it, or pick one below", ja: "ウィンドウをクリックして撮影、または下から選択", pt: "Clique em uma janela para capturá-la ou escolha abaixo", zh: "点击窗口进行截图，或在下方选择"),
+            (Kind::Rec, Mode::Window) if cards => t!("Щёлкните окно, чтобы записать его, или выберите ниже", "Click a window to record it, or pick one below", ja: "ウィンドウをクリックして録画、または下から選択", pt: "Clique em uma janela para gravá-la ou escolha abaixo", zh: "点击窗口开始录制，或在下方选择"),
+            (Kind::Rec, Mode::Window) => t!("Здесь нет окон для записи", "No windows here to record", ja: "ここには録画できるウィンドウがありません", pt: "Nenhuma janela aqui para gravar", zh: "此处没有可录制的窗口"),
+            (k, m) => hint_text(k, m),
+        }
+    }
+
     fn label_text(&self) -> String {
         let Some(s) = self.sel.or_else(|| self.hover_rect()) else { return String::new() };
         let size = format!("{} × {}", s.w(), s.h());
+        if let (None, Some(w)) = (self.sel, self.strip_hover.and_then(|i| self.strip.get(i)))
+            && self.opts.mode == Mode::Window
+        {
+            return format!("{} · {size}", trunc(&w.title, 36));
+        }
         match (self.sel, self.hover) {
             (None, Some(i)) if self.opts.mode == Mode::Window => format!("{} · {size}", trunc(&self.wins[i].title, 36)),
             _ => size,
@@ -987,7 +1385,7 @@ impl Snip {
         }
         if let Some(tool) = lay.tool {
             if shown.is_none() && !self.opts_open && self.drag.is_none() {
-                let text = hint_text(self.opts.kind, self.opts.mode);
+                let text = self.hint();
                 let hw = c.measure(text, F_HINT) + 24.0;
                 let r = Rect::new(((w - hw) / 2.0).round(), 74.0, hw, 28.0);
                 c.fill(r, 14.0, Rgba::css(12, 13, 18, 0.7));
@@ -997,6 +1395,110 @@ impl Snip {
             let k = 0.97 + 0.03 * p;
             c.faded(p, |c| c.transformed(tool.cx(), tool.cy(), k, 0.0, -10.0 * (1.0 - p), |c| self.paint_tool(c, lay, tool, now)));
         }
+        if let Some(strip) = lay.strip {
+            // `shpickIn`: from `opacity: 0; translate(0, 12px)`, .28 s, the springy ease
+            let p = SPRING.ease(prog(self.strip_at, now, 280));
+            c.faded(p, |c| c.transformed(strip.cx(), strip.cy(), 1.0, 0.0, 12.0 * (1.0 - p), |c| self.paint_strip(c, lay, strip, now)));
+        }
+    }
+
+    fn paint_strip(&self, c: &mut Canvas<'_>, lay: &Layout, r: Rect, now: u64) {
+        c.outside(r, 20.0, |c| {
+            c.shadow(r, 20.0, 24.0, 60.0, Rgba::css(0, 0, 0, 0.5));
+            c.ring(r.inset(-1.0), 21.0, 1.0, Rgba::css(0, 0, 0, 0.45));
+        });
+        c.fill(r, 20.0, Rgba::css(16, 17, 24, 0.84));
+        c.ring(r, 20.0, 1.0, Rgba::white(0.1));
+        let Some(view) = lay.view else {
+            // the empty state: the sentence and the button
+            let tw = c.measure(empty_text(), F_BODY);
+            c.text(empty_text(), Rect::new(r.x + 16.0, r.y + 12.0, tw, 30.0), F_BODY, DIM_INK, Align::Start);
+            if let Some(b) = lay.rect_of(Ctl::ToFull) {
+                c.fill(b, 9.0, Rgba::white(0.1));
+                self.hover_fill(c, Ctl::ToFull, b, 9.0, now);
+                c.text(full_label(), b, F_BTN, INK, Align::Center);
+            }
+            return;
+        };
+        let head = t!("Или выберите окно", "Or pick a window", ja: "ウィンドウを選択", pt: "Ou escolha uma janela", zh: "或选择窗口");
+        let note = if self.opts.kind == Kind::Rec {
+            t!("окна с других экранов отсюда записать нельзя", "windows from other screens can’t be recorded from here", ja: "他の画面のウィンドウはここから録画できません", pt: "janelas de outras telas não podem ser gravadas daqui", zh: "无法在此录制其他屏幕上的窗口")
+        } else {
+            t!("свёрнутые, перекрытые и на других экранах тоже", "minimized, covered and on other screens too", ja: "最小化・隠れている・他の画面のウィンドウも", pt: "minimizadas, cobertas e em outras telas também", zh: "最小化、被遮挡及其他屏幕上的窗口也可选")
+        };
+        let hw = c.measure(head, F_HEAD);
+        let (hx, hy) = (r.x + 12.0 + 4.0, r.y + 10.0);
+        c.text(head, Rect::new(hx, hy, hw, 24.0), F_HEAD, INK, Align::Start);
+        c.text(&format!("· {note}"), Rect::new(hx + hw + 8.0, hy, r.w, 24.0), F_FOOT, DIM_INK, Align::Start);
+        c.clipped(Rect::new(view.x, view.y, view.w, view.h), |c| {
+            for &(idx, card) in &lay.cards {
+                if card.x < view.x + view.w && card.x + card.w > view.x {
+                    self.paint_card(c, idx, card, now);
+                }
+            }
+        });
+        if lay.scroll_max > 0.0 {
+            // the thin scrollbar under the cards
+            let content = view.w + lay.scroll_max;
+            let tw = (view.w * view.w / content).max(24.0);
+            let at = self.scroll.clamp(0.0, lay.scroll_max) / lay.scroll_max;
+            c.fill(Rect::new(view.x + (view.w - tw) * at, view.y + CARD_H + 3.0, tw, 4.0), 2.0, Rgba::white(0.28));
+        }
+    }
+
+    /// One card: the window's picture (or its icon on a gradient of the app's colour), its tag, its icon and its title.
+    fn paint_card(&self, c: &mut Canvas<'_>, idx: usize, r: Rect, now: u64) {
+        let Some(w) = self.strip.get(idx) else { return };
+        let (lit, hover, press) = (self.val(Ani::Lit(idx), now), self.val(Ani::Hover(Ctl::Pick(idx)), now), self.val(Ani::Press(idx), now));
+        c.transformed(r.cx(), r.cy(), 1.0 - 0.03 * press, 0.0, 0.0, |c| {
+            // `.pwc:hover` is .08 of the ink; a card lit from the screen has .1 and the accent ring (`inset 0 0 0 2px`)
+            let a = 0.08 * hover + 0.10 * lit * (1.0 - hover);
+            if a > 0.001 {
+                c.fill(r, 14.0, Rgba::white(a));
+            }
+            if lit > 0.001 {
+                c.ring(r, 14.0, 2.0, accent().fade(lit));
+            }
+            let t = Rect::new(r.x + 5.0, r.y + 5.0, THUMB_W, THUMB_H);
+            let shot = {
+                let mut pics = self.pics.borrow_mut();
+                if let Some(th) = self.thumbs.get(&w.hwnd)
+                    && pics.get(&w.hwnd).is_none_or(|p| !c.is_current(p))
+                    && let Some(p) = c.pixels(&th.px, th.w, th.h)
+                {
+                    pics.insert(w.hwnd, p);
+                }
+                match pics.get(&w.hwnd) {
+                    Some(p) => {
+                        c.fill(t, 9.0, Rgba::hex(0x0c0d10));
+                        c.picture_cover(p, t, 9.0, 1.0);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            let icon = windows::Win32::UI::WindowsAndMessaging::HICON(w.icon as *mut std::ffi::c_void);
+            if !shot {
+                // `linear-gradient(140deg, ..)` of the app's colour, and its icon big in the middle
+                let base = w.tint.unwrap_or_else(accent);
+                let ink = Rgba::new(12.0 / 255.0, 13.0 / 255.0, 16.0 / 255.0, 1.0);
+                c.gradient_angle(t, 9.0, 140.0, &[(0.0, base.mix(ink, 0.55)), (1.0, base.mix(ink, 0.78))]);
+                c.hicon(icon, Rect::new(t.cx() - 18.0, t.cy() - 18.0, 36.0, 36.0), 1.0);
+            }
+            if let Some(tag) = w.at.tag() {
+                let tw = c.measure(&tag, F_TAG) + 14.0;
+                let chip = Rect::new(t.x + 6.0, t.y + t.h - 6.0 - 20.0, tw, 20.0);
+                c.fill(chip, 10.0, Rgba::new(10.0 / 255.0, 11.0 / 255.0, 15.0 / 255.0, 0.72));
+                c.text(&tag, Rect::new(chip.x + 7.0, chip.y, tw - 14.0, 20.0), F_TAG, Rgba::pure_white(1.0), Align::Start);
+            }
+            let y = t.y + t.h + 7.0;
+            let mut x = r.x + 5.0 + 2.0;
+            if w.icon != 0 {
+                c.hicon(icon, Rect::new(x, y, 16.0, 16.0), 1.0);
+                x += 16.0 + 7.0;
+            }
+            c.text_fit(&w.title, Rect::new(x, y, (t.x + t.w - 2.0 - x).max(0.0), 16.0), F_CARD, INK, Align::Start);
+        });
     }
 
     fn glass(c: &mut Canvas<'_>, r: Rect, radius: f32, bg: Rgba, lift: (f32, f32, f32)) {
@@ -1159,6 +1661,15 @@ impl Snip {
             x -= 7.0;
         }
     }
+}
+
+
+fn empty_text() -> &'static str {
+    t!("На этом экране нет окон для записи.", "There are no windows on this screen to record.", ja: "この画面に録画できるウィンドウはありません。", pt: "Não há janelas nesta tela para gravar.", zh: "此屏幕上没有可录制的窗口。")
+}
+
+fn full_label() -> &'static str {
+    t!("Записать весь экран", "Record the full screen", ja: "画面全体を録画", pt: "Gravar a tela inteira", zh: "录制整个屏幕")
 }
 
 fn wait_label(n: usize, kind: Kind) -> &'static str {
@@ -1415,7 +1926,7 @@ mod tests {
         assert_eq!(mon_at(&mons, (10, 10)), 0);
         assert_eq!(mon_at(&mons, (3000, 500)), 1);
         assert_eq!(mon_at(&mons, (3000, 1300)), 1, "below the shorter monitor: the nearest one");
-        let wins = [Win { rect: IRect::new(100, 100, 500, 400), title: "front".into() }, Win { rect: IRect::new(0, 0, 2560, 1440), title: "back".into() }];
+        let wins = [Win { rect: IRect::new(100, 100, 500, 400), title: "front".into(), hwnd: 0 }, Win { rect: IRect::new(0, 0, 2560, 1440), title: "back".into(), hwnd: 0 }];
         assert_eq!(window_at(&wins, (200, 200)), Some(0));
         assert_eq!(window_at(&wins, (600, 600)), Some(1));
         assert_eq!(window_at(&wins, (3000, 600)), None);
@@ -1446,7 +1957,7 @@ mod tests {
 
     fn picker(mode: Mode) -> Snip {
         let mons = vec![Mon { rect: M, scale: 1.0 }, Mon { rect: M2, scale: 1.25 }];
-        let wins = vec![Win { rect: IRect::new(100, 100, 700, 500), title: "A".into() }, Win { rect: IRect::new(2800, 100, 3400, 600), title: "B".into() }];
+        let wins = vec![Win { rect: IRect::new(100, 100, 700, 500), title: "A".into(), hwnd: 0 }, Win { rect: IRect::new(2800, 100, 3400, 600), title: "B".into(), hwnd: 0 }];
         Snip::new(mons, wins, Opts { mode, ..Opts::default() }, 0, 0)
     }
 
@@ -1612,5 +2123,179 @@ mod tests {
         assert_eq!(pill_top(Rect::new(300.0, 120.0, 840.0, 560.0), 900.0, false), 16.0);
         assert_eq!(pill_top(Rect::new(300.0, 0.0, 840.0, 400.0), 900.0, false), 414.0);
         assert_eq!(pill_top(Rect::new(0.0, 0.0, 1440.0, 900.0), 900.0, true), 16.0);
+    }
+
+    // ---- the strip of windows
+
+    fn raw(hwnd: isize, title: &str, r: (i32, i32, i32, i32), minimized: bool) -> RawWin {
+        RawWin { hwnd, title: title.into(), rect: IRect::new(r.0, r.1, r.2, r.3), minimized }
+    }
+
+    /// Two monitors (2560 x 1440 and 1920 x 1080) and these windows, topmost first.
+    fn desktop() -> Vec<RawWin> {
+        vec![
+            raw(1, "P", (0, 600, 100, 1000), false),       // a small window in front of G: 10 % of it
+            raw(2, "A", (100, 100, 700, 500), false),      // in sight
+            raw(3, "B", (200, 150, 600, 450), false),      // behind A, wholly
+            raw(4, "C", (300, 300, 900, 700), true),       // minimized
+            raw(5, "D", (2800, 100, 3400, 600), false),    // on the other monitor
+            raw(6, "E", (1000, 100, 1800, 800), false),    // in sight
+            raw(7, "F", (1400, 100, 2200, 800), false),    // half of it behind E
+            raw(8, "G", (0, 600, 1000, 1000), false),      // 90 % in sight
+        ]
+    }
+
+    fn titles(strip: &[PickWin]) -> Vec<&str> {
+        strip.iter().map(|w| w.title.as_str()).collect()
+    }
+
+    #[test]
+    fn the_strip_lists_what_is_in_sight_then_covered_then_minimized_then_other_monitors() {
+        let mons = [Mon { rect: M, scale: 1.0 }, Mon { rect: M2, scale: 1.0 }];
+        let strip = strip_of(&desktop(), &mons, 0);
+        assert_eq!(titles(&strip), ["P", "A", "E", "G", "B", "F", "C", "D"], "z-order inside each group");
+        let at: Vec<Where> = strip.iter().map(|w| w.at).collect();
+        assert_eq!(at[..4], [Where::Visible; 4]);
+        assert_eq!(at[4..], [Where::Covered, Where::Covered, Where::Minimized, Where::Monitor(1)]);
+        assert_eq!(Where::Visible.tag(), None);
+        assert!(Where::Monitor(1).tag().is_some_and(|t| t.ends_with('2')), "the tag counts monitors from 1");
+        // seen from the other monitor: its own window is in sight, the rest is "Monitor 1" (a minimized one stays minimized)
+        let from_2 = strip_of(&desktop(), &mons, 1);
+        assert_eq!(titles(&from_2), ["D", "C", "P", "A", "B", "E", "F", "G"]);
+        assert_eq!((from_2[0].at, from_2[1].at, from_2[2].at), (Where::Visible, Where::Minimized, Where::Monitor(0)));
+    }
+
+    #[test]
+    fn a_window_mostly_off_the_monitor_counts_by_what_is_on_it_and_one_wholly_off_is_covered() {
+        let mons = [Mon { rect: M, scale: 1.0 }];
+        let wins = [raw(1, "half", (2300, 100, 2820, 500), false), raw(2, "gone", (-900, 100, -300, 500), false)];
+        let at: Vec<Where> = strip_of(&wins, &mons, 0).iter().map(|w| w.at).collect();
+        assert_eq!(at, [Where::Visible, Where::Covered]);
+    }
+
+    #[test]
+    fn a_picture_is_cut_for_the_card_from_its_top_left_and_averaged() {
+        // a wide window: scaled to the card's height, its right part is cut off (the card shows its first 280 columns)
+        let (w, h) = (560, 168);
+        let px: Vec<u32> = (0..w * h).map(|i| if (i % w) < 140 { 0xff00_00ff } else { 0xffff_0000 }).collect();
+        let t = thumb_of(&px, w, h, 1.0).expect("a thumb");
+        assert_eq!((t.w, t.h, t.px.len()), (140, 84, 140 * 84));
+        assert_eq!(t.px[0], 0xff00_00ff, "the top left corner of the window is the card's");
+        // two window columns to a card column: the colour changes at the card's column 70
+        assert_eq!((t.px[69], t.px[70]), (0xff00_00ff, 0xffff_0000));
+        // averaged: stripes of black and white are grey, not one of them
+        let stripes: Vec<u32> = (0..280 * 168).map(|i| if (i % 280) % 2 == 0 { 0xff00_0000 } else { 0xffff_ffff }).collect();
+        let g = thumb_of(&stripes, 280, 168, 1.0).expect("a thumb");
+        let c = g.px[10] & 255;
+        assert!((120..=135).contains(&c), "{c}");
+        // a small window is blown up to cover the card, and a scale of 1.5 makes a picture of 210 x 126 pixels
+        let tiny = thumb_of(&[0xff12_3456; 4], 2, 2, 1.5).expect("a thumb");
+        assert_eq!((tiny.w, tiny.h, tiny.px[0]), (210, 126, 0xff12_3456));
+        assert!(thumb_of(&[], 0, 0, 1.0).is_none() && thumb_of(&[0; 3], 2, 2, 1.0).is_none());
+    }
+
+    /// A picker on a 1440 x 900 monitor with `n` windows in sight in its strip (more than 7 do not fit).
+    fn strip_picker(n: usize, kind: Kind) -> Snip {
+        let mons = vec![Mon { rect: IRect::new(0, 0, 1440, 900), scale: 1.0 }];
+        let raws: Vec<RawWin> = (0..n).map(|i| raw(i as isize + 1, &format!("w{i}"), (10 + i as i32 * 60, 100, 50 + i as i32 * 60, 140), false)).collect();
+        let wins: Vec<Win> = raws.iter().map(|r| Win { rect: r.rect, title: r.title.clone(), hwnd: r.hwnd }).collect();
+        let mut s = Snip::new(mons.clone(), wins, Opts { mode: Mode::Window, kind, ..Opts::default() }, 0, 0);
+        s.set_strip(strip_of(&raws, &mons, 0), 0);
+        s
+    }
+
+    #[test]
+    fn the_strip_stands_where_the_mockup_puts_it() {
+        let lay = strip_picker(7, Kind::Shot).layout(0, &mut |t, f| text_w(t, f));
+        // seven cards: 24 + 7 * 150 + 6 * 8 wide, a 32 high head, 117 high cards, 20 above the bottom edge
+        assert_eq!(lay.strip, Some(Rect::new(159.0, 709.0, 1122.0, 171.0)));
+        assert_eq!(lay.cards[0], (0, Rect::new(171.0, 751.0, 150.0, 117.0)));
+        assert_eq!(lay.cards[1].1.x, 171.0 + 158.0);
+        assert_eq!(lay.scroll_max, 0.0);
+        assert_eq!(lay.hit(200.0, 800.0), Hit::Ctl(Ctl::Pick(0)));
+        assert_eq!(lay.hit(163.0, 800.0), Hit::Ctl(Ctl::Strip), "the strip's padding takes the press and does nothing");
+        assert_eq!(lay.hit(700.0, 300.0), Hit::Canvas);
+        // eleven do not fit: the strip stops at 1160, grows a scrollbar, and the wheel moves the cards
+        let mut s = strip_picker(11, Kind::Shot);
+        let lay = s.layout(0, &mut |t, f| text_w(t, f));
+        assert_eq!(lay.strip, Some(Rect::new(140.0, 699.0, 1160.0, 181.0)));
+        assert_eq!(lay.scroll_max, 11.0 * 150.0 + 10.0 * 8.0 - 1136.0);
+        s.scroll_by(100.0);
+        assert_eq!(s.layout(0, &mut |t, f| text_w(t, f)).cards[0].1.x, 152.0 - 100.0);
+        s.scroll_by(10_000.0);
+        let lay = s.layout(0, &mut |t, f| text_w(t, f));
+        assert_eq!(lay.cards[10].1.x + 150.0, 152.0 + 1136.0, "the last card ends at the end of the view");
+        s.scroll_by(-10_000.0);
+        assert_eq!(s.layout(0, &mut |t, f| text_w(t, f)).cards[0].1.x, 152.0);
+    }
+
+    #[test]
+    fn a_card_under_the_pointer_outlines_its_window_and_lights_up_and_a_click_picks_it() {
+        let mut s = strip_picker(5, Kind::Shot);
+        assert!(s.strip_on());
+        s.move_to((700, 400), 1); // the screen under the strip: nothing there
+        s.point_at(Some(Ctl::Pick(2)), 2);
+        assert!(s.over_strip());
+        assert_eq!(s.showing(2), Some(IRect::new(130, 100, 170, 140)), "w2's frame");
+        assert_eq!(s.label_text(), "w2 · 40 × 40");
+        assert!((s.val(Ani::Lit(2), 1000) - 1.0).abs() < 1e-3 && s.val(Ani::Lit(1), 1000) < 1e-3);
+        // the screen under the strip is not pointed at while the pointer is on it
+        s.move_to((70, 120), 3);
+        assert_eq!(s.hover, None);
+        assert_eq!(s.press((200, 800), Hit::Ctl(Ctl::Pick(3)), 4), Act::Window(3));
+        s.release(5);
+        // pointing at a window on the screen lights its card; the card is the one of that window (the strip is in z-order here)
+        s.point_at(None, 6);
+        s.move_to((190, 120), 7);
+        assert_eq!(s.hover, Some(3));
+        assert!((s.val(Ani::Lit(3), 1000) - 1.0).abs() < 1e-3 && s.val(Ani::Lit(2), 1000) < 1e-3);
+        // a card chosen is the selection and the strip goes away with it
+        s.choose(IRect::new(130, 100, 170, 140), 8);
+        assert!(!s.strip_on() && s.ready());
+        assert_eq!(s.target(), Some(IRect::new(130, 100, 170, 140)));
+    }
+
+    #[test]
+    fn the_strip_comes_up_in_window_mode_only_and_goes_with_the_popover_and_the_countdown() {
+        let mut s = strip_picker(3, Kind::Shot);
+        assert!(s.strip_on());
+        s.set_mode(Mode::Region, 1);
+        assert!(!s.strip_on());
+        s.set_mode(Mode::Window, 2);
+        assert!(s.strip_on() && s.busy(100), "it slides in over .28 s");
+        assert!(!s.busy(10_000));
+        s.press((0, 0), Hit::Ctl(Ctl::Gear), 3);
+        assert!(!s.strip_on());
+        assert_eq!(s.key(Key::Esc, 4), Act::None);
+        assert!(s.strip_on());
+        s.counting = true;
+        assert!(!s.strip_on());
+        s.counting = false;
+        // no windows: nothing to pick for a screenshot
+        let mut none = strip_picker(0, Kind::Shot);
+        assert!(!none.strip_on());
+        assert_eq!(none.layout(0, &mut |t, f| text_w(t, f)).strip, None);
+        // a recording offers the whole screen instead
+        none.set_kind(Kind::Rec, 5);
+        assert!(none.strip_on());
+        let lay = none.layout(0, &mut |t, f| text_w(t, f));
+        let to_full = lay.rect_of(Ctl::ToFull).expect("the button");
+        assert_eq!((lay.strip.map(|r| r.h), to_full.h), (Some(56.0), 30.0));
+        assert_eq!(none.press((0, 0), Hit::Ctl(Ctl::ToFull), 6), Act::None);
+        assert_eq!((none.opts.mode, none.target()), (Mode::Full, Some(IRect::new(0, 0, 1440, 900))));
+    }
+
+    #[test]
+    fn a_recording_takes_what_is_on_this_screen_only() {
+        let mons = vec![Mon { rect: M, scale: 1.0 }, Mon { rect: M2, scale: 1.0 }];
+        let strip = strip_of(&desktop(), &mons, 0);
+        let mut s = Snip::new(mons, Vec::new(), Opts { mode: Mode::Window, ..Opts::default() }, 0, 0);
+        s.set_strip(strip, 0);
+        let n = |s: &Snip| s.layout(0, &mut |t, f| text_w(t, f)).cards.len();
+        assert_eq!(n(&s), 8);
+        s.set_kind(Kind::Rec, 1);
+        assert_eq!(n(&s), 7, "the window of the other monitor is not offered");
+        s.set_kind(Kind::Shot, 2);
+        assert_eq!(n(&s), 8);
     }
 }

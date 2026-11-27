@@ -13,7 +13,7 @@ use super::*;
 use crate::ui::{
     self,
     gfx::{self, Gfx, Picture, Surface},
-    snip::{self as model, Act, Ctl, Hit, IRect, Key, Kind, Mode, Mon, Opts, RecView, Snip, Win},
+    snip::{self as model, Act, Ctl, Hit, IRect, Key, Kind, Mode, Mon, Opts, PickWin, RawWin, RecView, Snip, Where, Win},
 };
 use std::{
     collections::VecDeque,
@@ -39,6 +39,8 @@ const T_REC: usize = 2;
 const T_FLASH: usize = 3;
 const T_END: usize = 4;
 const T_RECEND: usize = 5;
+/// A window picked from the strip has been brought up: it can be taken now.
+const T_RAISED: usize = 6;
 /// Room around the control's box for its shadow, DIPs.
 const PAD: f32 = 70.0;
 
@@ -190,11 +192,35 @@ unsafe fn monitors() -> Vec<Mon> {
     v
 }
 
+/// A window of the desktop as the picker lists it.
+struct Found {
+    win: Win,
+    minimized: bool,
+    /// It has an owner (a dialog): the screen can point at it, the strip leaves it to its owner.
+    owned: bool,
+}
+
 /// The windows a picker can take, the topmost first.
 unsafe fn windows_on_screen() -> Vec<Win> {
+    listed(false).into_iter().map(|f| f.win).collect()
+}
+
+/// The windows of the strip (a minimized one stands where it would come back to), the topmost first.
+unsafe fn strip_windows() -> Vec<RawWin> {
+    listed(true).into_iter().filter(|f| !f.owned && !f.win.title.is_empty()).map(|f| RawWin { hwnd: f.win.hwnd, title: f.win.title, rect: f.win.rect, minimized: f.minimized }).collect()
+}
+
+/// Every window the picker can take, topmost first, with the minimized ones when `minimized` says so.
+unsafe fn listed(minimized: bool) -> Vec<Found> {
+    struct Ctx {
+        out: Vec<Found>,
+        minimized: bool,
+    }
     unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> i32 {
-        let out = &mut *(lp as *mut Vec<Win>);
-        if IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
+        let ctx = &mut *(lp as *mut Ctx);
+        let out = &mut ctx.out;
+        let iconic = IsIconic(h) != 0;
+        if IsWindowVisible(h) == 0 || (iconic && !ctx.minimized) {
             return 1;
         }
         let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
@@ -217,7 +243,24 @@ unsafe fn windows_on_screen() -> Vec<Win> {
             return 1;
         }
         let mut rc: RECT = zeroed();
-        if DwmGetWindowAttribute(h, 9, (&mut rc as *mut RECT).cast(), size_of::<RECT>() as u32) != 0 && GetWindowRect(h, &mut rc) == 0 {
+        if iconic {
+            // where it comes back to; a window that was maximized comes back as the whole work area of its monitor
+            let mut pl: WINDOWPLACEMENT = zeroed();
+            pl.length = size_of::<WINDOWPLACEMENT>() as u32;
+            if GetWindowPlacement(h, &mut pl) == 0 {
+                return 1;
+            }
+            rc = pl.rcNormalPosition;
+            if pl.flags & 2 != 0 {
+                // WPF_RESTORETOMAXIMIZED
+                use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect};
+                let mut mi: MONITORINFO = zeroed();
+                mi.cbSize = size_of::<MONITORINFO>() as u32;
+                if GetMonitorInfoW(MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+                    rc = mi.rcWork;
+                }
+            }
+        } else if DwmGetWindowAttribute(h, 9, (&mut rc as *mut RECT).cast(), size_of::<RECT>() as u32) != 0 && GetWindowRect(h, &mut rc) == 0 {
             return 1; // DWMWA_EXTENDED_FRAME_BOUNDS: the visible frame, without the invisible resize borders
         }
         if rc.right - rc.left < 40 || rc.bottom - rc.top < 30 {
@@ -225,12 +268,13 @@ unsafe fn windows_on_screen() -> Vec<Win> {
         }
         let mut t = [0u16; 128];
         let n = GetWindowTextW(h, t.as_mut_ptr(), 128).max(0) as usize;
-        out.push(Win { rect: IRect::new(rc.left, rc.top, rc.right, rc.bottom), title: String::from_utf16_lossy(&t[..n]) });
+        let win = Win { rect: IRect::new(rc.left, rc.top, rc.right, rc.bottom), title: String::from_utf16_lossy(&t[..n]), hwnd: h as isize };
+        out.push(Found { win, minimized: iconic, owned: !GetWindow(h, GW_OWNER).is_null() });
         1
     }
-    let mut v: Vec<Win> = Vec::new();
-    EnumWindows(Some(each), &mut v as *mut _ as LPARAM);
-    v
+    let mut ctx = Ctx { out: Vec::new(), minimized };
+    EnumWindows(Some(each), &mut ctx as *mut _ as LPARAM);
+    ctx.out
 }
 
 /// The monitors as pictures, before anything of ours is on them.
@@ -291,23 +335,136 @@ fn sweep_old(dir: &std::path::Path, age: Duration) {
 }
 
 /// Saves what was taken and tells the bar (its own thread: the encoder and the clipboard take a moment).
-fn deliver(px: Vec<u32>, (w, h): (i32, i32), opts: Opts, copy_only: bool) {
-    thread::spawn(move || unsafe {
-        let bmp = bitmap_of(&px, w, h);
-        if bmp.is_null() {
-            return outcome(Outcome::ShotFailed);
+fn deliver(px: Vec<u32>, size: (i32, i32), opts: Opts, copy_only: bool) {
+    thread::spawn(move || unsafe { deliver_now(px, size, opts, copy_only) });
+}
+
+unsafe fn deliver_now(px: Vec<u32>, (w, h): (i32, i32), opts: Opts, copy_only: bool) {
+    let bmp = bitmap_of(&px, w, h);
+    if bmp.is_null() {
+        return outcome(Outcome::ShotFailed);
+    }
+    let (clip, mut save) = (opts.clip || copy_only, opts.save && !copy_only);
+    if !clip && !save {
+        save = true; // both switched off: it must go somewhere
+    }
+    // a preview for the notification when no file is saved (the file itself is its own preview)
+    let preview = (!save && opts.notify).then(|| temp_png("preview")).filter(|p| shot::write_png(bmp, p));
+    match shot::save_bitmap(bmp, clip, save) {
+        Some(s) => outcome(Outcome::Shot { name: s.saved.then_some(s.name), copied: s.copied, size: (w as u32, h as u32), preview: preview.map(|p| p.to_string_lossy().into_owned()), notify: opts.notify }),
+        None => outcome(Outcome::ShotFailed),
+    }
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn PrintWindow(window: HWND, dc: HDC, flags: u32) -> i32;
+}
+
+/// The window's own picture, whatever covers it or whichever monitor it is on (`PrintWindow` with `PW_RENDERFULLCONTENT`: the window
+/// draws itself), cut to its visible frame (without the invisible resize borders), as opaque pixels. `None` when the window does not
+/// answer within 100 ms (a hung program would hold `PrintWindow`), is minimized, or gives a picture with nothing in it (some
+/// programs that draw on the GPU). Run it on a thread of its own: a slow window must not hold the picker.
+unsafe fn print_window(hwnd: isize) -> Option<(Vec<u32>, i32, i32)> {
+    let win = hwnd as HWND;
+    if IsWindow(win) == 0 || IsIconic(win) != 0 {
+        return None;
+    }
+    let mut answer = 0usize;
+    if SendMessageTimeoutW(win, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &mut answer) == 0 {
+        return None;
+    }
+    let mut rc: RECT = zeroed();
+    GetWindowRect(win, &mut rc);
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+        return None;
+    }
+    let f = ui::live::frame_of(hwnd);
+    let (fx, fy) = ((f.0 - rc.left).clamp(0, w - 1), (f.1 - rc.top).clamp(0, h - 1));
+    let (fw, fh) = ((f.2 - f.0).clamp(1, w - fx), (f.3 - f.1).clamp(1, h - fy));
+    let bi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB, ..zeroed() }, ..zeroed() };
+    let dc = CreateCompatibleDC(null_mut());
+    let mut bits = null_mut();
+    let dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    let mut out = None;
+    if !dc.is_null() && !dib.is_null() && !bits.is_null() {
+        let old = SelectObject(dc, dib);
+        // what DWM has of the window first (it has the GPU's content too), then the window's own painting (a window DWM has not
+        // composed yet, off the screen, gives an empty picture the first time)
+        for flags in [2u32, 0] {
+            std::ptr::write_bytes(bits.cast::<u32>(), 0, (w * h) as usize);
+            if PrintWindow(win, dc, flags) == 0 {
+                continue;
+            }
+            let all = std::slice::from_raw_parts(bits.cast::<u32>(), (w * h) as usize);
+            let mut px = Vec::with_capacity((fw * fh) as usize);
+            for y in 0..fh {
+                let from = ((fy + y) * w + fx) as usize;
+                px.extend(all[from..from + fw as usize].iter().map(|p| p | 0xff00_0000));
+            }
+            if px.iter().any(|p| p & 0x00ff_ffff != 0) {
+                out = Some((px, fw, fh));
+                break;
+            }
         }
-        let (clip, mut save) = (opts.clip || copy_only, opts.save && !copy_only);
-        if !clip && !save {
-            save = true; // both switched off: it must go somewhere
-        }
-        // a preview for the notification when no file is saved (the file itself is its own preview)
-        let preview = (!save && opts.notify).then(|| temp_png("preview")).filter(|p| shot::write_png(bmp, p));
-        match shot::save_bitmap(bmp, clip, save) {
-            Some(s) => outcome(Outcome::Shot { name: s.saved.then_some(s.name), copied: s.copied, size: (w as u32, h as u32), preview: preview.map(|p| p.to_string_lossy().into_owned()), notify: opts.notify }),
-            None => outcome(Outcome::ShotFailed),
+        SelectObject(dc, old);
+    }
+    if !dib.is_null() {
+        DeleteObject(dib);
+    }
+    if !dc.is_null() {
+        DeleteDC(dc);
+    }
+    out
+}
+
+/// What the strip's card says a window looks like: its program's icon (48 px), or the window's own for the hosts that stand for many
+/// programs. The caller owns the handle.
+unsafe fn strip_icon(w: HWND) -> HICON {
+    let exe = exe_of(w);
+    let shell = if exe.is_empty() || is_host(&exe) { null_mut() } else { item_icon(&exe, 48) };
+    if !shell.is_null() {
+        return shell;
+    }
+    let own = icon_of(w);
+    CopyIcon(if own.is_null() { LoadIconW(null_mut(), IDI_APPLICATION) } else { own })
+}
+
+/// Whether the overlay thread is still there (a worker that outlives the picker has nobody to tell).
+fn alive() -> bool {
+    LINK.lock().unwrap_or_else(|e| e.into_inner()).hwnd != 0
+}
+
+/// A card to fill in: its window, where it is, and for a window in sight its place on the frozen screen (pixels, width, height).
+struct Feed {
+    hwnd: isize,
+    at: Where,
+    crop: Option<(Vec<u32>, i32, i32)>,
+}
+
+/// Fills in the strip from a thread of its own (the picker opens without waiting for it): each window's icon and colour, and its
+/// picture: for a window in sight cut from the frozen screen, for one that is covered or on another monitor the picture the window
+/// makes of itself; a minimized window has none and keeps its icon on the gradient.
+fn feed_strip(feed: Vec<Feed>, scale: f32) {
+    let spawned = thread::Builder::new().name("snip-strip".into()).spawn(move || unsafe {
+        SetThreadDpiAwarenessContext(-4isize as _);
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        for Feed { hwnd, at, crop } in feed {
+            if !alive() {
+                return;
+            }
+            let ic = strip_icon(hwnd as HWND);
+            let tint = (!ic.is_null()).then(|| icon_color(ic));
+            let ic = ic as isize;
+            send(Cmd::Run(Box::new(move |h| h.strip_icon(hwnd, ic, tint))));
+            let own = || if matches!(at, Where::Covered | Where::Monitor(_)) { print_window(hwnd) } else { None };
+            if let Some(t) = crop.or_else(own).and_then(|(px, w, h)| model::thumb_of(&px, w, h, scale)) {
+                send(Cmd::Run(Box::new(move |h| h.strip_thumb(hwnd, t))));
+            }
         }
     });
+    let _ = spawned;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -368,6 +525,15 @@ struct Pick {
     /// A capture was made: the flash plays and the picker closes by itself; input is ignored.
     busy: bool,
     hidden: bool,
+    /// A window picked from the strip is being brought up (the card, and whether it was minimized): `T_RAISED` takes it.
+    raising: Option<PickWin>,
+}
+
+impl Drop for Pick {
+    fn drop(&mut self) {
+        // SAFETY: the strip's icons are copies the picker owns; their cached bitmaps go first.
+        unsafe { self.snip.strip.iter().filter(|w| w.icon != 0).for_each(|w| destroy_icon(w.icon as HICON)) };
+    }
 }
 
 impl Pick {
@@ -388,6 +554,8 @@ struct Count {
 enum Then {
     Shot(IRect, bool),
     Rec(IRect),
+    /// A window of the strip that is taken as itself (not cut from the screen): its frame and handle.
+    Win(IRect, isize),
 }
 
 struct Rec {
@@ -560,13 +728,14 @@ impl Host {
             return;
         }
         let staged = STAGED.load(Relaxed);
-        let (mons, wins, frozen) = match STAGE.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            Some(s) => (s.mons, s.wins, s.frozen),
+        let (mons, wins, frozen, raw) = match STAGE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(s) => (s.mons, s.wins, s.frozen, Vec::new()),
             None => {
                 let mons = monitors();
                 let wins = windows_on_screen();
+                let raw = strip_windows();
                 let frozen = freeze(&mons); // before any window of ours is up: this is the picture the picker works on
-                (mons, wins, frozen)
+                (mons, wins, frozen, raw)
             }
         };
         if mons.is_empty() {
@@ -585,11 +754,27 @@ impl Host {
             return;
         }
         let mut snip = Snip::new(mons, wins, opts, at, t);
+        // the strip of windows: their icons and pictures come from a thread of its own (those in sight from the frozen screen)
+        let mut strip = model::strip_of(&raw, &snip.mons, at);
+        strip.truncate(40);
+        let feed: Vec<Feed> = strip
+            .iter()
+            .map(|w| {
+                let mi = model::mon_at(&snip.mons, ((w.rect.l + w.rect.r) / 2, (w.rect.t + w.rect.b) / 2));
+                let seen = w.rect.intersect(snip.mons[mi].rect).filter(|_| w.at == Where::Visible);
+                Feed { hwnd: w.hwnd, at: w.at, crop: seen.map(|r| crop(&frozen[mi], snip.mons[mi].rect, r)) }
+            })
+            .collect();
+        let scale = snip.mons[at].scale;
+        snip.set_strip(strip, t);
+        if !staged && !feed.is_empty() {
+            feed_strip(feed, scale);
+        }
         if !staged {
             snip.move_to(cursor_pos(), t); // the guides are on the pointer from the first frame
         }
         CURSOR.set(IDC_CROSS as usize);
-        self.pick = Some(Pick { snip, views, frozen, last_click: (0, (0, 0)), busy: false, hidden: false });
+        self.pick = Some(Pick { snip, views, frozen, last_click: (0, (0, 0)), busy: false, hidden: false, raising: None });
         self.frame();
         if let Some(p) = &self.pick {
             for v in &p.views {
@@ -704,6 +889,10 @@ impl Host {
                 self.pick = None;
                 gfx::trim();
             }
+            T_RAISED => {
+                KillTimer(self.ctl, T_RAISED);
+                self.raised();
+            }
             T_REC => self.rec_tick(t),
             T_RECEND => {
                 KillTimer(self.ctl, T_RECEND);
@@ -791,12 +980,149 @@ impl Host {
         self.apply(act);
     }
 
+    /// The wheel moves the strip's cards when the pointer is over it.
+    unsafe fn on_wheel(&mut self, delta: i16) {
+        let Some(p) = &mut self.pick else { return };
+        if p.locked() || !p.snip.over_strip() {
+            return;
+        }
+        p.snip.scroll_by(-f32::from(delta) / 120.0 * 80.0);
+        let pt = cursor_pos();
+        self.on_move(pt); // other cards are under the pointer now
+        self.request();
+    }
+
     unsafe fn apply(&mut self, act: Act) {
         match act {
             Act::None => {}
+            Act::Window(i) => self.pick_window(i),
             Act::Cancel => self.command(Cmd::Cancel),
             Act::Capture { copy_only } => self.capture(copy_only),
         }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // the strip of windows
+
+    /// A card's icon arrived from the worker (an icon nobody wants any more is destroyed here).
+    unsafe fn strip_icon(&mut self, hwnd: isize, icon: isize, tint: Option<ui::gfx::Rgba>) {
+        match &mut self.pick {
+            Some(p) if p.snip.strip.iter().any(|w| w.hwnd == hwnd && w.icon == 0) => {
+                p.snip.set_icon(hwnd, icon, tint);
+                self.request();
+            }
+            _ if icon != 0 => destroy_icon(icon as HICON),
+            _ => {}
+        }
+    }
+
+    fn strip_thumb(&mut self, hwnd: isize, t: model::Thumb) {
+        if let Some(p) = &mut self.pick {
+            p.snip.set_thumb(hwnd, t);
+            self.request();
+        }
+    }
+
+    /// A card was picked. A window that is not in sight comes to the front first when it has to be seen to be taken (it is minimized,
+    /// or it is a recording, which films the screen); one that is covered or on another monitor is taken as itself.
+    unsafe fn pick_window(&mut self, i: usize) {
+        let Some(p) = &mut self.pick else { return };
+        let Some(w) = p.snip.strip.get(i).cloned() else { return };
+        let win = w.hwnd as HWND;
+        if IsWindow(win) == 0 {
+            return;
+        }
+        let rec = p.snip.opts.kind == Kind::Rec;
+        if w.at == Where::Minimized || (rec && w.at != Where::Visible) {
+            // the picker stays up (it is topmost) while the window comes up; taking the focus is not a reason to leave
+            p.busy = true;
+            p.raising = Some(w);
+            if IsIconic(win) != 0 {
+                ShowWindow(win, SW_RESTORE);
+            }
+            super::force_fg(win);
+            SetTimer(self.ctl, T_RAISED, 320, None); // the restore animation
+        } else {
+            self.take_window(w, false);
+        }
+    }
+
+    /// The raised window is up: it is taken where it stands now.
+    unsafe fn raised(&mut self) {
+        let Some(p) = &mut self.pick else { return };
+        let Some(mut w) = p.raising.take() else { return };
+        p.busy = false;
+        // a window that is gone, or that would not come up (a program of a higher rank than ours does not obey), is left where it is
+        if IsWindow(w.hwnd as HWND) == 0 || IsIconic(w.hwnd as HWND) != 0 {
+            return;
+        }
+        let f = ui::live::frame_of(w.hwnd);
+        w.rect = IRect::new(f.0, f.1, f.2, f.3);
+        if p.snip.opts.kind == Kind::Rec {
+            self.refreeze(); // what the picture of the screen shows is what the recording starts from (and its notification's thumbnail)
+        }
+        self.take_window(w, true);
+    }
+
+    /// What the screen shows now is the picture the picker works on: its windows step aside for the grab.
+    unsafe fn refreeze(&mut self) {
+        let Some(p) = &mut self.pick else { return };
+        for v in &p.views {
+            ShowWindow(v.hwnd, SW_HIDE);
+        }
+        DwmFlush();
+        DwmFlush();
+        p.frozen = freeze(&p.snip.mons);
+        for v in &mut p.views {
+            v.pic = None;
+            show(v.hwnd, false);
+        }
+    }
+
+    /// Takes the window of a card as if it had been clicked: its frame is the selection. A window in sight is cut from the frozen
+    /// screen; a covered one, one on another monitor and one that was minimized (`raised`) make their own picture (a recording films
+    /// the area, so the window was brought up for it).
+    unsafe fn take_window(&mut self, w: PickWin, raised: bool) {
+        let Some(p) = &mut self.pick else { return };
+        let centre = ((w.rect.l + w.rect.r) / 2, (w.rect.t + w.rect.b) / 2);
+        let Some(sel) = w.rect.intersect(p.snip.mons[model::mon_at(&p.snip.mons, centre)].rect) else { return };
+        p.snip.choose(sel, now());
+        let opts = p.snip.opts;
+        if opts.kind == Kind::Rec || (w.at == Where::Visible && !raised) {
+            return self.capture(false);
+        }
+        save_opts(&opts);
+        p.snip.opts_open = false;
+        if opts.wait() > 0 {
+            self.begin_count(opts.wait(), Then::Win(sel, w.hwnd));
+        } else {
+            self.shoot_window(sel, w.hwnd);
+        }
+    }
+
+    /// Like `shoot`, for a window that makes its own picture (on a thread of its own: the window may be slow).
+    unsafe fn shoot_window(&mut self, sel: IRect, hwnd: isize) {
+        let Some(p) = &mut self.pick else { return };
+        let opts = p.snip.opts;
+        thread::spawn(move || unsafe {
+            SetThreadDpiAwarenessContext(-4isize as _);
+            match print_window(hwnd) {
+                Some((px, w, h)) => deliver_now(px, (w, h), opts, false),
+                None => {
+                    // the window cannot draw itself (a program that draws on the GPU): what the screen shows of it, now
+                    let mut s = Surface::new();
+                    if sel.w() > 0 && s.grab(sel.l, sel.t, sel.w(), sel.h()) {
+                        deliver_now(s.pixels().to_vec(), (sel.w(), sel.h()), opts, false);
+                    } else {
+                        outcome(Outcome::ShotFailed);
+                    }
+                }
+            }
+        });
+        p.busy = true;
+        p.snip.flash(now());
+        SetTimer(self.ctl, T_FLASH, 330, None);
+        self.request();
     }
 
     // -----------------------------------------------------------------------------------------------------------------
@@ -839,11 +1165,11 @@ impl Host {
     unsafe fn begin_count(&mut self, secs: u8, then: Then) {
         let Some(p) = &mut self.pick else { return };
         let at = match then {
-            Then::Shot(r, _) | Then::Rec(r) => model::mon_at(&p.snip.mons, (r.l, r.t)),
+            Then::Shot(r, _) | Then::Rec(r) | Then::Win(r, _) => model::mon_at(&p.snip.mons, (r.l, r.t)),
         };
         let m = p.snip.mons[at];
         let Some(view) = View::new(m, at, "topbar_snip_count", 0, false) else { return };
-        if matches!(then, Then::Shot(..)) {
+        if matches!(then, Then::Shot(..) | Then::Win(..)) {
             // a screenshot is taken of the live screen when the count ends: the picker steps aside, so the screen can be arranged
             for v in &p.views {
                 ShowWindow(v.hwnd, SW_HIDE);
@@ -880,6 +1206,18 @@ impl Host {
         DwmFlush(); // the disc is off the screen before anything is taken from it
         match then {
             Then::Rec(sel) => self.start_rec(sel),
+            Then::Win(sel, hwnd) => {
+                let Some(p) = &mut self.pick else { return };
+                p.hidden = false;
+                p.busy = false;
+                self.shoot_window(sel, hwnd);
+                self.frame();
+                if let Some(p) = &self.pick {
+                    for v in &p.views {
+                        show(v.hwnd, false);
+                    }
+                }
+            }
             Then::Shot(sel, copy_only) => {
                 let Some(p) = &mut self.pick else { return };
                 // what the screen is now, not what it was when the picker opened
@@ -1170,6 +1508,11 @@ unsafe extern "system" fn pick_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             0
         }
+        0x020A => {
+            // WM_MOUSEWHEEL
+            with(|h| h.on_wheel((wp >> 16) as i16));
+            0
+        }
         WM_RBUTTONDOWN => {
             let mine = with(|h| h.pick.as_ref().is_some_and(|p| p.views.iter().any(|v| v.hwnd == hwnd))).unwrap_or(false);
             if mine {
@@ -1257,8 +1600,82 @@ const DEMO_WINDOWS: [(&str, f32, f32, f32, f32); 3] = [("Terminal", 900.0, 60.0,
 pub(crate) fn demo_windows(k: f32) -> Vec<Win> {
     DEMO_WINDOWS
         .into_iter()
-        .map(|(t, x, y, w, h)| Win { rect: IRect::new((x * k) as i32, (y * k) as i32, ((x + w) * k) as i32, ((y + h) * k) as i32), title: t.into() })
+        .enumerate()
+        .map(|(i, (t, x, y, w, h))| Win { rect: IRect::new((x * k) as i32, (y * k) as i32, ((x + w) * k) as i32, ((y + h) * k) as i32), title: t.into(), hwnd: i as isize + 1 })
         .collect()
+}
+
+/// The windows of the demo's strip, topmost first: the three the demo screen draws, three that are hidden behind them, one minimized
+/// and two on a second monitor (right of the first); `n` of them are used. (x, y, w, h in DIPs, the program
+/// whose icon the card shows, minimized.)
+const DEMO_STRIP: [(&str, f32, f32, f32, f32, &str, bool); 14] = [
+    ("Terminal", 900.0, 60.0, 380.0, 300.0, r"C:\Windows\System32\cmd.exe", false),
+    ("File manager", 520.0, 240.0, 860.0, 560.0, r"C:\Windows\explorer.exe", false),
+    ("Photo viewer", 60.0, 130.0, 760.0, 470.0, r"C:\Windows\System32\mspaint.exe", false),
+    ("Lemxy/WinRust \u{b7} GitHub \u{2014} Edge", 560.0, 280.0, 700.0, 440.0, r"C:\Windows\System32\mmc.exe", false),
+    ("Telegram", 100.0, 170.0, 420.0, 380.0, r"C:\Windows\System32\SnippingTool.exe", false),
+    ("Claude", 90.0, 160.0, 600.0, 420.0, r"C:\Windows\System32\charmap.exe", false),
+    ("Untitled \u{2014} Notepad", 300.0, 200.0, 600.0, 400.0, r"C:\Windows\System32\notepad.exe", true),
+    ("Spotify", 1500.0, 100.0, 700.0, 500.0, r"C:\Windows\System32\calc.exe", false),
+    ("Discord", 1600.0, 300.0, 700.0, 500.0, r"C:\Windows\regedit.exe", false),
+    ("Windows PowerShell", 700.0, 120.0, 500.0, 300.0, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", true),
+    ("Settings", 1500.0, 150.0, 800.0, 600.0, r"C:\Windows\System32\control.exe", false),
+    ("Resource Monitor", 1520.0, 180.0, 800.0, 600.0, r"C:\Windows\System32\perfmon.exe", false),
+    ("Disk Management", 150.0, 175.0, 500.0, 300.0, r"C:\Windows\System32\diskmgmt.msc", true),
+    ("Event Viewer", 1700.0, 220.0, 700.0, 500.0, r"C:\Windows\System32\eventvwr.exe", false),
+];
+
+/// A made-up window picture for a window that is not on the demo screen: a title bar, a sidebar and some content in a colour of its own.
+fn demo_picture(seed: usize, w: i32, h: i32) -> Vec<u32> {
+    let hue = [(40u32, 90u32, 200u32), (30, 160, 120), (200, 90, 50), (120, 70, 190), (20, 130, 170), (190, 150, 40)][seed % 6];
+    let mut px = vec![0xff1c_1e26u32; (w * h) as usize];
+    let mut rect = |x0: f32, y0: f32, x1: f32, y1: f32, c: u32| {
+        for y in ((y0 * h as f32) as i32).max(0)..((y1 * h as f32) as i32).min(h) {
+            for x in ((x0 * w as f32) as i32).max(0)..((x1 * w as f32) as i32).min(w) {
+                px[(y * w + x) as usize] = 0xff00_0000 | c;
+            }
+        }
+    };
+    rect(0.0, 0.0, 1.0, 0.07, 0x2a2c36);
+    rect(0.0, 0.07, 0.22, 1.0, 0x23252e);
+    rect(0.30, 0.18, 0.62, 0.46, hue.0 << 16 | hue.1 << 8 | hue.2);
+    rect(0.68, 0.18, 0.94, 0.26, 0x3a3d4a);
+    rect(0.68, 0.32, 0.88, 0.38, 0x2f323e);
+    rect(0.30, 0.56, 0.94, 0.64, 0x2f323e);
+    rect(0.30, 0.72, 0.80, 0.78, 0x2a2d38);
+    px
+}
+
+/// The demo's strip: the cards for the windows of `DEMO_STRIP` seen from the first of two monitors, their icons and the pictures the
+/// host would have given them (cut from the demo screen for the windows in sight, a made-up picture for the others).
+unsafe fn demo_strip(scale: f32, mon: Mon, screen: &[u32], n: usize) -> (Vec<PickWin>, Vec<(isize, model::Thumb)>) {
+    let mons = [mon, Mon { rect: IRect::new(mon.rect.r, 0, mon.rect.r * 2, mon.rect.b), scale }];
+    let list: Vec<_> = DEMO_STRIP.iter().take(n).collect();
+    let raw: Vec<RawWin> = list
+        .iter()
+        .enumerate()
+        .map(|(i, &&(t, x, y, w, h, _, min))| RawWin { hwnd: i as isize + 1, title: t.into(), rect: IRect::new((x * scale) as i32, (y * scale) as i32, ((x + w) * scale) as i32, ((y + h) * scale) as i32), minimized: min })
+        .collect();
+    let mut strip = model::strip_of(&raw, &mons, 0);
+    let mut thumbs = Vec::new();
+    for w in &mut strip {
+        let n = (w.hwnd - 1) as usize;
+        let ic = item_icon(list[n].5, 48);
+        (w.icon, w.tint) = (ic as isize, (!ic.is_null()).then(|| icon_color(ic)));
+        match w.at {
+            Where::Visible => {
+                let r = w.rect.intersect(mon.rect).unwrap_or(w.rect);
+                let (px, cw, ch) = crop(screen, mon.rect, r);
+                thumbs.extend(model::thumb_of(&px, cw, ch, scale).map(|t| (w.hwnd, t)));
+            }
+            Where::Covered | Where::Monitor(_) => {
+                let (pw, ph) = ((w.rect.w() / 2).max(2), (w.rect.h() / 2).max(2));
+                thumbs.extend(model::thumb_of(&demo_picture(n, pw, ph), pw, ph, scale).map(|t| (w.hwnd, t)));
+            }
+            Where::Minimized => {}
+        }
+    }
+    (strip, thumbs)
 }
 
 /// Renders one picker state to `file` (device pixels, the monitor is 1440 x 900 DIPs at `scale`).
@@ -1305,8 +1722,33 @@ pub(crate) unsafe fn render(args: &[String]) {
     let mut out: Vec<u32>;
     let mut size = (w, h);
     match what.as_str() {
-        "shot" | "shot-window" | "shot-full" | "shot-opts" | "rec-pick" => {
+        "shot" | "shot-window" | "shot-full" | "shot-opts" | "rec-pick" | "shot-strip" | "rec-strip" => {
             match what.as_str() {
+                "shot-strip" | "rec-strip" => {
+                    snip.set_mode(Mode::Window, base);
+                    if !flag("nowin") {
+                        let (strip, thumbs) = demo_strip(scale, mon, &screen, get("n").and_then(|v| v.parse().ok()).unwrap_or(9));
+                        snip.set_strip(strip, base);
+                        for (h, th) in thumbs {
+                            snip.set_thumb(h, th);
+                        }
+                    } else {
+                        snip.set_strip(Vec::new(), base);
+                    }
+                    if let Some(n) = get("scroll").and_then(|v| v.parse::<f32>().ok()) {
+                        snip.scroll_by(n);
+                    }
+                    if let Some(i) = get("card").and_then(|v| v.parse::<usize>().ok()) {
+                        snip.point_at(Some(Ctl::Pick(i)), base + 1);
+                    } else if flag("onstrip") {
+                        snip.point_at(Some(Ctl::Strip), base + 1);
+                    } else if let Some(p) = get("cur").and_then(|v| v.split_once(',')).and_then(|(a, b)| Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?))) {
+                        snip.move_to(((p.0 * scale) as i32, (p.1 * scale) as i32), base + 1);
+                    }
+                    if flag("press") {
+                        snip.press((0, 0), Hit::Ctl(Ctl::Pick(get("card").and_then(|v| v.parse().ok()).unwrap_or(0))), base + 2);
+                    }
+                }
                 "shot-window" => {
                     snip.set_mode(Mode::Window, base);
                     snip.move_to(((get("x").and_then(|v| v.parse::<f32>().ok()).unwrap_or(620.0) * scale) as i32, (get("y").and_then(|v| v.parse::<f32>().ok()).unwrap_or(340.0) * scale) as i32), base);
@@ -1508,6 +1950,25 @@ mod tests {
         // a monitor that is not at the origin: the crop is in desktop coordinates
         let (c, _, _) = crop(&px, IRect::new(-8, 0, 0, 6), IRect::new(-6, 2, -4, 3));
         assert_eq!(c, vec![2 * 8 + 2, 2 * 8 + 3]);
+    }
+
+    /// Two windows stacked far off the screen (nobody sees them): the one underneath makes its own picture, not the one on top of it.
+    #[test]
+    fn a_covered_window_makes_its_own_picture() {
+        // SAFETY: two windows of the test's thread, made and destroyed here.
+        unsafe {
+            let make = |style: u32| CreateWindowExW(WS_EX_TOOLWINDOW, wide("STATIC").as_ptr(), wide("cover-test").as_ptr(), WS_POPUP | WS_VISIBLE | style, -20000, -20000, 120, 80, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+            let (under, over) = (make(0x6), make(0x4)); // SS_WHITERECT (the window colour), SS_BLACKRECT: the second is on top
+            assert!(!under.is_null() && !over.is_null());
+            let a = print_window(under as isize);
+            DestroyWindow(over);
+            DestroyWindow(under);
+            let (a, aw, ah) = a.expect("the covered window draws itself");
+            assert_eq!((aw, ah), (120, 80));
+            assert_eq!(a[(ah / 2 * aw + aw / 2) as usize], 0xffff_ffff, "the window underneath is white, whatever is on top of it");
+            // a window that is gone, or minimized, has no picture to make
+            assert!(print_window(under as isize).is_none());
+        }
     }
 
     #[test]
