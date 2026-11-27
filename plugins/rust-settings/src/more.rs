@@ -681,6 +681,19 @@ pub struct Assoc {
     pub protocol: bool,
 }
 
+/// What `SHOpenWithDialog` is asked: OAIF_ALLOW_REGISTRATION (1) and OAIF_REGISTER_EXT (2), the flags Explorer's "Open with > Choose another
+/// app" uses, so the user ticks "Always use this app" and Windows records it itself. Not OAIF_FORCE_REGISTRATION (8: Windows 11 refuses it from a
+/// program and says "go to Settings") and not OAIF_EXEC (4: nothing is to be run).
+pub const CHOOSER_FLAGS: u32 = 1 | 2;
+
+/// The empty sample file the chooser is pointed at: `<temp>\WinRust\defaults\Sample.<ext>` (a real file of that type, never opened). None for
+/// an extension that is not plain.
+#[must_use]
+pub fn sample_path(temp: &std::path::Path, ext: &str) -> Option<std::path::PathBuf> {
+    let e = ext.strip_prefix('.')?;
+    (!e.is_empty() && e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')).then(|| temp.join("WinRust").join("defaults").join(format!("Sample.{e}")))
+}
+
 /// An app Windows has registered for an association: its name and its exe's file name (lower case).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DefApp {
@@ -724,7 +737,11 @@ pub fn defaults_rows() -> Vec<Group> {
         head.rows = DefKind::ALL
             .iter()
             .map(|&k| match k.assoc() {
-                Some(a) => select(k.label(), k.sub().into(), Op::Def(k), format!("def:{k:?}"), &a).0,
+                Some(a) => {
+                    // a link scheme cannot be chosen in the open-with dialog: it opens Windows' own settings (which lends Explorer while open)
+                    let sub = if a.protocol { format!("{} \u{b7} {}", k.sub(), t!("откроются параметры Windows", "opens Windows Settings")) } else { k.sub().to_string() };
+                    select(k.label(), sub, Op::Def(k), format!("def:{k:?}"), &a).0
+                }
                 // WinRust's own file manager and terminal are fixed by what is installed, not a setting of Windows: shown, not offered
                 None => {
                     let own = o.own_default(k);

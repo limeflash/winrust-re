@@ -733,41 +733,55 @@ pub fn assoc_apps(a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
     (apps, cur)
 }
 
-/// Opens Windows' own chooser for `a` so the user confirms it ("Always use this app"); never sets the default itself. A file type gets the
-/// open-with dialog (registering the choice for the extension, nothing is run); a link scheme goes to Windows' default-apps page.
-pub fn assoc_pick(a: &Assoc, owner: isize, done: Ping) {
+/// Opens Windows' own chooser for `a` the way Explorer's "Open with > Choose another app" does: the dialog is pointed at a real, empty sample file
+/// of that type (never opened) with the registration flags only, so the user ticks "Always use this app" and Windows records the choice itself
+/// (nothing here writes UserChoice). When it closes the default is read again and `done` gets a line for the toast: the new default, or a hint
+/// when nothing changed. A link scheme cannot be chosen there: it opens Windows' own settings page (which lends Explorer while it is open).
+pub fn assoc_pick(a: &Assoc, owner: isize, done: Note) {
     if a.protocol {
         // Windows' page, not ours: "ms-settings:defaultapps" alone now opens this very page of WinRust Settings
         winrust_common::settings::open_windows("ms-settings:defaultapps");
         return;
     }
-    if !valid_ext(&a.name) {
-        return;
-    }
-    let file = format!("file{}", a.name);
+    let Some(sample) = crate::more::sample_path(&std::env::temp_dir(), &a.name) else { return };
+    let a = a.clone();
     std::thread::spawn(move || {
         use windows::Win32::{
             Foundation::HWND,
             System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
-            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_FORCE_REGISTRATION, OAIF_REGISTER_EXT, OPENASINFO, SHOpenWithDialog},
+            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_REGISTER_EXT, OPEN_AS_INFO_FLAGS, OPENASINFO, SHOpenWithDialog},
         };
         use windows::core::HSTRING;
-        let name = HSTRING::from(file.as_str());
-        let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_FORCE_REGISTRATION };
-        // SAFETY: a modal shell dialog on this thread, over our window; the file name is a placeholder that is never opened (no OAIF_EXEC).
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            let _ = SHOpenWithDialog(Some(HWND(owner as *mut _)), &info);
+        // an empty file of that type, made when it is not there; it is only a name for the dialog
+        if sample.parent().is_none_or(|p| std::fs::create_dir_all(p).is_err()) || (!sample.is_file() && std::fs::write(&sample, b"").is_err()) {
+            return done(t!("Не удалось подготовить образец файла", "Could not prepare the sample file").into());
         }
+        let (listed, cur0) = assoc_apps(&a);
+        let before = cur0.and_then(|c| listed.get(c)).map(|x| x.exe.clone());
+        let name = HSTRING::from(sample.as_os_str());
+        let flags = OPEN_AS_INFO_FLAGS(crate::more::CHOOSER_FLAGS as i32);
+        debug_assert_eq!(flags, OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT);
+        let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: flags };
+        // SAFETY: a modal shell dialog on this thread, over our window; the sample is an empty file that is never opened (no OAIF_EXEC).
+        let shown = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            SHOpenWithDialog(Some(HWND(owner as *mut _)), &info)
+        };
         if let Ok(mut c) = handlers_cache().lock() {
             c.clear(); // what it was is read again
         }
-        done();
+        if shown.is_err() {
+            // the dialog would not open for this type on this Windows: Windows' own settings page is the way
+            winrust_common::settings::open_windows("ms-settings:defaultapps");
+            return done(t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there").into());
+        }
+        let (apps, cur) = assoc_apps(&a);
+        let now = cur.and_then(|c| apps.get(c));
+        done(match now {
+            Some(x) if Some(&x.exe) != before.as_ref() => tf!("{} по умолчанию: {}", "Default for {}: {}", a.name, x.name),
+            _ => t!("Отметьте «Всегда использовать это приложение», чтобы оно стало основным", "Tick \u{2018}Always use this app\u{2019} to make it the default").into(),
+        });
     });
-}
-
-fn valid_ext(e: &str) -> bool {
-    e.len() > 1 && e.len() <= 21 && e.starts_with('.') && e[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')
 }
 
 /// What WinRust's own file manager and terminal are on this PC: not a Windows setting, what is installed.
