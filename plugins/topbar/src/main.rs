@@ -1376,7 +1376,7 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
         0x800C => !known() && top(), // title set: a window with no title had no button yet
         _ => top() || known(),       // created, shown, hidden, cloaked, uncloaked, minimized, restored
     };
-    if relevant && ev == 0x0016 { snapshots::capture(w); }
+    if relevant && ev == 0x0016 { snapshots::capture(w, bar); }
     if relevant && !WIN_DIRTY.replace(true) {
         SetTimer(bar, 8, 30, None);
     }
@@ -2385,6 +2385,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             search_toggle();
         }
         NEXT_LANG => next_lang(hwnd, wp == 1),
+        snapshots::SNAPSHOT => snapshots::take_done(),
+        notify::APP_NAME => notify::names_done(),
         ALT_UP if wp == 2 => alt_close(),
         ALT_UP => alt_done(wp == 1),
         SNIP if wp == 1 => screenshot_notice(hwnd),
