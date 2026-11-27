@@ -1,9 +1,11 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use windows_sys::Win32::Foundation::HINSTANCE;
 use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW, RegisterClassW, WNDCLASSW};
 use winrust_common::style::Anim;
-use crate::anim::{self, CubicBezier, POP, Transition};
+use crate::anim::{self, CubicBezier, EASE, POP, SPRING, Transition};
 use crate::gfx::{Canvas, Rect};
+use crate::widgets::overlay::{Dialog, MenuItem};
 
 /// CSS `clip-path: inset(top right bottom left round radius)`, in DIPs from the edges of the box.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,6 +150,27 @@ pub struct Cx {
     /// Where the box is on the screen (device pixels) and its scale: set by the frame for clicks and keys.
     pub at: (i32, i32),
     pub scale: f32,
+    /// What an application window is asked to do after the call (`Cx::menu`, `Cx::toast`..); the panels of the bar leave it empty.
+    pub reqs: Vec<Req>,
+    /// The application window (0 for a panel), for what needs an owner (a shell context menu, a file operation, UAC).
+    pub hwnd: isize,
+    /// Alt was held with the key (the panels never asked: `Mods` is theirs and stays as it is).
+    pub alt: bool,
+}
+
+/// What an application asks of its window through [`Cx`]; the host does it once the call has returned.
+pub enum Req {
+    Invalidate,
+    /// A one-shot timer: `App::wake` runs after this many milliseconds.
+    Wake(u32),
+    Menu { tag: u32, items: Vec<MenuItem>, at: Rect },
+    Toast { text: String, undo: Option<u32>, bottom: f32 },
+    Dialog { tag: u32, dialog: Dialog },
+    Focus(Id),
+    Title(String),
+    Cursor(Cursor),
+    Clipboard(String),
+    Close,
 }
 
 impl Cx {
@@ -180,6 +203,72 @@ impl Cx {
         self.then = Some(Box::new(f));
     }
 
+    /// Draw one more frame.
+    pub fn invalidate(&mut self) {
+        self.reqs.push(Req::Invalidate);
+    }
+
+    /// Call `App::wake` once after `ms` milliseconds.
+    pub fn wake_in(&mut self, ms: u32) {
+        self.reqs.push(Req::Wake(ms));
+    }
+
+    /// Open a menu next to `at` (an item's rectangle, or a point for a context menu); a choice comes back as
+    /// `App::command(tag, choice)`, `choice` being the item's `value` (see [`MenuItem`]).
+    pub fn menu(&mut self, tag: u32, items: Vec<MenuItem>, at: Rect) {
+        self.reqs.push(Req::Menu { tag, items, at });
+    }
+
+    /// A toast at the window's bottom; Undo comes back as `App::command(undo, 0)`.
+    pub fn toast(&mut self, text: impl Into<String>, undo: Option<u32>) {
+        self.toast_at(text, undo, 18.0);
+    }
+
+    /// Like [`Cx::toast`], `bottom` DIPs above the window's lower edge.
+    pub fn toast_at(&mut self, text: impl Into<String>, undo: Option<u32>, bottom: f32) {
+        self.reqs.push(Req::Toast { text: text.into(), undo, bottom });
+    }
+
+    /// A dialog over a scrim; the button pressed comes back as `App::command(tag, button)`.
+    pub fn dialog(&mut self, tag: u32, dialog: Dialog) {
+        self.reqs.push(Req::Dialog { tag, dialog });
+    }
+
+    /// Moves the keyboard focus to item `id` (shown with its ring as after Tab).
+    pub fn focus(&mut self, id: Id) {
+        self.reqs.push(Req::Focus(id));
+    }
+
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.reqs.push(Req::Title(title.into()));
+    }
+
+    /// The cursor until the pointer moves to another item.
+    pub fn cursor(&mut self, c: Cursor) {
+        self.reqs.push(Req::Cursor(c));
+    }
+
+    pub fn set_clipboard_text(&mut self, text: impl Into<String>) {
+        self.reqs.push(Req::Clipboard(text.into()));
+    }
+
+    /// The text on the clipboard, if there is any.
+    #[must_use]
+    pub fn clipboard_text(&self) -> Option<String> {
+        crate::window::clipboard_text(self.hwnd)
+    }
+
+    /// Close the application window (after `App::close` has agreed).
+    pub fn close_window(&mut self) {
+        self.reqs.push(Req::Close);
+    }
+
+    /// The window, for what needs an owner (0 outside a window).
+    #[must_use]
+    pub const fn hwnd(&self) -> isize {
+        self.hwnd
+    }
+
     /// Runs what the click asked for, for a window that is not the panel host (the notification pop-ups).
     pub fn finish(self) {
         if let Some(f) = self.then {
@@ -200,6 +289,104 @@ impl Cx {
 pub struct Mods {
     pub ctrl: bool,
     pub shift: bool,
+}
+
+/// An item of a window: what the app named with `f.item` while it drew.
+pub type Id = i32;
+
+/// The three window buttons; the host handles them, the caption widget draws them.
+pub const WIN_MIN: Id = -1;
+pub const WIN_MAX: Id = -2;
+pub const WIN_CLOSE: Id = -3;
+/// Ids from here down belong to the overlays (menus, dialog, toast).
+pub const OVERLAY: Id = -1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Cursor {
+    #[default]
+    Arrow,
+    Hand,
+    IBeam,
+    SizeWE,
+    SizeNS,
+    Move,
+}
+
+/// What the window knows of an item from the frame it drew last: where it is, and what the pointer may do over it.
+#[derive(Clone, Debug)]
+pub struct Hit {
+    pub id: Id,
+    pub r: Rect,
+    pub tip: Option<Cow<'static, str>>,
+    pub cursor: Cursor,
+    pub focusable: bool,
+}
+
+/// The items of the last frame in drawing order, which is also their stacking order: the last one under the pointer wins.
+#[derive(Default)]
+pub struct Hits {
+    list: Vec<Hit>,
+    clips: Vec<Rect>,
+    pub focus: Option<Id>,
+    /// Keyboard navigation shows the focus ring (`:focus-visible`); the mouse hides it again.
+    pub focus_visible: bool,
+}
+
+impl Hits {
+    /// Starts a frame.
+    pub fn clear(&mut self) {
+        self.list.clear();
+        self.clips.clear();
+    }
+
+    /// The item under a point (DIPs), the topmost.
+    #[must_use]
+    pub fn at(&self, x: f32, y: f32) -> Option<&Hit> {
+        self.list.iter().rev().find(|h| h.r.contains(x, y))
+    }
+
+    #[must_use]
+    pub fn get(&self, id: Id) -> Option<&Hit> {
+        self.list.iter().rev().find(|h| h.id == id)
+    }
+
+    #[must_use]
+    pub fn all(&self) -> &[Hit] {
+        &self.list
+    }
+
+    /// The items Tab walks through, in drawing order.
+    pub fn tab_order(&self) -> impl Iterator<Item = Id> + '_ {
+        self.list.iter().filter(|h| h.focusable).map(|h| h.id)
+    }
+
+    fn clip(&self) -> Option<Rect> {
+        self.clips.last().copied()
+    }
+}
+
+/// How an item looks this frame: the CSS states of the mockup's buttons, eased.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hot {
+    /// 0..1, `:hover` over 160 ms.
+    pub hover: f32,
+    /// 0..1, `:active` over 90 ms.
+    pub press: f32,
+    /// `:focus-visible`.
+    pub focus: bool,
+}
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));
+    Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
 
 /// What a frame hands to a content while it draws.
@@ -235,6 +422,66 @@ impl Frame<'_> {
         self.mo.go(id, HOVER, on, self.now, dur, ease)
     }
 
+    /// The window is maximized: a caption draws "restore" for "maximize".
+    #[must_use]
+    pub fn maximized(&self) -> bool {
+        self.mo.maximized
+    }
+
+    /// The window has the keyboard focus.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.mo.active
+    }
+
+    /// Names an item of an application window: records where it is (cut to the clip in force) so the host can hit-test it,
+    /// and gives its eased hover and press. Items drawn later stand over those drawn earlier.
+    pub fn item(&mut self, id: Id, r: Rect) -> Hot {
+        let r = self.mo.hits.clip().map_or(r, |c| intersect(r, c));
+        if r.w > 0.0 && r.h > 0.0 {
+            self.mo.hits.list.push(Hit { id, r, tip: None, cursor: Cursor::Arrow, focusable: false });
+        }
+        let hover = self.hover(id, 160, EASE);
+        let press = self.tween(id, 1, f32::from(self.press == Some(id)), 90, SPRING);
+        Hot { hover, press, focus: self.mo.hits.focus == Some(id) && self.mo.hits.focus_visible }
+    }
+
+    /// Like [`Frame::item`], and Tab stops here.
+    pub fn focusable(&mut self, id: Id, r: Rect) -> Hot {
+        let hot = self.item(id, r);
+        if let Some(h) = self.mo.hits.list.last_mut().filter(|h| h.id == id) {
+            h.focusable = true;
+        }
+        hot
+    }
+
+    /// The hand over the item just named (CSS `cursor: pointer`).
+    pub fn hand(&mut self) {
+        self.cursor(Cursor::Hand);
+    }
+
+    /// The cursor over the item just named.
+    pub fn cursor(&mut self, c: Cursor) {
+        if let Some(h) = self.mo.hits.list.last_mut() {
+            h.cursor = c;
+        }
+    }
+
+    /// The hint that appears after the pointer rests on the item just named (CSS `title`).
+    pub fn tip(&mut self, text: impl Into<Cow<'static, str>>) {
+        if let Some(h) = self.mo.hits.list.last_mut() {
+            h.tip = Some(text.into());
+        }
+    }
+
+    /// Runs `body` with everything it draws and every item it names cut to `r` (a scrolled body, a list).
+    pub fn clipped(&mut self, c: &mut Canvas<'_>, r: Rect, body: impl FnOnce(&mut Canvas<'_>, &mut Self)) {
+        let r = self.mo.hits.clip().map_or(r, |k| intersect(r, k));
+        self.mo.hits.clips.push(r);
+        c.clipped(r, |c| body(c, self));
+        self.mo.hits.clips.pop();
+    }
+
     /// `animation: <keyframes> <dur>ms <ease> <delay>ms backwards` of an item that rises in at the opening: before its delay it
     /// is invisible and displaced by `dy` and scaled by `k`.
     #[must_use]
@@ -260,6 +507,12 @@ impl Frame<'_> {
 pub struct Motion {
     t: HashMap<(i32, u8), Transition>,
     pub mode: Option<Anim>,
+    /// The items an application window drew (the panels of the bar do not name any).
+    pub hits: Hits,
+    /// The application window is maximized (it draws its restore button, its corners are square).
+    pub maximized: bool,
+    /// The window has the keyboard focus.
+    pub active: bool,
 }
 
 impl Motion {

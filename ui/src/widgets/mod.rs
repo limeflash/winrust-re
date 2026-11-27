@@ -1,0 +1,6 @@
+//! The widgets every application window is made of. Immediate mode like the bar's panels: a function draws and names its items
+//! with `Frame::item`; the click comes back to `App::click(id)`.
+pub mod button;
+pub mod caption;
+pub mod look;
+pub mod overlay;
