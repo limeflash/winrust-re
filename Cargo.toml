@@ -14,6 +14,17 @@ test = false # the embedded manifest demands admin: a test exe could not start f
 name = "install-selection"
 path = "src/selection.rs"
 
+# The window of src/ui/ without the admin manifest and without the system: fake install steps, so `--render`, `--bench` and
+# `--selftest` can run it from a normal shell (see src/ui_preview.rs). An example target gets no manifest from build.rs.
+[[example]]
+name = "installer-ui"
+path = "src/ui_preview.rs"
+
+# The window's model and its message flow, driven with no window (harness off: it needs a COM thread and the host's Core).
+[[test]]
+name = "installer-ui-tests"
+path = "src/ui_tests.rs"
+
 [[test]]
 name = "update-manifest"
 path = "src/update/manifest.rs"
@@ -23,9 +34,13 @@ path = "src/update/swap.rs"
 
 [dependencies]
 winrust-common = { path = "common" }
+winrust-ui = { path = "ui" } # the window: host, widgets, Direct2D renderer
 ed25519-dalek = "2.1.1" # signed update manifests (src/update)
 sha2 = "0.10.8"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+# WIC decodes the PNG previews embedded in the exe
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
 
 [build-dependencies]
 embed-resource = "3"

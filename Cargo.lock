@@ -467,8 +467,10 @@ dependencies = [
  "ed25519-dalek",
  "embed-resource",
  "sha2",
+ "windows",
  "windows-sys",
  "winrust-common",
+ "winrust-ui",
 ]
 
 [[package]]
