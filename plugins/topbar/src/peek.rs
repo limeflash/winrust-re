@@ -4,7 +4,7 @@
 //! DWM does this for Windows' own taskbar (Aero Peek) and exposes it only through `dwmapi` export #113, the undocumented
 //! `DwmpActivateLivePreview(BOOL on, HWND peek, HWND topmost, UINT kind, void* reserved)` (it has no name in the import
 //! library). Measured on 10.0.28000: `on = 1, peek = the desktop window, kind = 1` hides every other window (the bar
-//! included, whatever is passed as `topmost`); `on = 0` brings them back; the peek ends by itself when the process dies.
+//! included unless it is excluded from peek (`DWMWA_EXCLUDED_FROM_PEEK`, set on the bar windows in `bars::create`); `topmost` did nothing); `on = 0` brings them back; the peek ends by itself when the process dies.
 //! `kind` 2..4 does nothing to app windows. It is looked up at run time: where it is missing, nothing happens.
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::HWND;

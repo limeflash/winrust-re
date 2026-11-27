@@ -251,7 +251,7 @@ unsafe fn tip_text(h: i32) -> String {
         TAPP => "Hidden icons".into(),
         REC_I => t!("Остановить запись (Win+Shift+R)", "Stop and save (Win+Shift+R)", ja: "録画を停止して保存 (Win+Shift+R)", pt: "Parar e salvar (Win+Shift+R)", zh: "停止并保存 (Win+Shift+R)").into(),
         GEAR => t!("Настройки панели", "Bar settings", ja: "バーの設定", pt: "Configurações da barra", zh: "任务栏设置").into(),
-        SHOWDESK if desk_on() => t!("Вернуть окна", "Bring the windows back", ja: "ウィンドウを元に戻す", pt: "Trazer as janelas de volta", zh: "还原窗口").into(),
+        SHOWDESK if desk_on() => t!("Вернуть окна · Win+D · наведите, чтобы заглянуть", "Bring the windows back · Win+D · hover to peek", ja: "ウィンドウを元に戻す · Win+D · ポイントでプレビュー", pt: "Trazer as janelas de volta · Win+D · aponte para espiar", zh: "还原窗口 · Win+D · 悬停以预览").into(),
         SHOWDESK => t!("Показать рабочий стол · Win+D · наведите, чтобы заглянуть", "Show desktop · Win+D · hover to peek", ja: "デスクトップを表示 · Win+D · ポイントでプレビュー", pt: "Mostrar a área de trabalho · Win+D · aponte para espiar", zh: "显示桌面 · Win+D · 悬停以预览").into(),
         CLOCK => {
             let mut t: SYSTEMTIME = zeroed();
