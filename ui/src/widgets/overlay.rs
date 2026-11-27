@@ -555,7 +555,7 @@ impl Overlays {
                     let hot = f.item(TOAST_UNDO, b);
                     f.hand();
                     c.fill(b, 14.0, Rgba::white(0.1 + 0.06 * hot.hover));
-                    c.text("Undo", b, label, look::accent(), Align::Center);
+                    c.text("Undo", b, label, look::accent().accent_text(), Align::Center);
                 }
             });
         });
