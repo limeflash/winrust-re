@@ -1220,3 +1220,31 @@ fn the_microphone_list_shows_discord_once_and_names_the_webview_properly() {
     let mic = s.pg.groups[0].rows.iter().find(|l| l.key == "now:microphone").unwrap();
     assert!(mic.sub.contains("Discord"), "{}", mic.sub);
 }
+
+#[test]
+fn the_accent_swatches_reach_the_accent_and_show_the_current_one() {
+    let (mut s, d) = win("personal");
+    let line = |s: &Settings| s.pg.groups[1].rows.iter().find(|l| l.key == "accent").map(|l| (l.opts.len(), l.cur)).unwrap();
+    assert_eq!(line(&s), (winrust_common::style::Accent::ALL.len(), Some(0)), "the demo's accent is the first");
+    press(&mut s, |l| matches!(&l.row, Row::Cycle(_, _, Op::Accent)), P_SEG + 3);
+    assert_eq!(d.log(), vec!["accent_set 3"]);
+    assert_eq!(line(&s), (5, Some(3)), "the page was read again");
+    Rig::new("personal").frame();
+}
+
+#[test]
+fn a_wallpaper_tile_reaches_the_system_and_the_current_one_is_marked() {
+    let (mut s, d) = win("personal");
+    let on = |s: &Settings| match &s.pg.groups[0].extra {
+        Extra::Walls(w) => w.iter().position(|w| w.on),
+        _ => None,
+    };
+    assert_eq!(on(&s), Some(0));
+    click(&mut s, ID_WALL + 2);
+    assert_eq!(d.log(), vec!["wallpaper_select 2"]);
+    assert_eq!(on(&s), Some(2), "the picked preset is the selected one");
+    // the "Choose..." tile is the last one
+    d.clear_log();
+    click(&mut s, ID_WALL + 5);
+    assert_eq!(d.log(), vec!["wallpaper_pick"]);
+}

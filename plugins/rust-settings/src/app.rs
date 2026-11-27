@@ -228,6 +228,8 @@ pub struct Settings {
     give_up: Option<u64>,
     tick_at: Option<u64>,
     pub demo_clicks: Vec<Id>,
+    /// The thumbnails of the Personalization page's wallpapers as pictures of the device (by the thumbnail's address).
+    pub wall_pics: Vec<(usize, winrust_ui::gfx::Picture)>,
     /// The size of the window, DIPs (the picture of the arrangement is mapped from it).
     pub win: (f32, f32),
 }
@@ -287,6 +289,7 @@ impl Settings {
             give_up: None,
             tick_at: None,
             demo_clicks: Vec::new(),
+            wall_pics: Vec::new(),
             win: (1000.0, 720.0),
         };
         s.read_page();
@@ -330,6 +333,7 @@ impl Settings {
         let o = os();
         match i {
             NET_PAGE => o.wifi_scan(),
+            crate::PERSONAL_PAGE => o.wall_prepare(ping()),
             BT_PAGE => o.bt_refresh(ping()),
             POWER_PAGE if !o.temp_measured() => o.temp_measure(ping()),
             _ => {}
@@ -1127,7 +1131,7 @@ impl App for Settings {
                 if k >= n {
                     self.run_cmd("", "", Cmd::Wallpaper, cx);
                 } else {
-                    os().wallpaper_select(k);
+                    os().wallpaper_select(k, note());
                     self.read_page();
                 }
             }

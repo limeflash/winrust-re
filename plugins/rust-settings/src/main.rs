@@ -46,6 +46,7 @@ mod power;
 mod search;
 mod sys;
 mod sysx;
+mod wall;
 mod wifi;
 mod wu;
 #[cfg(test)]
@@ -122,6 +123,8 @@ pub enum Op {
     Opt(more::Opt),
     /// The tab of the Privacy page's App access list.
     PvTab,
+    /// The accent colour of every WinRust program (the swatches of Personalization).
+    Accent,
     /// The Keyboard page's "Try it" field: nothing to do, the field is only there to hold keys down in.
     Try,
 }
@@ -359,13 +362,15 @@ pub struct Wall {
     pub label: String,
     pub fill: Fill,
     pub on: bool,
+    /// The picture itself (the real wallpaper's thumbnail), when it has been decoded; else `fill` is drawn.
+    pub pic: Option<std::sync::Arc<wall::Thumb>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Fill {
     Solid(u32),
-    /// 160 degrees: top, middle (at 60 %), bottom.
-    Gradient(u32, u32, u32),
+    /// 160 degrees: top, middle (at the given position, 0..1), bottom.
+    Gradient(u32, u32, u32, f32),
 }
 
 /// The button at the right of a group's title.
@@ -549,7 +554,7 @@ pub fn listed(op: Op) -> bool {
 
 /// Rows drawn as a segmented control whenever they have a list (a click on a segment picks it).
 pub fn is_seg(op: Op) -> bool {
-    matches!(op, Op::Topology | Op::Plan | Op::PvTab) || matches!(op, Op::Opt(o) if o.segmented())
+    matches!(op, Op::Topology | Op::Plan | Op::PvTab | Op::Accent) || matches!(op, Op::Opt(o) if o.segmented())
 }
 
 /// The values a list offers and the index of the current one. None when there is nothing to choose.
@@ -583,6 +588,7 @@ pub fn choices(op: Op) -> Option<(Vec<String>, Option<usize>)> {
         }
         Op::Night => (night_labels(), ext::NIGHT_STEPS.iter().position(|&k| k == o.night_kelvin())),
         Op::Opt(x) => o.opt_list(x),
+        Op::Accent => (winrust_common::style::Accent::ALL.iter().map(|a| a.name().to_string()).collect(), Some(o.accent())),
         Op::PvTab => (more::Cap::ALL.iter().map(|c| c.name().to_string()).collect(), more::Cap::ALL.iter().position(|&c| c == more::pv_tab())),
         Op::Plan => o.power_plans(),
         Op::Screen => o.power_timeouts(power::Timeout::Screen),
@@ -652,6 +658,7 @@ pub fn choose(op: Op, i: usize) -> Done {
                 done = Done::Denied;
             }
         }
+        (Op::Accent, _) => o.accent_set(i),
         (Op::PvTab, _) => {
             if let Some(&c) = more::Cap::ALL.get(i) {
                 more::set_pv_tab(c);
@@ -1168,7 +1175,12 @@ fn personal_rows() -> Vec<Group> {
             Line::new(toggle_row(t!("Тёмная тема для приложений", "Dark theme for apps", ja: "アプリのダーク テーマ", pt: "Tema escuro para apps", zh: "应用深色主题"), PERSONALIZE, "AppsUseLightTheme", 0, 1)).subtitle(t!("Это окно, файловый менеджер, диспетчер задач", "This window, the file manager, Task Manager")),
             Line::new(toggle_row(t!("Тёмная тема для системы", "Dark theme for the system", ja: "システムのダーク テーマ", pt: "Tema escuro para o sistema", zh: "系统深色主题"), PERSONALIZE, "SystemUsesLightTheme", 0, 1)).subtitle(t!("Панель, Пуск и уведомления", "The bar, Start and notifications")),
             Line::new(toggle_row(t!("Эффекты прозрачности", "Transparency effects", ja: "透明効果", pt: "Efeitos de transparência", zh: "透明效果"), PERSONALIZE, "EnableTransparency", 1, 1)),
-            Line::new(toggle_row(t!("Акцентный цвет на заголовках окон", "Accent color on title bars", ja: "タイトル バーにアクセント カラーを表示", pt: "Cor de destaque nas barras de título", zh: "标题栏上的强调色"), r"Software\Microsoft\Windows\DWM", "ColorPrevalence", 1, 0)),
+            Line::new(toggle_row(t!("Акцентный цвет на заголовках окон", "Accent colour on title bars", ja: "タイトル バーにアクセント カラーを表示", pt: "Cor de destaque nas barras de título", zh: "标题栏上的强调色"), r"Software\Microsoft\Windows\DWM", "ColorPrevalence", 1, 0)),
+            {
+                let mut l = Line::new(Row::Cycle(t!("Акцентный цвет", "Accent colour", ja: "アクセント カラー", pt: "Cor de destaque", zh: "强调色").into(), String::new, Op::Accent)).key("accent");
+                l.h = Some(48.0);
+                l
+            },
         ]),
         Group::new(t!("Язык", "Language", ja: "言語", pt: "Idioma", zh: "语言")).rows(vec![Line::new(Row::Cycle(t!("Язык интерфейса", "Interface language", ja: "表示言語", pt: "Idioma da interface", zh: "界面语言").into(), lang_text, Op::UiLang))]),
     ]

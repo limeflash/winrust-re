@@ -144,7 +144,13 @@ pub trait Os {
     fn user_name(&self) -> String;
     fn set_lang(&self, l: winrust_common::Lang) -> bool;
     /// Picks the demo's picture `k` of the Personalization page (nothing in the real one: it has only the picker).
-    fn wallpaper_select(&self, k: usize);
+    /// Picks tile `k` of `wallpapers()`; a preset is drawn and set off the window's thread and `done` says what came of it.
+    fn wallpaper_select(&self, k: usize, done: Note);
+    /// Decodes the thumbnail of the picture that is the wallpaper (off the window's thread); `done` says it is ready.
+    fn wall_prepare(&self, done: Ping);
+    /// The WinRust accent now (an index of `style::Accent::ALL`) and setting it (the bar and every program follow).
+    fn accent(&self) -> usize;
+    fn accent_set(&self, i: usize);
 
     // ---- Notifications, Privacy & security, Keyboard & mouse, Date & time (more.rs)
     /// The entries of a list and the current one.
@@ -457,13 +463,13 @@ impl Os for Live {
         sys::announce_theme();
     }
     fn wallpaper_name(&self) -> String {
-        sys::wallpaper_name()
+        crate::wall::name()
     }
     fn wallpaper_pick(&self, owner: isize) -> Result<(), ()> {
         sys::pick_wallpaper(hw(owner))
     }
     fn wallpapers(&self) -> Vec<crate::Wall> {
-        Vec::new()
+        crate::wall::walls()
     }
     fn windows_value(&self, name: &str) -> String {
         sys::string(HKEY_LOCAL_MACHINE, crate::NT, name).unwrap_or_default()
@@ -484,7 +490,20 @@ impl Os for Live {
     fn set_lang(&self, l: winrust_common::Lang) -> bool {
         winrust_common::set_lang(l)
     }
-    fn wallpaper_select(&self, _k: usize) {}
+    fn wallpaper_select(&self, k: usize, done: Note) {
+        crate::wall::select(k, done);
+    }
+    fn wall_prepare(&self, done: Ping) {
+        crate::wall::prepare(done);
+    }
+    fn accent(&self) -> usize {
+        winrust_common::style::accent() as usize
+    }
+    fn accent_set(&self, i: usize) {
+        if let Some(&a) = winrust_common::style::Accent::ALL.get(i) {
+            winrust_common::style::set_accent(a);
+        }
+    }
     fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>) {
         sysx::opt_list(o)
     }

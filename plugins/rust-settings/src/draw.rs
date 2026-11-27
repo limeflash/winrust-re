@@ -4,7 +4,7 @@
 use winrust_ui::{
     anim::{EASE, LINEAR, SPRING},
     frame::{Cursor, Frame, Id, WIN_CLOSE, WIN_MAX, WIN_MIN},
-    gfx::{Align, Canvas, Font, Rect, Rgba},
+    gfx::{Align, Canvas, Font, Picture, Rect, Rgba, Sample, Xf},
     widgets::{
         button::{self, segmented_width},
         field::field_with,
@@ -30,6 +30,9 @@ const VIEW_W: f32 = 640.0;
 const GAP: f32 = 22.0;
 /// The scrollbar the mockup's browser reserves beside a scrolled page.
 const BAR_W: f32 = 10.0;
+
+/// One cell of the accent swatches.
+const SWATCH: f32 = 30.0;
 
 const BODY_M: Font = Font::new(13.0, 500);
 const SMALL: Font = Font::new(12.0, 400);
@@ -476,7 +479,7 @@ impl Settings {
                     Extra::Hero(h) => paint_hero(c, f, ex, h),
                     Extra::Battery(b) => paint_battery(c, ex, b.as_ref()),
                     Extra::Drives(d) => paint_drives(c, ex, d),
-                    Extra::Walls(wl) => paint_walls(c, f, ex, wl),
+                    Extra::Walls(wl) => paint_walls(c, f, ex, wl, &mut me.wall_pics),
                     Extra::Search(count) => {
                         let count = count.clone();
                         me.paint_app_search(c, f, ex, &count);
@@ -640,6 +643,7 @@ impl Settings {
             Row::Toggle { .. } | Row::Switch(..) | Row::Flag(..) => v.push(RItem::Switch(l.on, l.dis)),
             Row::Gauge(..) => v.push(RItem::Slider { w: 260.0, v: l.vol, mute: None }),
             Row::Cycle(_, _, Op::Try) => {}
+            Row::Cycle(_, _, Op::Accent) => v.push(RItem::Swatches(l.opts.len(), l.cur.unwrap_or(usize::MAX))),
             Row::Cycle(_, _, op) if is_seg(*op) && !l.opts.is_empty() && !matches!(op, Op::Topology | Op::Plan) => v.push(RItem::Seg(l.opts.clone(), l.cur.unwrap_or(usize::MAX))),
             Row::Info(..) => {
                 if !l.val.is_empty() {
@@ -797,6 +801,29 @@ impl Settings {
                 self.slider(c, f, id(P_CTL), track, val, v.is_some(), flat, mute.is_some_and(|m| m.1));
                 let pct = format!("{}", (val * 100.0).round() as u32);
                 c.text(&pct, Rect::new(x + *sw - 34.0, r.y, 34.0, r.h), BODY.tabular(), T2, Align::End);
+            }
+            RItem::Swatches(n, sel) => {
+                let b = Rect::new(x, r.cy() - 15.0, *n as f32 * SWATCH, 30.0);
+                c.fill(b, 8.0, look::ui::WELL);
+                for i in 0..*n {
+                    let cell = Rect::new(b.x + i as f32 * SWATCH + 2.0, b.y + 2.0, SWATCH - 4.0, 26.0);
+                    let hot = f.focusable(id(P_SEG + i as Id), cell);
+                    f.hand();
+                    let on = f.tween(id(P_SEG + i as Id), 2, f32::from(i == *sel), 200, EASE);
+                    if on > 0.0 {
+                        c.faded(on, |c| {
+                            c.shadow(cell, 6.0, 1.0, 2.0, Rgba::css(0, 0, 0, 0.25));
+                            c.fill(cell, 6.0, CARD);
+                            c.ring(cell, 6.0, 1.0, ink(0.08));
+                        });
+                    }
+                    c.fill(cell, 6.0, ink(0.05 * hot.hover));
+                    let col = winrust_common::style::Accent::ALL.get(i).map_or(T2, |a| Rgba::colorref(a.color()));
+                    c.circle(cell.cx(), cell.cy(), 3.5, col);
+                    if hot.focus {
+                        c.ring(cell.inset(-1.0), 7.0, 2.0, winrust_ui::widgets::look::focus_ring().fade(0.9));
+                    }
+                }
             }
             RItem::Steps(step, label) => {
                 let track = Rect::new(x, r.cy() - 10.0, w - 62.0, 20.0);
@@ -1170,6 +1197,8 @@ enum RItem {
     Btns(Vec<RBtn>),
     Slider { w: f32, v: Option<f32>, mute: Option<(Op, bool)> },
     Steps(usize, String),
+    /// The accent swatches: how many, which is chosen.
+    Swatches(usize, usize),
 }
 
 struct RBtn {
@@ -1198,6 +1227,7 @@ fn item_width(c: &mut Canvas<'_>, it: &RItem) -> f32 {
         RItem::Btns(list) => list.iter().map(|b| btn_width(c, b)).sum::<f32>() + 6.0 * (list.len().saturating_sub(1)) as f32,
         RItem::Slider { w, .. } => *w,
         RItem::Steps(..) => 300.0,
+        RItem::Swatches(n, _) => *n as f32 * SWATCH,
     }
 }
 
@@ -1367,7 +1397,7 @@ fn paint_drives(c: &mut Canvas<'_>, r: Rect, drives: &[Drive]) {
     }
 }
 
-fn paint_walls(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, walls: &[crate::Wall]) {
+fn paint_walls(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, walls: &[crate::Wall], pics: &mut Vec<(usize, Picture)>) {
     let mut x = r.x + 14.0;
     let y = r.y + 14.0;
     for (i, w) in walls.iter().enumerate() {
@@ -1376,9 +1406,25 @@ fn paint_walls(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, walls: &[crate::W
         f.hand();
         let lift = f.tween(ID_WALL + i as Id, 13, hot.hover, 200, SPRING);
         let b = b.shift(0.0, -2.0 * lift);
+        // the real wallpaper's thumbnail is made into a picture once (again after a lost device)
+        let pic = w.pic.as_ref().and_then(|t| {
+            let key = std::sync::Arc::as_ptr(t) as usize;
+            let at = pics.iter().position(|(k, p)| *k == key && c.is_current(p));
+            at.or_else(|| {
+                pics.retain(|(k, _)| *k != key);
+                c.pixels(&t.px, t.w as i32, t.h as i32).map(|p| {
+                    pics.push((key, p));
+                    pics.len() - 1
+                })
+            })
+        });
         match w.fill {
+            _ if pic.is_some() => {
+                let p = &pics[pic.unwrap_or(0)].1;
+                c.masked(b, 9.0, Xf::NONE, |c| c.picture_in(p, b, 0.0, 1.0, Sample::Smooth));
+            }
             Fill::Solid(col) => c.fill(b, 9.0, look::rgb(col)),
-            Fill::Gradient(a, m, z) => c.gradient_angle(b, 9.0, 160.0, &[(0.0, look::rgb(a)), (0.6, look::rgb(m)), (1.0, look::rgb(z))]),
+            Fill::Gradient(a, m, z, at) => c.gradient_angle(b, 9.0, 160.0, &[(0.0, look::rgb(a)), (at, look::rgb(m)), (1.0, look::rgb(z))]),
         }
         if w.on {
             c.ring(b.inset(-2.0), 11.0, 2.0, CARD);

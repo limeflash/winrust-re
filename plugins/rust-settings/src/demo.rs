@@ -88,6 +88,8 @@ struct State {
     security: Security,
     /// Changes that need administrator rights are refused.
     deny_admin: bool,
+    /// The WinRust accent (an index of `style::Accent::ALL`).
+    accent: usize,
 }
 
 /// The demo source. `log` says what a test or a render asked it to change.
@@ -251,10 +253,10 @@ impl Demo {
             wu: wu::State { busy: None, found: Some(Vec::new()), note: "Last checked today, 17:02".into() },
             wu_extra: WuExtra::default(),
             walls: vec![
-                ("Obsidian (current)".into(), Fill::Gradient(0x1a2a46, 0x14203a, 0x0a0f1a)),
-                ("Dusk".into(), Fill::Gradient(0x1e2a4a, 0x4a2a5e, 0xc2546a)),
-                ("Sea".into(), Fill::Gradient(0x0b3d4f, 0x1f7a8c, 0x9fd3c7)),
-                ("Sand".into(), Fill::Gradient(0x3b2f2a, 0x8c6a4f, 0xe7c9a0)),
+                ("Obsidian (current)".into(), Fill::Gradient(0x1a2a46, 0x14203a, 0x0a0f1a, 0.6)),
+                ("Dusk".into(), Fill::Gradient(0x1e2a4a, 0x4a2a5e, 0xc2546a, 0.6)),
+                ("Sea".into(), Fill::Gradient(0x0b3d4f, 0x1f7a8c, 0x9fd3c7, 0.55)),
+                ("Sand".into(), Fill::Gradient(0x3b2f2a, 0x8c6a4f, 0xe7c9a0, 0.55)),
                 ("Graphite".into(), Fill::Solid(0x2a2c33)),
             ],
             wall: 0,
@@ -266,6 +268,7 @@ impl Demo {
             consent: demo_consent(),
             security: Security { av: Some(true), fw: Some(true), sig: "1.421.316.0".into(), sig_when: Some(when(0, 7, 14)), smart: "Warn".into(), scanning: false, scanned: false },
             deny_admin: false,
+            accent: 0,
         };
         Self { s: RefCell::new(s), log: RefCell::new(Vec::new()) }
     }
@@ -749,7 +752,7 @@ impl Os for Demo {
         Ok(())
     }
     fn wallpapers(&self) -> Vec<Wall> {
-        self.with(|s| s.walls.iter().enumerate().map(|(i, (label, fill))| Wall { label: label.clone(), fill: *fill, on: i == s.wall }).collect())
+        self.with(|s| s.walls.iter().enumerate().map(|(i, (label, fill))| Wall { label: label.clone(), fill: *fill, on: i == s.wall, pic: None }).collect())
     }
     fn windows_value(&self, name: &str) -> String {
         match name {
@@ -773,9 +776,17 @@ impl Os for Demo {
         self.with(|s| s.lang = l);
         true
     }
-    fn wallpaper_select(&self, k: usize) {
+    fn wallpaper_select(&self, k: usize, _done: Note) {
         self.note(format!("wallpaper_select {k}"));
         self.with(|s| s.wall = k.min(s.walls.len() - 1));
+    }
+    fn wall_prepare(&self, _done: Ping) {}
+    fn accent(&self) -> usize {
+        self.with(|s| s.accent)
+    }
+    fn accent_set(&self, i: usize) {
+        self.note(format!("accent_set {i}"));
+        self.with(|s| s.accent = i.min(winrust_common::style::Accent::ALL.len() - 1));
     }
     fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>) {
         let sec = |n: &[u32]| -> Vec<String> { n.iter().map(|&v| if v >= 60 { format!("{} min", v / 60) } else { format!("{v} s") }).collect() };
