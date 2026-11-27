@@ -582,6 +582,11 @@ impl Disk {
         if !d.tree.recs.contains_key(&id) || id == ROOT {
             return;
         }
+        if !crate::delete::deletable(std::path::Path::new(&d.path(id))) {
+            let name = d.name(id).to_string();
+            self.say(format!("Windows needs {name}: it isn’t deleted from here"), false, false);
+            return;
+        }
         let parent = d.tree.recs[&id].parent;
         self.dlg = Some(Dlg { id, name: d.name(id).to_string(), dir: d.is_dir(id), size: d.size(id), parent: d.path(parent), how: DEFAULT_HOW });
     }

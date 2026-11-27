@@ -25,15 +25,39 @@ fn allowed(p: &Path) -> bool {
     matches!(parts.next(), Some(Component::Prefix(_))) && matches!(parts.next(), Some(Component::RootDir)) && parts.clone().next().is_some() && parts.all(|c| matches!(c, Component::Normal(n) if n != "?"))
 }
 
+/// What Windows or every account needs, refused even when confirmed (this program runs as administrator): the system folders at a
+/// drive's top, the NTFS `$` files there, a whole user profile, and the folders right inside `Windows` (System32, WinSxS…). What
+/// is inside them can still go: a cache, a game, a download.
+// ponytail: the names are checked on every drive, not only the system one; a `D:\Users` of a data drive is refused too
+fn protected(p: &Path) -> bool {
+    let names: Vec<String> = p.components().filter_map(|c| match c {
+        Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+        _ => None,
+    }).collect();
+    match names.as_slice() {
+        [top] => top.starts_with('$') || matches!(top.as_str(), "windows" | "program files" | "program files (x86)" | "programdata" | "users" | "recovery" | "boot" | "system volume information"),
+        [first, _] => first == "users" || first == "windows",
+        _ => false,
+    }
+}
+
+/// A path the deleter accepts: see [`allowed`] and [`protected`]. The app asks before it shows the dialog.
+pub fn deletable(p: &Path) -> bool {
+    allowed(p) && !protected(p)
+}
+
 /// Deletes `paths`. Blocks until the shell is done, so call it from a worker thread. `confirmed` is the dialog's answer: without it
-/// nothing is touched. Fails when any path is not one of a drive's files and folders (see [`allowed`]), before the shell has been
-/// asked about any, and when something is still there afterwards.
+/// nothing is touched. Fails when any path is not [`deletable`], before the shell has been asked about any, and when something is
+/// still there afterwards.
 pub fn delete(paths: &[PathBuf], how: How, confirmed: bool) -> Result<(), String> {
     if !confirmed {
         return Err("Deletion requires confirmation".into());
     }
     if paths.is_empty() || !paths.iter().all(|p| allowed(p)) {
         return Err("Not a path that can be deleted".into());
+    }
+    if paths.iter().any(|p| protected(p)) {
+        return Err("Windows needs it".into());
     }
     let paths = paths.to_vec();
     // COM wants its own apartment: a thread that is only that
@@ -125,6 +149,18 @@ mod tests {
         assert!(keep.exists());
         assert!(allowed(&keep) && allowed(Path::new("D:\\x")) && !allowed(Path::new("D:\\")));
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn what_windows_needs_is_refused_even_when_confirmed_but_not_what_is_inside() {
+        for bad in ["C:\\Windows", "C:\\windows\\System32", "C:\\Windows\\WinSxS", "C:\\Program Files", "C:\\Program Files (x86)", "C:\\ProgramData", "C:\\Users", "C:\\Users\\Daniiar", "C:\\$MFT", "C:\\System Volume Information", "C:\\Recovery"] {
+            assert!(!deletable(Path::new(bad)), "{bad}");
+            // refused before the shell hears of it: these paths are never touched
+            assert_eq!(delete(&[PathBuf::from(bad)], How::Permanently, true), Err("Windows needs it".into()), "{bad}");
+        }
+        for ok in ["C:\\Windows\\SoftwareDistribution\\Download", "C:\\Users\\Daniiar\\Downloads", "C:\\Program Files\\Some Game", "C:\\Games", "D:\\Videos\\a.mkv"] {
+            assert!(deletable(Path::new(ok)), "{ok}");
+        }
     }
 
     /// Touches the real Recycle Bin of the user: run by hand (`cargo test -- --ignored`).
