@@ -107,7 +107,7 @@ fn reveal(st: &mut ListState, view_h: f32, content: f32, top: f32, bottom: f32, 
             // the first row brings the padding above it into view, the last the padding below it
             let y = if i == 0 { 0.0 } else { top + i as f32 * pitch };
             let h = row_h + if i == 0 { top } else { 0.0 } + if i + 1 == st.len() { bottom } else { 0.0 };
-            st.scroll.ensure_visible(y, h, now);
+            st.bring(y, h, now);
         }
         st.shown = st.cursor;
     }
@@ -134,7 +134,7 @@ pub fn grid_with(c: &mut Canvas<'_>, f: &mut Frame<'_>, base: Id, r: Rect, st: &
     st.scroll.set_extent(content, r.h);
     if st.cursor != st.shown {
         if let Some(i) = st.cursor {
-            st.scroll.ensure_visible(look.top + (i / cols) as f32 * pitch, cell_h, f.now);
+            st.bring(look.top + (i / cols) as f32 * pitch, cell_h, f.now);
         }
         st.shown = st.cursor;
     }
@@ -310,7 +310,7 @@ pub fn list_grouped(
             let lead = if heads.binary_search_by_key(&i, |h| h.before).is_ok() { hp } else { 0.0 };
             let y = if i == 0 { 0.0 } else { look.top + grouped_y(i, heads, pitch, hp) - lead };
             let h = row_h + lead + if i == 0 { look.top } else { 0.0 } + if i + 1 == n { look.bottom } else { 0.0 };
-            st.scroll.ensure_visible(y, h, f.now);
+            st.bring(y, h, f.now);
         }
         st.shown = st.cursor;
     }

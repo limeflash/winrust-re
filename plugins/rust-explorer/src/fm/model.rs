@@ -39,6 +39,7 @@ pub const ID_VIEW: Id = 8; // 8 list, 9 icons
 pub const ID_PV: Id = 10;
 pub const ID_MORE: Id = 11;
 pub const ID_NEWTAB: Id = 12;
+pub const ID_REFRESH: Id = 13;
 pub const ID_TAB: Id = 20; // 20..60
 pub const ID_TAB_X: Id = 60; // 60..100
 pub const ID_CRUMB: Id = 100; // 100..140
@@ -468,6 +469,12 @@ impl Fm {
         names.iter().filter_map(|n| self.rows.iter().position(|r| r.name.eq_ignore_ascii_case(n))).collect()
     }
 
+    /// Picks the rows called `names` and puts the cursor on the first, in the middle of the list when it is off-screen ("Show in folder").
+    pub fn reveal_names(&mut self, names: &[String]) {
+        self.select_names(names);
+        self.list.center_next = true;
+    }
+
     /// Selects the rows called `names` and puts the cursor on the first.
     pub fn select_names(&mut self, names: &[String]) {
         let idx = self.names_to_rows(names);
@@ -481,6 +488,9 @@ impl Fm {
     /// window as it is.
     pub fn load(&mut self, dir: PathBuf, record: bool, keep: bool, cx: &mut Cx) {
         let names = if keep { self.sel_names() } else { Vec::new() };
+        // the same folder read again keeps where the list was scrolled to; only another folder starts at the top
+        let same = keep && dir == self.dir && !self.searching();
+        let before = same.then(|| (self.list.scroll.clone(), self.list.cursor.or_else(|| self.list.sel.iter().next().copied())));
         let mut rows;
         if dir == pc_dir() {
             self.places = self.be.places();
@@ -524,6 +534,15 @@ impl Fm {
         self.set_rows(rows);
         if !names.is_empty() {
             self.select_names(&names);
+            // what was picked is gone (deleted, renamed): the item that took its place is picked, the last one's neighbour before it
+            if self.list.sel.is_empty() && !self.rows.is_empty() {
+                let at = before.as_ref().and_then(|b| b.1).unwrap_or(0).min(self.rows.len() - 1);
+                self.list.click(at, false, false);
+                self.list.shown = None;
+            }
+        }
+        if let Some((scroll, _)) = before {
+            self.list.scroll = scroll; // brought into view again only if the cursor row is off-screen
         }
         self.addr_edit = false;
         self.addr.set_text(&self.dir_text());

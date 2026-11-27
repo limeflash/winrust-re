@@ -903,3 +903,78 @@ fn drives_nearly_full_are_told_apart_by_their_percentage() {
     let c = t.fm.places.drives.iter().find(|d| d.root == PathBuf::from(r"C:\")).unwrap();
     assert!(c.used_pct() < 90);
 }
+
+/// Scrolls the list of `t` to `y` at once, as a user's wheel and a few frames would leave it.
+fn scrolled_to(t: &mut T, y: f32) {
+    t.fm.list.scroll.set_extent(10_000.0 * 37.0, 600.0);
+    t.fm.list.scroll.scroll_to(y, 0);
+    t.fm.list.scroll.settle();
+}
+
+fn many(t: &T) -> usize {
+    t.fm.rows.len()
+}
+
+#[test]
+fn a_refresh_of_the_same_folder_keeps_the_scroll_and_a_deleted_row_hands_the_pick_to_its_neighbour() {
+    let mut t = T::new("many");
+    assert_eq!(many(&t), 10_000);
+    scrolled_to(&mut t, 5000.0 * 37.0);
+    t.fm.list.shown = t.fm.list.cursor; // what the frames did
+    t.select("file 05001.txt");
+    t.fm.list.shown = t.fm.list.cursor;
+    let at = t.fm.list.scroll.target();
+    let i = t.row("file 05001.txt");
+    // another program deletes it: the watcher's reload
+    t.fake.fs.lock().unwrap().get_mut(&PathBuf::from(r"C:\Many")).unwrap().retain(|r| r.name != "file 05001.txt");
+    t.press(VK_F5);
+    assert_eq!(t.fm.list.scroll.target(), at, "the list stays where it was");
+    assert_eq!(t.fm.list.sel.len(), 1);
+    assert_eq!(t.one().as_deref(), Some(t.fm.rows[i].name.as_str()), "the next item took the deleted one's place");
+    assert_eq!(t.fm.list.cursor, Some(i));
+    // the last row deleted: the one before it
+    let n = many(&t);
+    t.fm.list.click(n - 1, false, false);
+    let last = t.fm.rows[n - 1].name.clone();
+    t.fake.fs.lock().unwrap().get_mut(&PathBuf::from(r"C:\Many")).unwrap().retain(|r| r.name != last);
+    t.press(VK_F5);
+    assert_eq!(t.fm.list.cursor, Some(n - 2));
+    // a plain refresh keeps the pick and the offset
+    let (sel, off) = (t.fm.sel_names(), t.fm.list.scroll.target());
+    t.press(VK_F5);
+    assert_eq!((t.fm.sel_names(), t.fm.list.scroll.target()), (sel, off));
+    // another folder starts at the top
+    let mut cx = Cx::default();
+    t.fm.go(PathBuf::from(r"C:\Windows"), &mut cx);
+    assert_eq!(t.fm.list.scroll.target(), 0.0);
+}
+
+#[test]
+fn show_in_folder_asks_for_the_row_to_be_centred_when_it_is_off_screen() {
+    let mut t = T::new("many");
+    t.fm.reveal_names(&["file 05001.txt".to_string()]);
+    assert!(t.fm.list.center_next && t.fm.list.shown.is_none());
+    assert_eq!(t.one().as_deref(), Some("file 05001.txt"));
+    // the host's frame: the list brings the row in, in the middle, with no glide
+    let mut l = std::mem::take(&mut t.fm.list);
+    l.scroll.set_extent(10_000.0 * 37.0, 600.0);
+    let y = 5000.0 * 37.0;
+    l.bring(y, 36.0, 0);
+    assert!((l.scroll.offset(0) - (y + 18.0 - 300.0)).abs() < 0.5, "{}", l.scroll.offset(0));
+    assert!(!l.center_next);
+    // already in view: it stays
+    let off = l.scroll.target();
+    l.center_next = true;
+    l.bring(off + 100.0, 36.0, 0);
+    assert_eq!(l.scroll.target(), off);
+}
+
+#[test]
+fn the_refresh_button_reloads_like_f5_and_keeps_the_pick() {
+    let mut t = T::new("folder");
+    t.select("Windows");
+    let era = t.fm.era;
+    t.click(ID_REFRESH, Button::Left);
+    assert!(t.fm.era > era, "the folder was listed again");
+    assert_eq!(t.one().as_deref(), Some("Windows"));
+}

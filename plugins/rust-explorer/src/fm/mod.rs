@@ -58,7 +58,7 @@ pub fn open(dir: PathBuf, pick: Option<String>) -> i32 {
     fm.load(dir.clone(), true, false, &mut cx);
     fm.places = places.join().unwrap_or_default();
     if let Some(name) = pick {
-        fm.select_names(&[name]);
+        fm.reveal_names(&[name]);
     }
     let place = place_path("rust-explorer");
     if let Some(p) = &place {

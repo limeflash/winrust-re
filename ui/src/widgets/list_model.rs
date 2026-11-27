@@ -26,8 +26,23 @@ pub struct ListState {
     pub shown: Option<usize>,
     /// How many cells a line of a grid has (0 in a list): [`super::list::grid`] writes it so that Up and Down know their step.
     pub cols: usize,
+    /// The next time the cursor row is brought into view and is off-screen, it is put in the middle (a file picked by "Show in
+    /// folder"), and at once, with no glide.
+    pub center_next: bool,
 }
 impl ListState {
+    /// Brings the span `top .. top + h` of the content into view: by the least scrolling, or centred when `center_next` asked.
+    pub fn bring(&mut self, top: f32, h: f32, now: u64) {
+        if std::mem::take(&mut self.center_next) {
+            let (at, view) = (self.scroll.target(), self.scroll.view());
+            if top < at || top + h > at + view {
+                self.scroll.scroll_to(top + h / 2.0 - view / 2.0, now);
+                self.scroll.settle();
+            }
+        } else {
+            self.scroll.ensure_visible(top, h, now);
+        }
+    }
     pub fn click(&mut self, i: usize, ctrl: bool, shift: bool) {
         if shift {
             let a = self.anchor.unwrap_or(i);

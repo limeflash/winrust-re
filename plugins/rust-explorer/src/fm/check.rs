@@ -437,6 +437,7 @@ fn selftest() -> i32 {
 
     // the live parts, on a temp folder of its own
     live_parts(&mut rep, &o("rust_explorer_selftest_live"));
+    pick_parts(&mut rep, &o("rust_explorer_selftest_pick"));
 
     // memory: the folder's menu and an item's, thirty times
     let (fm, _) = demo::build("folder");
@@ -513,5 +514,51 @@ fn live_parts(rep: &mut Report, o: &Options) {
     // SAFETY: a query of a handle that may be gone.
     rep.check(unsafe { IsWindow(hwnd as HWND) } == 0, "the live window is gone too");
     crate::shellwin::revoke();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Where row `i` stands in the window and whether it is inside the list's viewport (None: it is not drawn at all).
+fn row_in_view(hwnd: isize, i: usize) -> Option<bool> {
+    probe::with_core(hwnd, |c| {
+        let r = c.hits().get(row_id(ID_LIST, i)).map(|h| h.r)?;
+        let v = c.hits().get(ID_LIST).map(|h| h.r)?;
+        Some(r.y >= v.y - 0.5 && r.y + r.h <= v.y + v.h + 0.5)
+    })
+    .flatten()
+}
+
+/// "Show in folder" from another app: the file is picked and brought into view, in a window that is made on it (`/select,`) and in one
+/// that is open on another file of the same folder (the shell's `SelectItem`, which arrives as a message).
+fn pick_parts(rep: &mut Report, o: &Options) {
+    let d = temp_folder("pick", 400);
+    let be: Arc<dyn Backend> = Arc::new(Real);
+    let mut fm = Fm::new(be, d.clone());
+    fm.flags_from_backend();
+    fm.places = fm.be.places();
+    let mut cx = winrust_ui::frame::Cx::default();
+    fm.load(d.clone(), true, false, &mut cx);
+    fm.reveal_names(&["file 00350.txt".to_string()]);
+    let Some(hwnd) = probe::make(Box::new(fm), o, gfx::compose_windows(), (-5000, -5000)) else {
+        rep.check(false, "a window on a folder of 400 files can be made");
+        let _ = std::fs::remove_dir_all(&d);
+        return;
+    };
+    probe::show_off_screen(hwnd);
+    probe::pump(1200);
+    let at = |h: isize, i: usize| row_in_view(h, i);
+    rep.check(at(hwnd, 350) == Some(true), &format!("a window made with /select, shows the picked file (row 350 of 400) inside the list: {:?}", at(hwnd, 350)));
+    let picked = |h: isize, i: usize| probe::with_core(h, |c| c.hits().get(row_id(ID_LIST, i)).is_some()).unwrap_or(false);
+    rep.check(picked(hwnd, 350), "... and it is drawn");
+    // the shell asks an open window to show another file of the folder
+    let want = d.join("file 00020.txt");
+    probe::send(hwnd, crate::shellwin::WM_SHELL_SELECT, 0, Box::into_raw(Box::new(want)) as isize);
+    probe::pump(1200);
+    rep.check(at(hwnd, 20) == Some(true), &format!("SelectItem on an open window: file 20 is in view ({:?})", at(hwnd, 20)));
+    let want = d.join("file 00399.txt");
+    probe::send(hwnd, crate::shellwin::WM_SHELL_SELECT, 0, Box::into_raw(Box::new(want)) as isize);
+    probe::pump(1200);
+    rep.check(at(hwnd, 399) == Some(true), &format!("... and file 399 at the other end ({:?})", at(hwnd, 399)));
+    probe::destroy(hwnd);
+    probe::pump(100);
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -128,7 +128,7 @@ impl Fm {
         }
         let Some(name) = self.be.new_entry(&self.dir, folder) else { return };
         let d = self.dir.clone();
-        self.load(d, false, false, cx);
+        self.load(d, false, true, cx);
         self.select_names(std::slice::from_ref(&name));
         if let Some(i) = self.one() {
             self.rename_begin(i, cx);
@@ -194,7 +194,7 @@ impl Fm {
         match self.be.rename(&self.dir, &old, &new) {
             Ok(()) => {
                 let d = self.dir.clone();
-                self.load(d, false, false, cx);
+                self.load(d, false, true, cx);
                 self.select_names(std::slice::from_ref(&new));
             }
             Err(e) => cx.toast(e, None),
