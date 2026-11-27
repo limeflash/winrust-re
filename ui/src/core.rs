@@ -109,6 +109,8 @@ pub struct Core {
     last_click: Option<(Id, u64, f32, f32)>,
     cursor: Option<Cursor>,
     pub hwnd: isize,
+    /// Shift and Ctrl at the last click or key: what the host tells it (`Cx::mods`).
+    pub held: Mods,
     born: u64,
     redraw: bool,
     host: Vec<HostReq>,
@@ -131,6 +133,7 @@ impl Core {
             last_click: None,
             cursor: None,
             hwnd: 0,
+            held: Mods::default(),
             born: now,
             redraw: false,
             host: Vec::new(),
@@ -138,7 +141,7 @@ impl Core {
     }
 
     fn cx(&self) -> Cx {
-        Cx { scale: self.scale, hwnd: self.hwnd, ..Cx::default() }
+        Cx { scale: self.scale, hwnd: self.hwnd, focus: self.mo.hits.focus, mods: self.held, pointer: self.pointer, ..Cx::default() }
     }
 
     pub fn hits(&self) -> &Hits {
@@ -149,6 +152,7 @@ impl Core {
     pub fn draw(&mut self, c: &mut Canvas<'_>, now: u64) {
         self.mo.mode = Some(style::anim());
         self.mo.hits.clear();
+        self.mo.due = None;
         self.mo.maximized = self.maximized;
         self.mo.active = self.active;
         let (w, h) = self.size;
@@ -160,6 +164,7 @@ impl Core {
             c.round_corners(win, RADIUS);
             c.ring(win, RADIUS, 1.0, Rgba::white(0.08));
         }
+        self.mo.sweep(now);
         self.redraw = false;
     }
 
@@ -172,7 +177,16 @@ impl Core {
     /// The time a frame is due though nothing moves (a hint's delay, a toast's end).
     #[must_use]
     pub fn deadline(&self, now: u64) -> Option<u64> {
-        self.ov.deadline(now)
+        match (self.ov.deadline(now), self.mo.due.filter(|&d| d > now)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Where the focused text field's caret is, in DIPs of the client (the IME puts its windows there).
+    #[must_use]
+    pub fn ime_caret(&self) -> Option<Rect> {
+        self.mo.hits.caret
     }
 
     /// An `invalidate` has not been answered with a frame yet.
@@ -303,6 +317,7 @@ impl Core {
 
     /// Wheel notches over the window (positive `dy` scrolls up, as the wheel reports it).
     pub fn wheel(&mut self, dx: f32, dy: f32, mods: Mods, now: u64) {
+        self.held = mods;
         if self.ov.modal() {
             return;
         }
@@ -324,6 +339,7 @@ impl Core {
 
     /// A key went down; true when it was used.
     pub fn key(&mut self, vk: u32, mods: Mods, alt: bool, now: u64) -> bool {
+        self.held = mods;
         const TAB: u32 = 0x09;
         const ENTER: u32 = 0x0D;
         const ESC: u32 = 0x1B;
