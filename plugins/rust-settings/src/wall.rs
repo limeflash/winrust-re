@@ -40,7 +40,10 @@ pub struct Thumb {
 const THUMB: (u32, u32) = (276, 180);
 
 /// The presets of the design: id, name, the stops of `linear-gradient(160deg, ...)` (position 0..1, 0xRRGGBB); one stop is a plain colour.
-pub const PRESETS: [(&str, &str, &[(f32, u32)]); 4] = [
+/// The stops of a preset: position 0..1 and 0xRRGGBB.
+pub type Stops = &'static [(f32, u32)];
+
+pub const PRESETS: [(&str, &str, Stops); 4] = [
     ("dusk", "Dusk", &[(0.0, 0x1e2a4a), (0.6, 0x4a2a5e), (1.0, 0xc2546a)]),
     ("sea", "Sea", &[(0.0, 0x0b3d4f), (0.55, 0x1f7a8c), (1.0, 0x9fd3c7)]),
     ("sand", "Sand", &[(0.0, 0x3b2f2a), (0.55, 0x8c6a4f), (1.0, 0xe7c9a0)]),
@@ -293,7 +296,9 @@ mod tests {
     fn print_walls() {
         println!("current {:?}, name {:?}", current_path(), name());
         let (tx, rx) = std::sync::mpsc::channel();
-        prepare(Box::new(move || drop(tx.send(()))));
+        prepare(Box::new(move || {
+            let _ = tx.send(());
+        }));
         let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
         for w in walls() {
             println!("{} on={} thumb={:?}", w.label, w.on, w.pic.as_ref().map(|t| (t.w, t.h, t.px[t.px.len() / 2] & 0xffffff)));

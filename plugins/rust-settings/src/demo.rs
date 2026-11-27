@@ -251,7 +251,7 @@ impl Demo {
                 app_entry("Visual Studio Code", "1.95.3", "Microsoft Corporation"),
             ],
             wu: wu::State { busy: None, found: Some(Vec::new()), note: "Last checked today, 17:02".into() },
-            wu_extra: WuExtra::default(),
+            wu_extra: WuExtra { last_check: Some(when(0, 17, 2)), last_install: Some(when(3, 8, 40)), ..WuExtra::default() },
             walls: vec![
                 ("Obsidian (current)".into(), Fill::Gradient(0x1a2a46, 0x14203a, 0x0a0f1a, 0.6)),
                 ("Dusk".into(), Fill::Gradient(0x1e2a4a, 0x4a2a5e, 0xc2546a, 0.6)),
@@ -334,12 +334,12 @@ impl Demo {
             "wu-available" => s.wu = wu::State { busy: None, found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() },
             "wu-installing" => {
                 s.wu = wu::State { busy: Some("Downloading and installing updates\u{2026}".into()), found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() };
-                s.wu_extra = WuExtra { progress: Some(46), restart: false };
+                s.wu_extra = WuExtra { progress: Some(46), restart: false, ..s.wu_extra };
             }
             "wu-checking" | "update-checking" => s.wu = wu::State { busy: Some("Checking for updates\u{2026}".into()), found: None, note: String::new() },
             "wu-restart" => {
                 s.wu = wu::State { busy: None, found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() };
-                s.wu_extra = WuExtra { progress: None, restart: true };
+                s.wu_extra = WuExtra { progress: None, restart: true, ..s.wu_extra };
             }
             "appearance-night-light" => s.night = 4800,
             "display-single" => {
@@ -712,6 +712,10 @@ impl Os for Demo {
     }
     fn wu_extra(&self) -> WuExtra {
         self.with(|s| s.wu_extra)
+    }
+    fn restart_now(&self) -> bool {
+        self.note("restart_now");
+        true
     }
     fn wu_check(&self, _done: Ping) {
         self.note("wu_check");

@@ -4,7 +4,7 @@
 use super::*;
 use crate::{
     more::{Cap, Flag, Gauge, Opt, Who},
-    app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
+    app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_BODY, P_CTL, P_CTL2, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
     demo::{self, Demo},
 };
 use std::rc::Rc;
@@ -1247,4 +1247,41 @@ fn a_wallpaper_tile_reaches_the_system_and_the_current_one_is_marked() {
     d.clear_log();
     click(&mut s, ID_WALL + 5);
     assert_eq!(d.log(), vec!["wallpaper_pick"]);
+}
+
+#[test]
+fn the_update_status_says_when_windows_last_looked_and_not_the_verdict_twice() {
+    let (s, _d) = win("wu-up-to-date");
+    let st = &s.pg.groups[0].rows[0];
+    assert!(st.sub.contains("17:02"), "{}", st.sub);
+    assert_ne!(st.sub, os().wu_state().note);
+    assert_ne!(st.sub, st.row.label(), "the title is the verdict, the line under it is not");
+    assert!(st.sub.contains('\u{b7}'), "and the last installation: {}", st.sub);
+    // not looked in this window yet: Windows' own date instead of a bare "Not checked yet"
+    let d = Rc::new(Demo::for_state("wu-up-to-date"));
+    os::set_os(d.clone());
+    let mut w = Settings::new(WU_PAGE);
+    w.reread();
+    assert!(!w.pg.groups[0].rows[0].sub.is_empty());
+}
+
+#[test]
+fn restart_now_needs_a_second_click_and_only_then_restarts() {
+    let (mut s, d) = win("wu-restart");
+    let st = |l: &Line| l.key == "wu-status";
+    assert!(s.pg.groups[0].rows[0].restart);
+    press(&mut s, st, P_CTL2);
+    assert!(d.log().is_empty(), "the first click only arms the button: {:?}", d.log());
+    assert_eq!(s.armed.as_deref(), Some("wu-restart"));
+    let cx = press(&mut s, st, P_CTL2);
+    assert_eq!(d.log(), vec!["restart_now"]);
+    assert_eq!(toasts(&cx).len(), 1);
+    // "Later" does nothing to the machine
+    d.clear_log();
+    press(&mut s, st, P_CTL);
+    assert!(d.log().is_empty());
+    // leaving the page disarms it
+    press(&mut s, st, P_CTL2);
+    click(&mut s, ID_NAV);
+    assert!(s.armed.is_none());
 }

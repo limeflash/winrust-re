@@ -284,6 +284,12 @@ pub fn when_text(w: When) -> String {
     }
 }
 
+/// `when_text` inside a sentence: "last checked today, 17:02", "last checked 20 Nov".
+#[must_use]
+pub fn when_sentence(w: When) -> String {
+    if w.days_ago < 2 { lower_first(&when_text(w)) } else { when_text(w) }
+}
+
 fn lower_first(s: &str) -> String {
     let mut c = s.chars();
     c.next().map_or_else(String::new, |f| f.to_lowercase().chain(c).collect())

@@ -1121,11 +1121,21 @@ fn wu_rows() -> Vec<Group> {
     let o = os();
     let (s, extra) = (o.wu_state(), o.wu_extra());
     let n = s.found.as_ref().map_or(0, Vec::len);
+    let installed = extra.last_install.map(|w| tf!("установлено: {}", "installed {}", more::when_sentence(w)));
     let (title, sub, tile) = match (&s.busy, &s.found) {
         (Some(b), _) => (b.clone(), extra.progress.map_or_else(|| t!("Это займёт некоторое время · можно работать", "This takes a while \u{b7} you can keep working").to_string(), |p| tf!("{}% · можно работать", "{}% \u{b7} you can keep working", p)), Tile::Lit(look::REFRESH)),
         (_, _) if extra.restart => (t!("Установлено. Перезагрузите, чтобы завершить", "Installed. Restart to finish").to_string(), t!("Windows завершит обновление при перезагрузке", "Windows finishes the updates while it restarts").to_string(), Tile::Soft(look::WARN, Tone::Warn)),
-        (_, None) => (t!("Ещё не проверялось", "Not checked yet", ja: "まだ確認していません", pt: "Ainda não verificado", zh: "尚未检查").to_string(), s.note.clone(), Tile::Quiet(look::REFRESH)),
-        (_, Some(f)) if f.is_empty() => (t!("Всё установлено", "You\u{2019}re up to date", ja: "最新の状態です", pt: "Atualizado", zh: "已是最新").to_string(), s.note.clone(), Tile::Soft(look::CHECK, Tone::Good)),
+        // not looked in this window yet: what Windows itself last did, when it says
+        (_, None) => match extra.last_check {
+            Some(w) => (tf!("Windows проверяла: {}", "Windows last checked {}", more::when_sentence(w)), installed.clone().unwrap_or_else(|| t!("Нажмите «Проверить», чтобы увидеть, что ждёт установки", "Check for updates to see what is waiting").to_string()), Tile::Quiet(look::REFRESH)),
+            None => (t!("Ещё не проверялось", "Not checked yet", ja: "まだ確認していません", pt: "Ainda não verificado", zh: "尚未检查").to_string(), s.note.clone(), Tile::Quiet(look::REFRESH)),
+        },
+        // the verdict is the title; the line under it says when Windows last looked (and what it last installed)
+        (_, Some(f)) if f.is_empty() => {
+            let looked = extra.last_check.map(|w| tf!("Последняя проверка: {}", "Last checked {}", more::when_sentence(w)));
+            let sub = [looked, installed.clone()].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ");
+            (t!("Всё установлено", "You\u{2019}re up to date", ja: "最新の状態です", pt: "Atualizado", zh: "已是最新").to_string(), sub, Tile::Soft(look::CHECK, Tone::Good))
+        }
         (_, Some(_)) => (tf!("Доступно обновлений: {}", "{} updates are available", ja: "利用可能な更新プログラム: {}", pt: "Atualizações disponíveis: {}", zh: "可用更新：{}", n), t!("Для установки нужны права администратора", "Installing needs administrator rights").to_string(), Tile::Soft(look::WARN, Tone::Warn)),
     };
     let cmd = if s.found.as_ref().is_some_and(|f| !f.is_empty()) && s.busy.is_none() { Cmd::Install } else { Cmd::Check };

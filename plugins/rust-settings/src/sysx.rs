@@ -121,6 +121,11 @@ fn when(ft: u64) -> Option<When> {
     }
 }
 
+/// Unix seconds (UTC) as a moment of the user's day.
+pub fn when_unix(secs: i64) -> Option<When> {
+    u64::try_from(secs + 11_644_473_600).ok().and_then(|s| when(s * 10_000_000))
+}
+
 fn today() -> (u32, u32, u32) {
     // SAFETY: a plain clock read.
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };

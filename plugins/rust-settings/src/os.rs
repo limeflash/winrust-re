@@ -33,7 +33,11 @@ pub struct Battery {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WuExtra {
     pub progress: Option<u8>,
+    /// Windows needs a restart to finish updates.
     pub restart: bool,
+    /// When Windows (or this window) last looked for updates, and when it last installed some.
+    pub last_check: Option<crate::more::When>,
+    pub last_install: Option<crate::more::When>,
 }
 
 pub trait Os {
@@ -123,6 +127,8 @@ pub trait Os {
     fn uninstall(&self, cmd: &str) -> bool;
     fn wu_state(&self) -> wu::State;
     fn wu_extra(&self) -> WuExtra;
+    /// Restarts the PC now (the user confirmed); false when Windows refused.
+    fn restart_now(&self) -> bool;
     fn wu_check(&self, done: Ping);
     fn wu_install(&self, done: Ping);
 
@@ -435,7 +441,13 @@ impl Os for Live {
         wu::state()
     }
     fn wu_extra(&self) -> WuExtra {
-        WuExtra::default()
+        let i = wu::info();
+        // our own search of this session may be newer than what Windows wrote down
+        let last = i.checked.into_iter().chain(i.search).max();
+        WuExtra { progress: None, restart: i.restart, last_check: last.and_then(sysx::when_unix), last_install: i.install.and_then(sysx::when_unix) }
+    }
+    fn restart_now(&self) -> bool {
+        wu::restart()
     }
     fn wu_check(&self, done: Ping) {
         wu::check(done);

@@ -701,7 +701,7 @@ impl Settings {
                     if l.busy {
                         v.push(RItem::Btns(vec![RBtn { label: l.val.clone(), kind: BKind::Quiet, busy: true, dis: true }]));
                     } else if l.restart {
-                        v.push(RItem::Btns(vec![RBtn { label: t!("Позже", "Later").into(), kind: BKind::Quiet, busy: false, dis: false }, RBtn { label: t!("Перезагрузить", "Restart now").into(), kind: BKind::Primary, busy: false, dis: false }]));
+                        v.push(RItem::Btns(vec![RBtn { label: t!("Позже", "Later").into(), kind: BKind::Quiet, busy: false, dis: false }, RBtn { label: if self.armed.as_deref() == Some("wu-restart") { t!("Нажмите ещё раз: перезагрузка", "Click again to restart").into() } else { t!("Перезагрузить", "Restart now").into() }, kind: if self.armed.as_deref() == Some("wu-restart") { BKind::Danger } else { BKind::Primary }, busy: false, dis: false }]));
                     } else if matches!(cmd, Cmd::Install) {
                         v.push(RItem::Btns(vec![RBtn { label: t!("Скачать и установить", "Download and install", ja: "ダウンロードしてインストール", pt: "Baixar e instalar", zh: "下载并安装").into(), kind: BKind::Primary, busy: false, dis: false }]));
                     } else {

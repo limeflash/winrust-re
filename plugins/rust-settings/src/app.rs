@@ -811,7 +811,16 @@ impl Settings {
             Do::Disconnect => self.wifi_disconnect(cx),
             Do::Hidden => self.connect_hidden(cx),
             Do::Later => self.say(t!("Windows завершит обновление при следующей перезагрузке", "Windows will finish the next time you restart"), cx),
-            Do::Restart => self.say(t!("Перезагрузка…", "Restarting…"), cx),
+            Do::Restart => {
+                // the first click arms the button ("Click again to restart"), the second restarts the PC
+                if self.once_more("wu-restart") {
+                    if os().restart_now() {
+                        self.say(t!("Перезагрузка…", "Restarting\u{2026}"), cx);
+                    } else {
+                        self.say(t!("Windows не разрешила перезагрузку", "Windows did not allow the restart"), cx);
+                    }
+                }
+            }
         }
         cx.invalidate();
     }
