@@ -18,7 +18,7 @@ use winrust_ui::{
 
 use super::{
     backend::Do,
-    live::{MSG_DONE, MSG_DRAG_DONE, MSG_MENU_OWN, MSG_BACK, MSG_FORWARD, MSG_NEWTAB, MSG_OPEN, MSG_REGISTER, MSG_PLACES, MSG_RELOAD, MSG_RENAME, MSG_THUMB, MSG_TICK, ThumbMsg},
+    live::{MSG_DONE, MSG_DRAG_DONE, MSG_MENU_OWN, MSG_BACK, MSG_FORWARD, MSG_NEWTAB, MSG_OPEN, MSG_REGISTER, MSG_PLACES, MSG_RELOAD, MSG_RENAME, MSG_THUMB, MSG_TICK, MSG_WATCH, ThumbMsg},
     model::*,
 };
 
@@ -240,6 +240,10 @@ impl App for Fm {
     fn start(&mut self, hwnd: isize) {
         self.hwnd = hwnd;
         self.be.run(hwnd, Do::Start);
+        // the folder was listed before the window was there: it is watched for the window now
+        if !self.at_pc() && !self.searching() {
+            self.be.run(hwnd, Do::Navigated(self.dir.clone()));
+        }
     }
 
     fn demo_clicks(&self) -> Vec<Id> {
@@ -581,6 +585,7 @@ impl App for Fm {
 
     fn message(&mut self, msg: u32, wp: usize, lp: isize, cx: &mut Cx) {
         match msg {
+            MSG_WATCH => self.watch_event(wp == 1, cx),
             MSG_REGISTER => self.be.run(self.hwnd, Do::Register),
             MSG_BACK => self.back(cx),
             MSG_FORWARD => self.forward(cx),
@@ -657,6 +662,13 @@ impl App for Fm {
         let _ = lp;
         self.settle(cx);
         cx.invalidate();
+    }
+
+    fn wake(&mut self, cx: &mut Cx) {
+        if self.watch_pending {
+            self.watch_event(false, cx);
+            self.settle(cx);
+        }
     }
 
     fn drag_over(&mut self, paths: &[String], x: f32, y: f32) -> bool {

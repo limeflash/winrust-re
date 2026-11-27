@@ -128,8 +128,10 @@ pub enum Do {
     Thumb { path: PathBuf, icon: bool, size: i32 },
     Eject(PathBuf),
     JobCancel,
-    /// The folder shown changed: other programs that ask the shell what this window shows are told.
+    /// The folder shown changed: other programs that ask the shell what this window shows are told, and the folder is watched.
     Navigated(PathBuf),
+    /// Nothing is watched (This PC, search results).
+    Unwatch,
     /// The window exists: it takes the messages the host does not know.
     Start,
     /// Registers the window as a shell window (after the first frame: Windows' shell is asked, which takes a moment).
@@ -140,6 +142,10 @@ pub trait Backend: Send + Sync {
     fn clock(&self) -> Clock;
     /// The rows of `dir` (date headings included when `o.group`), None when it cannot be read.
     fn list(&self, dir: &Path, o: &Opts) -> Option<Vec<Row>>;
+    /// [`Backend::list`] to look at only (the watcher asks whether anything changed): it does not make what workers were asked for stale.
+    fn peek(&self, dir: &Path, o: &Opts) -> Option<Vec<Row>> {
+        self.list(dir, o)
+    }
     /// Puts `rows` (a listing without date headings) in the order of `o`, with the date headings when `o.group`.
     fn sort(&self, rows: &mut Vec<Row>, o: &Opts);
     /// A folder (or something inside an archive) the address bar may open.
@@ -182,16 +188,20 @@ impl Backend for Real {
     }
 
     fn list(&self, dir: &Path, o: &Opts) -> Option<Vec<Row>> {
+        let rows = self.peek(dir, o);
+        if rows.is_some() {
+            crate::GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        rows
+    }
+
+    fn peek(&self, dir: &Path, o: &Opts) -> Option<Vec<Row>> {
         use std::sync::atomic::Ordering::Relaxed;
         crate::SORT_COL.store(o.col, Relaxed);
         crate::SORT_ASC.store(o.asc, Relaxed);
         crate::SHOW_HIDDEN.store(o.hidden, Relaxed);
         crate::THUMBS.store(o.icons, Relaxed);
-        let rows = crate::rows_of(&dir.to_path_buf());
-        if rows.is_some() {
-            crate::GEN.fetch_add(1, Relaxed);
-        }
-        rows
+        crate::rows_of(&dir.to_path_buf())
     }
 
     fn sort(&self, rows: &mut Vec<Row>, o: &Opts) {

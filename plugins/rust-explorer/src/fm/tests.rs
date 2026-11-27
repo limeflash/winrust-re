@@ -117,7 +117,7 @@ impl T {
 }
 
 fn quiet(calls: Vec<String>) -> Vec<String> {
-    calls.into_iter().filter(|c| !c.starts_with("Navigated(") && !c.starts_with("Sizes {")).collect()
+    calls.into_iter().filter(|c| !c.starts_with("Navigated(") && !c.starts_with("Sizes {") && c != "Unwatch").collect()
 }
 
 const VK_BACK: u32 = 0x08;
@@ -977,4 +977,85 @@ fn the_refresh_button_reloads_like_f5_and_keeps_the_pick() {
     t.click(ID_REFRESH, Button::Left);
     assert!(t.fm.era > era, "the folder was listed again");
     assert_eq!(t.one().as_deref(), Some("Windows"));
+}
+
+fn watch(t: &mut T, gone: bool) {
+    let mut cx = t.cx(false);
+    t.fm.message(super::live::MSG_WATCH, usize::from(gone), 0, &mut cx);
+    t.settle(cx);
+}
+
+fn add_file(t: &T, dir: &str, name: &str) {
+    let r = Row { name: name.into(), dir: false, size: 5, time: 1, icon: -1, hdr: false };
+    t.fake.fs.lock().unwrap().get_mut(&PathBuf::from(dir)).unwrap().push(r);
+}
+
+#[test]
+fn the_watchers_reload_keeps_the_scroll_and_the_pick_and_an_unchanged_listing_is_no_reload() {
+    let mut t = T::new("many");
+    scrolled_to(&mut t, 4000.0 * 37.0);
+    t.select("file 04100.txt");
+    t.fm.list.shown = t.fm.list.cursor;
+    let (at, era) = (t.fm.list.scroll.target(), t.fm.era);
+    watch(&mut t, false);
+    assert_eq!(t.fm.era, era, "nothing changed: no listing was taken for the window");
+    add_file(&t, r"C:\Many", "zzz new.txt");
+    watch(&mut t, false);
+    assert_eq!(t.fm.rows.len(), 10_001);
+    assert_eq!(t.fm.list.scroll.target(), at);
+    assert_eq!(t.one().as_deref(), Some("file 04100.txt"));
+    assert!(!t.fm.nav_fresh, "no slide-in for a refresh");
+    // our own operation and the echo: the second telling finds the listing the same
+    t.message(MSG_RELOAD);
+    let era = t.fm.era;
+    watch(&mut t, false);
+    assert_eq!(t.fm.era, era);
+}
+
+#[test]
+fn the_watcher_waits_for_a_rename_a_drag_or_a_menu_to_end() {
+    let mut t = T::new("folder");
+    t.select("config.toml");
+    t.press(VK_F2);
+    add_file(&t, r"C:\", "new.txt");
+    watch(&mut t, false);
+    assert!(t.fm.watch_pending && t.fm.ren.is_some(), "the rename box is not taken away");
+    assert_eq!(t.fm.rows.len(), 10);
+    t.press(VK_ESCAPE);
+    let mut cx = t.cx(false);
+    t.fm.wake(&mut cx);
+    assert!(!t.fm.watch_pending);
+    assert_eq!(t.fm.rows.len(), 11);
+    // a menu open
+    add_file(&t, r"C:\", "newer.txt");
+    t.fm.menu_open = true;
+    watch(&mut t, false);
+    assert_eq!(t.fm.rows.len(), 11);
+    t.fm.menu_open = false;
+    t.fm.wake(&mut Cx::default());
+    assert_eq!(t.fm.rows.len(), 12);
+    // a drag
+    add_file(&t, r"C:\", "newest.txt");
+    t.fm.dragging = true;
+    watch(&mut t, false);
+    assert_eq!(t.fm.rows.len(), 12);
+}
+
+#[test]
+fn a_watched_folder_that_goes_takes_the_window_to_the_nearest_folder_above_and_search_and_this_pc_are_not_watched() {
+    let mut t = T::new("deep");
+    t.fm.go(PathBuf::from(r"C:\Projects\WinRust\plugins"), &mut Cx::default());
+    t.fake.fs.lock().unwrap().remove(&PathBuf::from(r"C:\Projects\WinRust\plugins"));
+    t.fake.fs.lock().unwrap().remove(&PathBuf::from(r"C:\Projects\WinRust"));
+    watch(&mut t, true);
+    assert_eq!(t.dir(), r"C:\Projects");
+    let _ = t.calls();
+    t.fm.go(pc_dir(), &mut Cx::default());
+    assert!(t.fake.take_calls().contains(&"Unwatch".to_string()), "This PC is not watched");
+    watch(&mut t, false);
+    assert!(t.fm.at_pc());
+    let mut t = T::new("search");
+    let era = t.fm.era;
+    watch(&mut t, false);
+    assert_eq!(t.fm.era, era);
 }

@@ -509,6 +509,37 @@ fn live_parts(rep: &mut Report, o: &Options) {
     plain_key(hwnd, 0x0D);
     probe::pump(200);
     rep.check(d.join("Docs").is_dir() && !d.join("New folder").exists() && !d.join("Новая папка").exists(), "typing a name and Enter renames it on disk");
+    // another thread creates, renames and deletes files: the listing follows within about a second (the watcher)
+    let count = |h: isize| (0..64).filter(|&i| has(h, row_id(ID_LIST, i))).count();
+    let follows = |h: isize, want: usize, limit: u128| {
+        let t0 = Instant::now();
+        while t0.elapsed().as_millis() < limit {
+            probe::pump(50);
+            if count(h) == want {
+                return Some(t0.elapsed().as_millis());
+            }
+        }
+        None
+    };
+    let n0 = count(hwnd);
+    let dd = d.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = std::fs::write(dd.join("w1.txt"), b"x");
+        std::thread::sleep(std::time::Duration::from_millis(1900));
+        let _ = std::fs::rename(dd.join("w1.txt"), dd.join("w2.txt"));
+        let _ = std::fs::write(dd.join("w3.txt"), b"x");
+        std::thread::sleep(std::time::Duration::from_millis(1900));
+        let _ = std::fs::remove_file(dd.join("w2.txt"));
+        let _ = std::fs::remove_file(dd.join("w3.txt"));
+    });
+    let a = follows(hwnd, n0 + 1, 1800);
+    rep.check(a.is_some(), &format!("a file made by another thread shows in the listing ({n0} -> {} rows, after {a:?} ms)", count(hwnd)));
+    probe::pump(1700);
+    let b = follows(hwnd, n0 + 2, 1800);
+    rep.check(b.is_some(), &format!("a rename and a new file: two more rows ({} rows, after {b:?} ms)", count(hwnd)));
+    let c = follows(hwnd, n0, 2500); // the worker deletes about 3.8 s after it started
+    rep.check(c.is_some(), &format!("both deleted: back to {n0} rows ({} rows, after {c:?} ms)", count(hwnd)));
+    let _ = worker.join();
     probe::destroy(hwnd);
     probe::pump(100);
     // SAFETY: a query of a handle that may be gone.

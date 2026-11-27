@@ -146,6 +146,7 @@ impl Fm {
         self.geo.places.clear();
         self.geo.rows.clear();
         self.geo.size = (w, h);
+        self.menu_open = f.menu_open();
         c.fill(Rect::new(0.0, 0.0, w, h), 0.0, WIN);
 
         // the preview pane opens and closes by width (its content keeps its size and is cut)

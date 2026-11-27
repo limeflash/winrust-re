@@ -189,8 +189,13 @@ impl Backend for Fake {
     }
 
     fn list(&self, dir: &Path, o: &Opts) -> Option<Vec<Row>> {
-        let mut rows = self.fs.lock().unwrap().get(dir)?.clone();
+        let rows = self.peek(dir, o)?;
         self.era.fetch_add(1, Relaxed);
+        Some(rows)
+    }
+
+    fn peek(&self, dir: &Path, o: &Opts) -> Option<Vec<Row>> {
+        let mut rows = self.fs.lock().unwrap().get(dir)?.clone();
         self.sort(&mut rows, o);
         Some(rows)
     }
