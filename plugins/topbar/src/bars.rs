@@ -311,6 +311,7 @@ unsafe fn create(mon: Mon, main: bool) -> Option<Rc<BarCx>> {
     // The bar may run elevated while apps and explorer do not; UIPI would drop their messages to us (appbar callbacks, files dropped).
     ChangeWindowMessageFilterEx(hwnd, CALLBACK, MSGFLT_ALLOW, null_mut());
     ChangeWindowMessageFilterEx(hwnd, TB_MSG.get(), MSGFLT_ALLOW, null_mut()); // explorer restarted (it runs unelevated)
+    ChangeWindowMessageFilterEx(hwnd, winrust_common::deskmenu::request_msg(), MSGFLT_ALLOW, null_mut()); // rust-explorer's desktop asks for its menu
     // files dragged from a normal-rights app onto the (elevated) bar: Start button = add to Start, elsewhere = pin
     DragAcceptFiles(hwnd, 1);
     for m in [WM_DROPFILES, 0x49 /* WM_COPYGLOBALDATA */, WM_COPYDATA] {

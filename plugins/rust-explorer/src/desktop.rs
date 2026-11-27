@@ -1,4 +1,5 @@
 use super::*;
+use winrust_common::deskmenu::{self, Cmd, IconSize, Request, Sort};
 
 const CLR_NONE: isize = 0xFFFF_FFFF; // list background / text background: let the parent's wallpaper show through
 thread_local! { static WALL: std::cell::Cell<(isize, i32, i32)> = const { std::cell::Cell::new((0, 0, 0)) }; } // (HBITMAP, w, h)
@@ -46,15 +47,77 @@ fn desk_bottom() -> i32 {
 }
 /// "Hide desktop icons" is a marker file, so it survives restarts.
 pub(crate) fn icons_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"WinRust\desktop-icons-hidden.txt") }
+/// The old "small icons" marker: still read while there is no view file.
 pub(crate) fn small_marker() -> PathBuf { icons_marker().with_file_name("small-icons") }
-/// Desktop icon size: the system's large (32 px, default) or small (16 px) icons with a tighter grid. Same icon indexes in both.
+fn view_file() -> PathBuf { icons_marker().with_file_name("desktop-view.txt") }
+
+/// How the desktop's icons are ordered and sized (what the bar's desktop menu changes), kept in `desktop-view.txt`
+/// (`sort=name|date|size`, `size=small|medium|large`, `auto=0|1`). Without the file the old marker decides the size (small,
+/// else the old default 32 px = medium), the order is by name and nothing arranges itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct View { pub sort: Sort, pub size: IconSize, pub auto: bool }
+
+impl View {
+    pub fn parse(text: &str, small_marker: bool) -> View {
+        let mut v = View { size: if small_marker { IconSize::Small } else { IconSize::Medium }, ..View::default() };
+        for (k, val) in text.lines().filter_map(|l| l.split_once('=')) {
+            match k.trim() {
+                "sort" => if let Some(s) = Sort::parse(val) { v.sort = s },
+                "size" => if let Some(s) = IconSize::parse(val) { v.size = s },
+                "auto" => v.auto = val.trim() == "1",
+                _ => {}
+            }
+        }
+        v
+    }
+    pub fn to_text(self) -> String { format!("sort={}\nsize={}\nauto={}\n", self.sort.name(), self.size.name(), u8::from(self.auto)) }
+    /// The old menu's "Small icons / Large icons" item: small, and back to the old default.
+    pub fn toggled_small(self) -> View { View { size: if self.size == IconSize::Small { IconSize::Medium } else { IconSize::Small }, ..self } }
+}
+
+thread_local! { static VIEW: std::cell::Cell<Option<View>> = const { std::cell::Cell::new(None) }; }
+/// The current view: read once, then kept (the desktop window's thread is the only one that changes it).
+pub(crate) fn view() -> View {
+    VIEW.with(|c| c.get().unwrap_or_else(|| {
+        let v = View::parse(&fs::read_to_string(view_file()).unwrap_or_default(), small_marker().exists());
+        c.set(Some(v));
+        v
+    }))
+}
+pub(crate) fn set_view(v: View) {
+    VIEW.with(|c| c.set(Some(v)));
+    let f = view_file();
+    if let Some(d) = f.parent() { let _ = fs::create_dir_all(d); }
+    let _ = fs::write(f, v.to_text());
+    let _ = fs::remove_file(small_marker()); // the file says it now
+}
+/// The column `sort_rows` orders by: 0 name, 1 modified, 3 size.
+pub(crate) const fn sort_col(s: Sort) -> usize { [0, 1, 3][s as usize] }
+/// The icon grid of a size: cell width and height before scaling.
+pub(crate) const fn spacing(s: IconSize) -> (i32, i32) { [(76, 64), (88, 96), (104, 112)][s as usize] }
+
+/// The system's 48 px image list (`SHIL_EXTRALARGE`); its handle is the interface pointer, and the list lives as long as the process.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn extra_large_icons() -> Option<usize> {
+    use windows_sys::{core::GUID, Win32::UI::Shell::SHGetImageList};
+    let iid = GUID::from_u128(0x46EB5926_582E_4017_9FDF_E8998DAA0950); // IID_IImageList
+    let mut p: *mut std::ffi::c_void = ptr::null_mut();
+    (SHGetImageList(2, &iid, &mut p) >= 0 && !p.is_null()).then_some(p as usize)
+}
+
+/// Desktop icon size: the system's 16, 32 or 48 px icons with a grid to match. Same icon indexes in all three.
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn apply_icon_size(list: HWND) {
-    let small = small_marker().exists();
+    let size = view().size;
     let mut fi: SHFILEINFOW = std::mem::zeroed();
-    let il = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | if small { SHGFI_SMALLICON } else { SHGFI_LARGEICON });
+    let mut sys = |flag| SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | flag);
+    let il = match size {
+        IconSize::Small => sys(SHGFI_SMALLICON),
+        IconSize::Medium => sys(SHGFI_LARGEICON),
+        IconSize::Large => extra_large_icons().unwrap_or_else(|| sys(SHGFI_LARGEICON)),
+    };
     put(list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, il as isize);
-    let (cx, cy) = if small { (76, 64) } else { (88, 96) };
+    let (cx, cy) = spacing(size);
     put(list, LVM_SETICONSPACING, 0, ((ui::sc(cy) as isize) << 16) | ui::sc(cx) as isize);
 }
 pub(crate) fn icons_hidden() -> bool { icons_marker().exists() }
@@ -63,6 +126,95 @@ pub(crate) fn set_icons_hidden(hide: bool) {
     if hide { if let Some(d) = m.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&m, "1"); } else { let _ = fs::remove_file(&m); }
     let list = ST.with_borrow(|st| st.list);
     unsafe { ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW }) };
+}
+
+/// The drive letter of a path that starts with one (`C:\...`): the drive WinRust Disk is asked to scan.
+pub(crate) fn drive_of(p: &Path) -> Option<char> {
+    let s = p.to_string_lossy();
+    let mut c = s.chars();
+    match (c.next(), c.next()) { (Some(d), Some(':')) if d.is_ascii_alphabetic() => Some(d.to_ascii_uppercase()), _ => None }
+}
+
+/// Right click on the desktop: asks the bar to draw the design's menu at the pointer, with the state it has to show.
+/// `false` (no bar, or one that cannot) = the caller shows its own GDI menu.
+pub(crate) fn ask_bar() -> bool {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    let v = view();
+    let drive = tool("wiztree").and_then(|_| drive_of(&cur_dir()));
+    deskmenu::ask(&Request { at: (pt.x, pt.y), sort: v.sort, size: v.size, auto: v.auto, shown: !icons_hidden(), drive })
+}
+
+/// What the bar's menu chose. The segments and the toggles carry the value they set.
+pub(crate) fn command(h: HWND, cmd: Cmd) {
+    let (list, dir, mut v) = (ST.with_borrow(|st| st.list), cur_dir(), view());
+    let drop_cells = || { let _ = fs::remove_file(desk::pos_file()); }; // the next load lays every icon out again
+    match cmd {
+        Cmd::NewFolder => new_entry(&dir, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), true),
+        Cmd::NewText => new_entry(&dir, t!("Новый текстовый документ.txt", "New text document.txt", ja: "新しいテキスト ドキュメント.txt", pt: "Novo documento de texto.txt", zh: "新建文本文档.txt"), false),
+        Cmd::Paste => paste(h, &dir),
+        Cmd::Sort(s) => { v.sort = s; set_view(v); SORT_COL.store(sort_col(s), Relaxed); SORT_ASC.store(true, Relaxed); drop_cells(); }
+        Cmd::Size(s) => { v.size = s; set_view(v); unsafe { apply_icon_size(list) }; drop_cells(); } // the grid changes with the size
+        Cmd::Auto(on) => {
+            v.auto = on;
+            set_view(v);
+            if !on { desk::save(list); } // switched off: the icons stay where they are
+        }
+        Cmd::Show(on) => return set_icons_hidden(!on),
+        Cmd::Refresh => {}
+        Cmd::Disk => { // wiztree takes the drive letter and asks for admin rights itself
+            if let (Some(exe), Some(d)) = (tool("wiztree"), drive_of(&dir)) { let _ = std::process::Command::new(exe).arg(format!("{d}:")).spawn(); }
+            return;
+        }
+        Cmd::Properties => return properties(&dir),
+    }
+    reload(h);
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn without_a_view_file_the_old_marker_decides_the_size() {
+        assert_eq!(View::parse("", false), View { sort: Sort::Name, size: IconSize::Medium, auto: false }); // the old default: 32 px
+        assert_eq!(View::parse("", true).size, IconSize::Small); // the old small-icons marker
+        assert_eq!(View::parse("garbage\n=\nsort\n", false), View::default());
+    }
+
+    #[test]
+    fn the_view_file_wins_and_round_trips() {
+        let v = View { sort: Sort::Size, size: IconSize::Large, auto: true };
+        assert_eq!(View::parse(&v.to_text(), true), v); // even over the marker
+        assert_eq!(View::parse("size=small\nauto=1\nsort=date", false), View { sort: Sort::Date, size: IconSize::Small, auto: true });
+        assert_eq!(View::parse("size=huge\nsort=type\nauto=yes", true), View { size: IconSize::Small, ..View::default() }); // unknown values are left alone
+    }
+
+    #[test]
+    fn sizes_map_to_the_systems_icons_and_the_grid_widens_with_them() {
+        assert_eq!(IconSize::ALL.map(|s| s.px()), [16, 32, 48]);
+        let g = IconSize::ALL.map(spacing);
+        assert_eq!(g[0], (76, 64), "as the old small icons");
+        assert_eq!(g[1], (88, 96), "as the old large icons");
+        assert!(g[1].0 < g[2].0 && g[1].1 < g[2].1);
+        assert_eq!(Sort::ALL.map(sort_col), [0, 1, 3]);
+    }
+
+    #[test]
+    fn the_old_menus_size_item_goes_between_small_and_the_default() {
+        let v = View::default();
+        assert_eq!(v.toggled_small().size, IconSize::Small);
+        assert_eq!(v.toggled_small().toggled_small().size, IconSize::Medium);
+        assert_eq!(View { size: IconSize::Large, ..v }.toggled_small().size, IconSize::Small);
+    }
+
+    #[test]
+    fn disk_usage_scans_the_drive_the_desktop_folder_is_on() {
+        assert_eq!(drive_of(Path::new(r"C:\Users\a\Desktop")), Some('C'));
+        assert_eq!(drive_of(Path::new(r"d:\x")), Some('D'));
+        assert_eq!(drive_of(Path::new(r"\\server\share\Desktop")), None);
+        assert_eq!(drive_of(Path::new("")), None);
+    }
 }
 
 /// Wallpaper for the desktop window.
@@ -189,8 +341,10 @@ pub(crate) mod desk {
         put(list, LVM_SETITEMPOSITION32, i, &p as *const _ as isize);
     }
 
-    /// Writes every icon's position (after a move or a fresh layout).
+    /// Writes every icon's position (after a move or a fresh layout). "Arrange automatically" keeps none: the layout is the
+    /// sort order, so the positions from before stay put for when it is switched off (which writes them anew).
     pub fn save(list: HWND) {
+        if view().auto { return; }
         let lines: String = names().iter().enumerate().map(|(i, n)| { let (x, y) = pos(list, i); format!("{x}\t{y}\t{n}\n") }).collect();
         let f = pos_file();
         let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
@@ -239,21 +393,30 @@ pub(crate) mod desk {
             it.iImage = -1; // I_IMAGECALLBACK
             put(list, LVM_INSERTITEMW, 0, &it as *const _ as isize);
         }
-        let (g, old, names) = (Grid::of(list), saved(), names());
+        let old = if view().auto { HashMap::new() } else { saved() };
+        for (i, p) in plan(&Grid::of(list), &names(), &old).into_iter().enumerate() { set_pos(list, i, p); }
+        save(list);
+    }
+
+    /// Where each icon goes (list pixels, in the order of `names`): on its saved cell when that is on the grid and nobody else
+    /// has it, the others on the first free cells going down the columns. With nothing saved (arranging automatically) that is
+    /// the sort order, column after column.
+    fn plan(g: &Grid, names: &[String], old: &HashMap<String, (i32, i32)>) -> Vec<(i32, i32)> {
         let mut taken = HashSet::new();
+        let mut out = vec![(0, 0); names.len()];
         let mut later = vec![];
         for (i, name) in names.iter().enumerate() {
             match old.get(name).and_then(|&p| g.cell(p)).filter(|c| !taken.contains(c)) {
-                Some(c) => { taken.insert(c); set_pos(list, i, g.at(c)); }
+                Some(c) => { taken.insert(c); out[i] = g.at(c); }
                 None => later.push(i),
             }
         }
         for i in later {
             let c = g.free(&taken, None);
             taken.insert(c);
-            set_pos(list, i, g.at(c));
+            out[i] = g.at(c);
         }
-        save(list);
+        out
     }
 
     // ---------- moving icons ----------
@@ -300,6 +463,10 @@ pub(crate) mod desk {
             }
         }
         let g = Grid::of(list);
+        if view().auto { // nothing stays where it was dropped: everything goes back to the order of the sort
+            for (i, p) in plan(&g, &names(), &HashMap::new()).into_iter().enumerate() { set_pos(list, i, p); }
+            return true;
+        }
         let n = put(list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
         let mut taken: HashSet<(i32, i32)> = (0..n).filter(|i| !sel.contains(i)).filter_map(|i| g.cell(pos(list, i))).collect();
         let (dx, dy) = (pt.x - from.0, pt.y - from.1);
@@ -378,8 +545,8 @@ pub(crate) mod desk {
 
     #[cfg(test)]
     mod tests {
-        use super::Grid;
-        use std::collections::HashSet;
+        use super::{Grid, plan};
+        use std::collections::{HashMap, HashSet};
 
         #[test]
         fn grid_cells() {
@@ -391,6 +558,28 @@ pub(crate) mod desk {
             assert_eq!(g.free(&taken, None), (0, 2)); // down the first column first
             taken.insert((2, 2));
             assert_eq!(g.free(&taken, Some((2, 2))), (1, 2)); // nearest free to the wish (ties: lowest)
+        }
+
+        fn names(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+        #[test]
+        fn saved_cells_are_kept_and_the_rest_fills_the_free_ones() {
+            let g = Grid { cx: 100, cy: 90, cols: 3, rows: 2 };
+            let old: HashMap<_, _> = [("b".to_string(), (200, 90)), ("gone".to_string(), (0, 0)), ("off".to_string(), (900, 900))].into();
+            // b keeps (2, 1); a and c (new) and "off" (its cell is off the grid now) take the free cells down the columns
+            let p = plan(&g, &names(&["a", "b", "c", "off"]), &old);
+            assert_eq!(p, vec![(0, 0), (200, 90), (0, 90), (100, 0)]);
+        }
+
+        #[test]
+        fn arranging_automatically_ignores_the_saved_cells_and_follows_the_order_down_the_columns() {
+            let g = Grid { cx: 100, cy: 90, cols: 3, rows: 2 };
+            let p = plan(&g, &names(&["a", "b", "c", "d"]), &HashMap::new());
+            assert_eq!(p, vec![(0, 0), (0, 90), (100, 0), (100, 90)]);
+            // the same names with a different sort order: a different layout, whatever was saved
+            let p = plan(&g, &names(&["d", "c", "b", "a"]), &[("a".to_string(), (200, 90))].into());
+            assert_eq!(p[3], (200, 90)); // not auto: a keeps its cell
+            assert_eq!(plan(&g, &names(&["d", "c", "b", "a"]), &HashMap::new())[3], (100, 90)); // auto: it is the fourth
         }
     }
 }
@@ -410,6 +599,7 @@ pub(crate) fn desktop_dirs() -> Vec<PathBuf> {
 
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn setup_list(h: HWND, list: HWND, inst: HINSTANCE, fi: &mut SHFILEINFOW) {
+                    SORT_COL.store(sort_col(view().sort), Relaxed); // the order the bar's menu chose last time
                     // system large icons; indexes are shared with the small list, so icon_of() works unchanged
                     let big = SHGetFileInfoW(w("C:\\").as_ptr(), 0, fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
                     put(list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, big as isize);
@@ -445,6 +635,7 @@ pub(crate) unsafe fn create_window(inst: HINSTANCE, bg: windows_sys::Win32::Grap
             RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: inst, lpszClassName: w("SHELLDLL_DefView").as_ptr(), ..std::mem::zeroed() });
             let (vx, vy, vw, vh) = virt(); // every monitor: the wallpaper reaches the secondary ones too (#67)
             let d = CreateWindowExW(WS_EX_TOOLWINDOW, pm.as_ptr(), w("rs-desktop").as_ptr(), WS_POPUP, vx, vy, vw, vh, 0 as _, 0 as _, inst, ptr::null());
+            ChangeWindowMessageFilterEx(d, deskmenu::cmd_msg(), MSGFLT_ALLOW, ptr::null_mut()); // the bar may run elevated, we do not: UIPI would drop its choice
             SetWindowPos(d, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
