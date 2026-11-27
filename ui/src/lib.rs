@@ -6,6 +6,7 @@ pub mod pacing;
 pub mod frame;
 pub mod core;
 pub mod window;
+pub mod dnd;
 pub mod widgets;
 pub mod render;
 pub mod bench;

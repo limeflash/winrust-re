@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT};
-use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim;
@@ -371,7 +371,7 @@ fn run_deferred(hwnd: HWND, later: Vec<Deferred>) {
 }
 
 /// Runs `f` on the host of `hwnd` and does what it asked of the window; `f` says if the frame must be drawn anyway.
-fn event(hwnd: HWND, f: impl FnOnce(&mut Host) -> Option<Act>) {
+pub(crate) fn event(hwnd: HWND, f: impl FnOnce(&mut Host) -> Option<Act>) {
     let later = with(hwnd, |h| {
         let act = f(h);
         let mut later = h.settle();
@@ -411,6 +411,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             h.core.ask_redraw();
             None
         });
+        return 0;
+    }
+    if msg == gfx::WM_HARDWARE {
+        // the hardware device is ready: the first frames were WARP's; the window is drawn anew on the real GPU
+        if gfx::use_hardware() {
+            event(hwnd, |h| {
+                h.lost = true;
+                h.core.ask_redraw();
+                None
+            });
+            // WARP's pages (its code and shader cache, ~25 MB) will not be touched again: the working set lets go of them
+            gfx::trim();
+            // SAFETY: trims our own process; what is used again is paged back in at once.
+            unsafe { windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet(windows_sys::Win32::System::Threading::GetCurrentProcess()) };
+        }
         return 0;
     }
     match msg {
@@ -774,6 +789,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             return 0;
         }
         WM_DESTROY => {
+            crate::dnd::refuse(hwnd as isize);
             pacing::set(hwnd as isize, false);
             let host = HOSTS.with_borrow_mut(|m| m.remove(&(hwnd as isize)));
             if let Some(h) = host {
@@ -874,7 +890,7 @@ pub(crate) fn create(app: Box<dyn App>, o: &Options, composed: bool, at: Option<
             let m = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 1, cyBottomHeight: 0 };
             DwmExtendFrameIntoClientArea(hwnd, &m); // the system's shadow, the only one this path has
         }
-        DragAcceptFiles(hwnd, 1);
+        crate::dnd::accept(hwnd as isize);
         let real = GetDpiForWindow(hwnd);
         let Ok(gfx) = Gfx::new(real as f32 / 96.0) else {
             DestroyWindow(hwnd);
@@ -904,6 +920,8 @@ pub(crate) fn create(app: Box<dyn App>, o: &Options, composed: bool, at: Option<
             lost: false,
         };
         HOSTS.with_borrow_mut(|m| m.insert(hwnd as isize, host));
+        with(hwnd, |h| h.core.app.start(hwnd as isize));
+        gfx::notify_hardware(hwnd as isize);
         if real != dpi {
             // made on a screen of another DPI than the system's: the size was worked out for the wrong one
             let f2 = if composed { frame_px(real) } else { 0 };
@@ -930,6 +948,7 @@ pub fn run(app: Box<dyn App>, o: Options) -> i32 {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     style::follow_system();
+    gfx::fast_start();
     let composed = gfx::compose_windows();
     let Some(hwnd) = create(app, &o, composed, None) else { return 1 };
     // SAFETY: the loop of our own thread; the first frame is on the surface, so showing the window cannot flash.
