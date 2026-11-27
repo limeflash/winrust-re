@@ -124,7 +124,7 @@ impl Installer {
             f.hand();
             f.tip(label.clone());
             c.fill(r, 9.0, acc.alpha(0.22 + 0.1 * hot.hover));
-            c.text(&label, r, fnt, acc, Align::Center);
+            c.text(&label, r, fnt, acc.accent_text(), Align::Center);
             focus_ring(c, r, 9.0, hot);
         }
         c.text_fit(t.tagline, Rect::new(58.0, 29.5, (w - 58.0 - 420.0).max(120.0), 16.0), Font::new(12.0, 400), T3, Align::Start);
@@ -318,7 +318,7 @@ impl Installer {
             let mut x = tx + nw + 8.0;
             let cy = rect.y + 18.0;
             if row.new {
-                x += pill(c, x, cy, 17.0, 6.0, 6.0, t.new_tag, Font::new(10.5, 600), acc.alpha(0.22), acc) + 8.0;
+                x += pill(c, x, cy, 17.0, 6.0, 6.0, t.new_tag, Font::new(10.5, 600), acc.alpha(0.22), acc.accent_text()) + 8.0;
             }
             if !row.key.is_empty() {
                 let kf = Font::new(10.5, 500);

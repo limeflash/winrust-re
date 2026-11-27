@@ -644,7 +644,7 @@ impl Disk {
                 let (x, w) = (r.x + 22.0, r.w - 44.0);
                 let mut y = r.y + 20.0;
                 c.text(&title, Rect::new(x, y, w, 19.0), font(15.0, 600), ui::T1, Align::Start);
-                c.text(&format!("{}%", (shown * 100.0).round()), Rect::new(x, y, w, 19.0), font(13.0, 600).tabular(), accent(), Align::End);
+                c.text(&format!("{}%", (shown * 100.0).round()), Rect::new(x, y, w, 19.0), font(13.0, 600).tabular(), accent().accent_text(), Align::End);
                 y += 19.0 + 6.0;
                 c.text(&sub, Rect::new(x, y, w, 15.0), font(12.5, 400), ui::T2, Align::Start);
                 y += 15.0 + 14.0;
@@ -1024,7 +1024,7 @@ impl Disk {
                     let hot = f.item(ID_TOAST_UNDO, b);
                     f.hand();
                     c.fill(b, 14.0, Rgba::white(0.1 + 0.05 * hot.hover));
-                    c.text("Undo", b, uf, accent(), Align::Center);
+                    c.text("Undo", b, uf, accent().accent_text(), Align::Center);
                 }
             });
         });

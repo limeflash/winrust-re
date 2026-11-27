@@ -22,8 +22,8 @@ pub const T1B: Rgba = Rgba::pair(0xc9cdd8, 0x343844);
 pub const T4: Rgba = Rgba::pair(0x6f7486, 0x8d93a1);
 /// "Done": `#4cc38a`, the same in both modes.
 pub const OK: Rgba = Rgba::new(0x4c as f32 / 255.0, 0xc3 as f32 / 255.0, 0x8a as f32 / 255.0, 1.0);
-/// "Remove all": `#ff8a8f`, the mockup keeps it in the light mode too.
-pub const REMOVE: Rgba = Rgba::pair(0xff8a8f, 0xff8a8f);
+/// "Remove all": the danger text (`--dangerT`): `#ff8a8f` on the dark style, `#c8333a` on the light one.
+pub const REMOVE: Rgba = Rgba::pair(0xff8a8f, 0xc8333a);
 /// What failed: `#e5484d`.
 pub const BAD: Rgba = Rgba::new(0xe5 as f32 / 255.0, 0x48 as f32 / 255.0, 0x4d as f32 / 255.0, 1.0);
 
