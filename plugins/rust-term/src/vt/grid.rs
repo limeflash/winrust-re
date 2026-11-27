@@ -36,6 +36,7 @@ pub struct Pen {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    pub link: u32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -139,6 +140,12 @@ impl Grid {
     }
     pub fn pen_mut(&mut self) -> &mut Pen {
         &mut self.active.pen
+    }
+    pub fn origin_mode(&self) -> bool {
+        self.active.origin
+    }
+    pub fn scroll_top(&self) -> usize {
+        self.top
     }
     pub fn pending_wrap(&self) -> bool {
         self.active.wrap
@@ -487,7 +494,8 @@ impl Grid {
             }
             buf.row = buf.row.saturating_sub(remove);
             buf.cells.truncate(rows);
-            buf.cells.resize_with(rows, || vec![Cell::blank(Pen::default()); cols]);
+            buf.cells
+                .resize_with(rows, || vec![Cell::blank(Pen::default()); cols]);
             for line in &mut buf.cells {
                 line.resize(cols, Cell::blank(Pen::default()));
                 if line[cols - 1].width == 2 {
