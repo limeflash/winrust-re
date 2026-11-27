@@ -23,8 +23,8 @@ thread_local! {
     static BENCH_END: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
 }
 
-pub(crate) fn bench_start() { BENCH_END.set(Some(std::time::Duration::ZERO)); }
-pub(crate) fn bench_end() -> std::time::Duration { BENCH_END.replace(None).unwrap_or_default() }
+pub fn bench_start() { BENCH_END.set(Some(std::time::Duration::ZERO)); }
+pub fn bench_end() -> std::time::Duration { BENCH_END.replace(None).unwrap_or_default() }
 
 use windows::Win32::Foundation::{COLORREF, E_FAIL, HMODULE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
@@ -265,7 +265,7 @@ impl Font {
 }
 
 /// The design's typeface, built in: a Latin + Cyrillic subset of Inter's variable font (SIL OFL 1.1, `fonts/OFL.txt`).
-static INTER: &[u8] = include_bytes!("../../fonts/InterVariable.ttf");
+static INTER: &[u8] = include_bytes!("../fonts/InterVariable.ttf");
 const INTER_FAMILY: &str = "Inter Variable";
 
 /// Fallbacks when the system cannot load a variable font from memory (DirectWrite before Windows 10 1709).
@@ -646,7 +646,7 @@ fn create_dev(factory: &ID2D1Factory1, compose: bool) -> Result<Dev> {
 }
 
 /// The GPU went away (or a test says so): every device-bound thing is rebuilt on its next frame.
-pub(crate) fn lose_device() {
+pub fn lose_device() {
     GEN.set(GEN.get() + 1);
     DEV.set(None);
 }
@@ -692,7 +692,7 @@ pub fn compose_windows() -> bool {
 }
 
 /// Surfaces made from now on are DIBs again (the self-test draws its reference with them).
-pub(crate) fn compose_off() {
+pub fn compose_off() {
     COMPOSE.set(false);
 }
 
@@ -746,7 +746,7 @@ fn make_target(dev: &Dev, hwnd: HWND) -> Result<Tgt> {
 }
 
 /// How much video memory this process uses on the device's adapter, MB: (local, non-local). For the benchmark and self-test.
-pub(crate) fn gpu_memory() -> Option<(f64, f64)> {
+pub fn gpu_memory() -> Option<(f64, f64)> {
     use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, IDXGIAdapter3};
     let d = current_dev()?;
     // SAFETY: plain queries on the device's adapter.
@@ -762,7 +762,7 @@ pub(crate) fn gpu_memory() -> Option<(f64, f64)> {
 
 /// Waits until the GPU has finished everything queued so far and says how long that took (the benchmark's measure of what a
 /// frame still costs the GPU after the CPU is done with it). Never used by the bar itself.
-pub(crate) fn gpu_wait() -> std::time::Duration {
+pub fn gpu_wait() -> std::time::Duration {
     use windows::Win32::Graphics::Direct3D11::{D3D11_QUERY_DESC, D3D11_QUERY_EVENT, ID3D11Query};
     let Some(d) = current_dev() else { return std::time::Duration::ZERO };
     // SAFETY: an event query on the thread's device, polled with the raw vtable because `GetData` answers S_FALSE while the

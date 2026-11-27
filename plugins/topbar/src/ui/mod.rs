@@ -1,9 +1,9 @@
 //! Rendering helpers for the Obsidian bar.
 #![allow(dead_code)] // wired into the renderer in the next step
-pub mod anim;
+#[allow(unused_imports)]
+pub use winrust_ui::{gfx, anim, svg, frame};
 pub mod bar;
 pub mod cal_popup;
-pub mod gfx;
 pub mod icons;
 pub mod jump;
 pub mod lang_popup;
@@ -19,7 +19,6 @@ pub mod search_panel;
 pub mod snip;
 pub mod settings_panel;
 pub mod start_panel;
-pub mod svg;
 pub mod taskview;
 pub mod tip;
 pub mod toast;
