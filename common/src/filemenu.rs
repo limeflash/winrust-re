@@ -53,7 +53,14 @@ pub mod rq {
     pub const TAB: u32 = 8;
     /// The paths stand for the Recycle Bin (`paths` is empty).
     pub const BIN: u32 = 16;
+    /// Windows' menu did not come in time: `items` are rust-explorer's own (command numbers from 0x8000, apart from the shell's
+    /// 1..0x7FFF), and the whole list of the shell is a submenu ([`super::MORE_SUB`]) that fills when (if) Windows answers.
+    pub const SLOW: u32 = 32;
 }
+
+/// The handle of the submenu that holds the shell's whole list when it came late (see [`rq::SLOW`]): the bar asks for it with
+/// [`Act::Fill`] like for any lazy submenu, and [`SubReply`] brings it, whenever it is ready.
+pub const MORE_SUB: u32 = 0x7FFF_FF01;
 
 /// Flags of a [`ShellItem`].
 pub mod fl {

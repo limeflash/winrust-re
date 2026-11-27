@@ -12,7 +12,7 @@
 //! Windows uses in the five languages the bar speaks.
 use std::rc::Rc;
 
-use winrust_common::filemenu::{Act, Icon, ShellItem, Sub, fl, rq};
+use winrust_common::filemenu::{Act, Icon, MORE_SUB, ShellItem, Sub, fl, rq};
 
 use crate::ui::taskview::OwnedIcon;
 
@@ -578,7 +578,14 @@ pub fn build(f: &Facts, items: &[ShellItem], head: HeadIcon) -> Menu {
     // the tail: the whole list and Properties (a drive and the Recycle Bin have only Properties)
     rows.push(Row::sep());
     if !matches!(f.target, Target::Drive | Target::Bin) {
-        rows.push(Row::line(label("Показать дополнительные параметры", "Show more options", "その他のオプションを確認", "Mostrar mais opções", "显示更多选项"), MORE, Do::More).keys(&["Shift", "F10"]));
+        let more = label("Показать дополнительные параметры", "Show more options", "その他のオプションを確認", "Mostrar mais opções", "显示更多选项");
+        if f.flags & rq::SLOW != 0 {
+            // Windows has not answered: its whole list is a submenu that fills when (if) it does, and the row says why it is slow
+            rows.push(Row::line(more, MORE, Do::Nothing).under(Under::Lazy(MORE_SUB)));
+            rows.push(Row::caption(label("Windows отвечает медленно", "Windows is slow to answer", "Windows の応答が遅れています", "O Windows está demorando a responder", "Windows 响应缓慢")));
+        } else {
+            rows.push(Row::line(more, MORE, Do::More).keys(&["Shift", "F10"]));
+        }
     }
     rows.extend(props);
     // no separator at either end or twice in a row (a verb the shell did not offer leaves its neighbours)
@@ -749,6 +756,27 @@ mod tests {
         // an exe has no such item: ours reveals it
         let m = build(&facts(Target::App), &text_items(), head());
         assert!(m.rows.iter().any(|r| r.act == Do::Ours(Act::Reveal)));
+    }
+
+    #[test]
+    fn when_windows_is_slow_the_whole_list_is_a_submenu_that_waits_and_says_so() {
+        // rust-explorer's own rows, by the verbs the bar maps: Open, Run as administrator, Properties, Delete
+        let own = vec![it(0x8001, "open", "Open"), it(0x8002, "runas", "Run as administrator"), it(0x8005, "delete", "Delete"), it(0x8004, "properties", "Properties")];
+        let mut f = facts(Target::App);
+        f.flags |= rq::SLOW;
+        let m = build(&f, &own, head());
+        let more = m.rows.iter().find(|r| matches!(r.sub, Some(Under::Lazy(MORE_SUB)))).expect("Show more options waits for the shell's list");
+        assert_eq!(more.act, Do::Nothing);
+        let at = m.rows.iter().position(|r| matches!(r.sub, Some(Under::Lazy(MORE_SUB)))).unwrap();
+        assert_eq!(m.rows[at + 1].kind, Kind::Caption, "and says Windows is slow");
+        assert!(m.rows.iter().all(|r| r.act != Do::More));
+        let acts: Vec<Do> = m.rows.iter().filter(|r| r.is_item()).map(|r| r.act.clone()).collect();
+        assert!(acts.contains(&Do::Shell(0x8001)) && acts.contains(&Do::Shell(0x8002)) && acts.contains(&Do::Shell(0x8004)));
+        assert!(acts.contains(&Do::Ours(Act::Reveal)) && acts.contains(&Do::Ours(Act::CopyPath)) && acts.contains(&Do::PinStart) && acts.contains(&Do::PinBar), "the bar's and rust-explorer's own rows need nothing from the shell");
+        assert!(m.quick.iter().any(|q| q.act == Do::Shell(0x8005) && q.danger) && m.quick.iter().any(|q| q.act == Do::Ours(Act::Rename)));
+        // a menu that is not slow is as before
+        f.flags &= !rq::SLOW;
+        assert!(build(&f, &text_items(), head()).rows.iter().any(|r| r.act == Do::More));
     }
 
     #[test]
