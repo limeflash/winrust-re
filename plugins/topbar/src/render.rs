@@ -159,6 +159,7 @@ pub(crate) unsafe fn render(args: &[String]) {
     let (mut battery, mut tray, mut n_apps) = (false, 0usize, 8usize);
     let (mut unread, mut dnd) = (0usize, false);
     let mut rec_time = None::<String>;
+    let (mut second, mut same) = (false, false); // a bar on another monitor (1920x1080): the lighter one, or with `same` the whole one
     let Some(file) = args.first() else { return };
     for a in &args[1..] {
         match a.split_once('=') {
@@ -173,6 +174,8 @@ pub(crate) unsafe fn render(args: &[String]) {
             Some(("rec", v)) => rec_time = Some(v.to_string()),
             _ => match a.as_str() {
                 "dnd" => dnd = true,
+                "second" => second = true,
+                "same" => same = true,
                 "battery" => battery = true,
                 "0" | "1" | "2" => size = a.parse().unwrap_or(1),
                 "bottom" | "left" | "right" => side = Side::parse(a),
@@ -194,16 +197,18 @@ pub(crate) unsafe fn render(args: &[String]) {
         })
         .collect();
     let tray_icons: Vec<_> = (0..tray).map(|_| icon(r"C:\Windows\System32\notepad.exe")).collect();
-    let (sw, sh) = ((1440.0 * scale).round() as i32, (900.0 * scale).round() as i32);
+    let screen = if second { (1920.0, 1080.0) } else { (1440.0, 900.0) };
+    let (sw, sh) = ((screen.0 * scale).round() as i32, (screen.1 * scale).round() as i32);
     let view = barui::View {
         style,
         side,
         size,
         align_left: args.iter().any(|a| a == "alignl"),
-        screen: (1440.0, 900.0),
+        screen,
+        full: !second || same,
         op,
         apps,
-        tray: tray_icons,
+        tray: if second && !same { Vec::new() } else { tray_icons },
         battery: battery.then_some((98, false)),
         vol: (72, false),
         net: Net::Wifi(85),
@@ -212,7 +217,7 @@ pub(crate) unsafe fn render(args: &[String]) {
         date: "11/26/2026".into(),
         unread,
         dnd,
-        rec: rec_time,
+        rec: if second && !same { None } else { rec_time },
     };
     let still = barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() };
     let shown = barui::Live {
@@ -422,6 +427,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let mut dir_arg = "";
+    let (mut apps_on, mut other_bars, mut one_display) = (String::new(), String::new(), false); // the bar page's monitor rows
     let (mut click, mut after, mut busy, mut per_monitor) = (None::<i32>, 0u64, false, false);
     // the notification centre (`calendar`) and the pop-ups (`popups`): what is in the store
     let (mut notes_arg, mut expand, mut reply_text, mut pops_arg) = ("demo", "", None::<&str>, "msg,shot,cal");
@@ -448,6 +454,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("op", v)) => opacity = v.parse().unwrap_or(85),
             Some(("accent", v)) => accent = Box::leak(v.to_string().into_boxed_str()),
             Some(("dir", v)) => dir_arg = Box::leak(v.to_string().into_boxed_str()),
+            Some(("appson", v)) => apps_on = v.to_string(),
+            Some(("other", v)) => other_bars = v.to_string(),
             Some(("hover", v)) => hover = v.parse().ok(),
             Some(("click", v)) => click = v.parse().ok(),
             Some(("after", v)) => after = v.parse().unwrap_or(0),
@@ -466,6 +474,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 "real" => real = true,
                 "busy" => busy = true,
                 "permon" => per_monitor = true,
+                "onedisplay" => one_display = true,
                 "tiled" => tiled = true,
                 "del" => del = true,
                 "hide" => hide = true,
@@ -499,6 +508,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         i18n::style::set_autohide(hide);
         i18n::style::set_align_left(alignl);
         i18n::style::set_accent(i18n::style::Accent::parse(accent));
+        i18n::style::set_bar_on_all_displays(!one_display);
+        i18n::style::set_apps_on(i18n::style::AppsOn::parse(&apps_on));
+        i18n::style::set_other_bars(i18n::style::OtherBars::parse(&other_bars));
         if !t_given && what == "toast" {
             t = 800;
         }
@@ -522,6 +534,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         size: 1,
         align_left: false,
         screen: (screen_w, screen_h),
+        full: true,
         op: 0.85,
         apps,
         tray: Vec::new(),
@@ -628,7 +641,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         _ => TAPP,
     };
     let r = bar.screen_rect(key).unwrap_or((0, 0, 0, 0));
-    let anchor = Anchor { side, button: r, bar: (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3), screen: (sw, sh) };
+    let anchor = Anchor { side, button: r, bar: (p.rest.0, p.rest.1, p.rest.0 + p.rest.2, p.rest.1 + p.rest.3), screen: (sw, sh), origin: (0, 0) };
     let around = |b: (i32, i32, i32, i32)| {
         let m = (110.0 * scale) as i32;
         let (x0, y0, x1, y1) = (b.0 - m, b.1 - m, b.0 + b.2 + m, b.1 + b.3 + m);
@@ -827,7 +840,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         blend(&mut canvas, (sw, sh), bar_surf.pixels(), p.win.2, (p.win.0, p.win.1), p.alpha); // the bar stands above every panel
         if let Some((text, along, top)) = popup.tip() {
             let mut tip = ui::tip::Tip::new(scale, (sw, sh));
-            let place = ui::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * scale).round() as i32 };
+            let place = ui::tip::Place { side: Side::Bottom, along, edge: top - (8.0 * scale).round() as i32, mon: (0, 0, 0, 0) };
             tip.show(&mut gfx, &text, place, 0, 0, None);
             let (win, _, alpha) = tip.frame(&mut gfx, 5000);
             blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), alpha);

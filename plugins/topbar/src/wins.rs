@@ -22,6 +22,7 @@ thread_local! {
     /// The app button the previews are open for, and when the pointer was last seen away from both.
     static PV_BTN: Cell<i32> = const { Cell::new(NONE) };
     static PV_AWAY: Cell<u64> = const { Cell::new(0) };
+    static PV_BAR: Cell<HWND> = const { Cell::new(null_mut()) }; // the bar whose button the previews are for
     /// A window was closed from a panel: which panel (the app button, or `TASKVIEW`) lays itself out again, without it.
     static REOPEN: Cell<(i32, isize)> = const { Cell::new((NONE, 0)) };
 }
@@ -112,7 +113,7 @@ pub(crate) unsafe fn reopen(bar: HWND) {
 
 /// Shows the windows of app button `btn` as live cards above it. False when it has none (the caller shows the tip).
 pub(crate) unsafe fn preview_open(btn: i32, calm: bool, skip: isize) -> bool {
-    let (wins, pin, bicon) = BTNS.with_borrow(|b| b.get(btn as usize).map(|b| (b.wins.clone(), b.pin, b.icon)).unwrap_or((vec![], None, null_mut())));
+    let (pin, wins, bicon) = btn_at(btn).unwrap_or((None, vec![], null_mut()));
     let wins: Vec<HWND> = wins.into_iter().filter(|&w| IsWindow(w) != 0 && w as isize != skip).collect();
     if wins.is_empty() || btn <= 0 {
         return false;
@@ -132,6 +133,7 @@ pub(crate) unsafe fn preview_open(btn: i32, calm: bool, skip: isize) -> bool {
         .map(|&w| Card { hwnd: w as isize, title: window_title(w), src: ui::live::source_size(w as isize), minimized: IsIconic(w) != 0, current: w == fg })
         .collect();
     PV_BTN.set(btn);
+    PV_BAR.set(bars::cur().map_or(null_mut(), |b| b.hwnd));
     PV_AWAY.set(0);
     let panel = PreviewPanel::new(cards, wicon(ic), icon_color(ic), calm, move |p| match p {
         preview::Pick::Window(w) => {
@@ -157,7 +159,7 @@ pub(crate) unsafe fn preview_tick(bar: HWND) {
     };
     let p = cursor();
     let inside = p.0 >= r.0 && p.0 < r.0 + r.2 && p.1 >= r.1 && p.1 < r.1 + r.3;
-    if inside || HOT.get() == PV_BTN.get() {
+    if inside || bars::of(PV_BAR.get()).is_some_and(|b| b.hot.get() == PV_BTN.get()) {
         PV_AWAY.set(0);
     } else if PV_AWAY.get() == 0 {
         PV_AWAY.set(now_ms());
@@ -174,7 +176,7 @@ pub(crate) unsafe fn hide_preview() {
 
 /// The previews are on the screen for this button.
 pub(crate) fn preview_for(btn: i32) -> bool {
-    panel::is_open(Id::Preview) && PV_BTN.get() == btn
+    panel::is_open(Id::Preview) && PV_BTN.get() == btn && bars::cur().is_some_and(|b| b.hwnd == PV_BAR.get())
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -199,7 +201,7 @@ unsafe fn taskview_content(calm: bool, skip: isize) -> Option<(Box<dyn panel::Co
         current.clear();
         for &w in v.iter().rev().filter(|&&w| IsIconic(w) == 0) {
             let (l, t, r, b) = ui::live::frame_of(w as isize);
-            if let Some(m) = vdesk::on_screen((l, t, r, b), a.screen.0.max(1) as f32, a.screen.1.max(1) as f32) { current.push((w as isize, m)); }
+            if let Some(m) = vdesk::on_screen((l - a.origin.0, t - a.origin.1, r - a.origin.0, b - a.origin.1), a.screen.0.max(1) as f32, a.screen.1.max(1) as f32) { current.push((w as isize, m)); }
         }
     }
     let can_add = EXPLORER_UP.load(Relaxed) && desks.len() < 8;
@@ -266,8 +268,10 @@ fn sw_pick(p: taskview::Pick) {
 unsafe fn open_switcher() {
     let mon = SW_MON.get();
     let wins = SW.with_borrow(|(v, _)| v.clone());
-    let Some(mut a) = anchor(NONE) else { return };
-    a.screen = (mon.2, mon.3);
+    let Some(mut a) = anchor_main(NONE) else { return };
+    // the monitor it opens on (the active window's, with the per-monitor setting), wherever it is on the virtual screen
+    a.origin = (mon.0, mon.1);
+    a.screen = (mon.2 - mon.0, mon.3 - mon.1);
     let sw = Switch { selected: sw_selected, point: sw_point, pick: sw_pick };
     let panel = Switcher::new(SCALE.get(), mon, win_cards(&wins), SW_PER.get(), sw);
     panel::open(Box::new(panel), a);

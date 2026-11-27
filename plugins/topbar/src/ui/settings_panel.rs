@@ -88,6 +88,9 @@ const LANG: i32 = 500;
 const SIDE: i32 = 600;
 const SIZE: i32 = 610;
 const BEHAVIOR: i32 = 620;
+const SHOW_ALL: i32 = 640;
+const APPS_ON: i32 = 650; // + 0 all bars, 1 where the window is
+const OTHER_BARS: i32 = 660; // + 0 like Windows 11, 1 the same as the main bar
 const CANCEL: i32 = 700;
 const YES: i32 = 701;
 const ANIM: i32 = 820;
@@ -622,6 +625,20 @@ impl SettingsPanel {
         y += 21.0 + 34.0 + 12.0;
         b.text(Rect::new(18.0, y, 340.0, 15.0), t!("Размер", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小"), LABEL, Tone::Dim);
         Self::seg(b, SIZE, y + 21.0, (0..3).map(|s| size_name(s).to_string()).collect(), usize::from(size.min(2)));
+        y += 21.0 + 34.0 + 10.0;
+        // the monitors: whether every one has a bar, where the app buttons are and what the other bars hold
+        b.text(Rect::new(18.0, y + 4.0, 340.0, 15.0), t!("Дисплеи", "Displays", ja: "ディスプレイ", pt: "Monitores", zh: "显示器"), LABEL, Tone::Dim);
+        y += 23.0;
+        let all = style::bar_on_all_displays();
+        b.put(SHOW_ALL, Rect::new(PAD, y, CW, 40.0), K::Switch { label: t!("Панель на всех дисплеях", "Show the bar on all displays", ja: "すべてのディスプレイにバーを表示", pt: "Mostrar a barra em todos os monitores", zh: "在所有显示器上显示任务栏").to_string(), sub: vec![], on: all, off: false });
+        y += 40.0 + 10.0;
+        b.text(Rect::new(18.0, y, 340.0, 15.0), t!("Кнопки приложений", "Apps on", ja: "アプリのボタン", pt: "Aplicativos em", zh: "应用按钮显示于"), LABEL, Tone::Dim);
+        let apps = [t!("На всех панелях", "All bars", ja: "すべてのバー", pt: "Todas as barras", zh: "所有任务栏"), t!("Где окно", "Where the window is", ja: "ウィンドウのある画面", pt: "Onde a janela está", zh: "窗口所在的显示器")];
+        Self::seg(b, APPS_ON, y + 21.0, apps.iter().map(ToString::to_string).collect(), style::apps_on() as usize);
+        y += 21.0 + 34.0 + 12.0;
+        b.text(Rect::new(18.0, y, 340.0, 15.0), t!("Остальные панели", "Other bars", ja: "ほかのバー", pt: "Outras barras", zh: "其他任务栏"), LABEL, Tone::Dim);
+        let other = [t!("Как в Windows 11", "Like Windows 11", ja: "Windows 11 と同じ", pt: "Como no Windows 11", zh: "如 Windows 11"), t!("Как главная", "Same as main", ja: "メインと同じ", pt: "Como a principal", zh: "与主任务栏相同")];
+        Self::seg(b, OTHER_BARS, y + 21.0, other.iter().map(ToString::to_string).collect(), style::other_bars() as usize);
         y += 21.0 + 34.0 + 10.0;
         b.text(Rect::new(18.0, y + 4.0, 340.0, 15.0), t!("Поведение", "Behavior", ja: "動作", pt: "Comportamento", zh: "行为"), LABEL, Tone::Dim);
         y += 23.0;
@@ -1292,7 +1309,7 @@ impl Content for SettingsPanel {
     }
 
     fn max_size(&mut self, _g: &mut Gfx) -> Option<(f32, f32)> {
-        Some((W, 700.0))
+        Some((W, 760.0))
     }
 
     fn resized(&mut self, g: &mut Gfx, _now: u64) -> Option<(f32, f32)> {
@@ -1442,6 +1459,23 @@ impl Content for SettingsPanel {
                 self.relook(cx);
             }
             i if (BEHAVIOR..BEHAVIOR + 4).contains(&i) => self.behavior((i - BEHAVIOR) as usize, cx),
+            SHOW_ALL => {
+                let on = !style::bar_on_all_displays();
+                style::set_bar_on_all_displays(on);
+                self.say(cx, if on {
+                    t!("Панель на каждом дисплее", "A bar on every display", ja: "すべてのディスプレイにバーを表示します", pt: "Uma barra em cada monitor", zh: "每个显示器上都有任务栏")
+                } else {
+                    t!("Панель только на главном дисплее", "The bar stays on the main display", ja: "メイン ディスプレイのみにバーを表示します", pt: "A barra fica só no monitor principal", zh: "任务栏仅在主显示器上")
+                });
+            }
+            i if (APPS_ON..APPS_ON + 2).contains(&i) => {
+                style::set_apps_on(style::AppsOn::ALL[(i - APPS_ON) as usize]);
+                self.relook(cx);
+            }
+            i if (OTHER_BARS..OTHER_BARS + 2).contains(&i) => {
+                style::set_other_bars(style::OtherBars::ALL[(i - OTHER_BARS) as usize]);
+                self.relook(cx);
+            }
             CANCEL => self.go(Page::Main, false),
             YES => {
                 style::reset_all();
@@ -1591,7 +1625,7 @@ mod tests {
     fn a_page_change_resizes_the_panel_and_keeps_its_bottom_against_the_bar() {
         use crate::ui::panel::{Anchor, Popup};
         let mut g = gfx();
-        let anchor = Anchor { side: Side::Bottom, button: (10, 846, 50, 886), bar: (0, 846, 1440, 900), screen: (1440, 900) };
+        let anchor = Anchor { side: Side::Bottom, button: (10, 846, 50, 886), bar: (0, 846, 1440, 900), screen: (1440, 900), origin: (0, 0) };
         let mut grab = |_x, _y, w: i32, h: i32| Some(vec![0xff10_1010u32; (w * h) as usize]);
         let mut p = Popup::new(&mut g, Box::new(panel(Page::Main, 0)), anchor, 0, &mut grab);
         let shown = p.frame(&mut g, 0);

@@ -33,6 +33,8 @@ pub struct Place {
     pub side: Side,
     pub along: i32,
     pub edge: i32,
+    /// The monitor it stands on (left, top, width, height, device pixels); zero width: the primary one the tip was made for.
+    pub mon: (i32, i32, i32, i32),
 }
 
 impl Place {
@@ -45,7 +47,14 @@ impl Place {
             Side::Left => rect.2 + dp(12.0),
             Side::Right => rect.0 - dp(12.0),
         };
-        Self { side, along, edge }
+        Self { side, along, edge, mon: (0, 0, 0, 0) }
+    }
+
+    /// The same label on the monitor `mon` (left, top, width, height).
+    #[must_use]
+    pub const fn on(mut self, mon: (i32, i32, i32, i32)) -> Self {
+        self.mon = mon;
+        self
     }
 }
 
@@ -73,7 +82,7 @@ impl Tip {
         Self {
             lines: Vec::new(),
             size: (0.0, 0.0),
-            place: Place { side: Side::Bottom, along: 0, edge: 0 },
+            place: Place { side: Side::Bottom, along: 0, edge: 0, mon: (0, 0, 0, 0) },
             screen,
             scale,
             op: Transition::new(0.0),
@@ -150,13 +159,20 @@ impl Tip {
     fn rest(&self) -> (f32, f32) {
         let s = self.scale;
         let (w, h) = self.size;
-        let (sw, sh) = (self.screen.0 as f32 / s, self.screen.1 as f32 / s);
-        let (along, edge) = (self.place.along as f32 / s, self.place.edge as f32 / s);
-        match self.place.side {
+        // within the monitor, as if it stood at (0, 0), and moved to where it is
+        let (mx, my, mw, mh) = if self.place.mon.2 > 0 { self.place.mon } else { (0, 0, self.screen.0, self.screen.1) };
+        let (sw, sh) = (mw as f32 / s, mh as f32 / s);
+        let (ox, oy) = (mx as f32 / s, my as f32 / s);
+        let (along, edge) = match self.place.side {
+            Side::Bottom => ((self.place.along - mx) as f32 / s, (self.place.edge - my) as f32 / s),
+            _ => ((self.place.along - my) as f32 / s, (self.place.edge - mx) as f32 / s),
+        };
+        let (x, y) = match self.place.side {
             Side::Bottom => ((along - w / 2.0).clamp(4.0, (sw - w - 4.0).max(4.0)), edge - h),
             Side::Left => (edge, (along - h / 2.0).clamp(4.0, (sh - h - 4.0).max(4.0))),
             Side::Right => (edge - w, (along - h / 2.0).clamp(4.0, (sh - h - 4.0).max(4.0))),
-        }
+        };
+        (x + ox, y + oy)
     }
 
     /// Paints the label at `now`. Returns the window rectangle in device pixels, whether the window should be shown, and its
@@ -334,6 +350,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_label_over_a_bar_on_the_monitor_to_the_left_stays_on_it() {
+        let mut t = Tip::new(1.0, (2560, 1440));
+        t.size = (100.0, 25.0);
+        // the primary monitor: centred on the button, 58 above its foot
+        t.place = Place::button(Side::Bottom, (1000, 1386, 1040, 1426), 1020, 1.0);
+        assert_eq!(t.rest(), (970.0, 1368.0 - 25.0));
+        // the monitor to its left (1920x1080 at negative x): the same arithmetic within that monitor
+        let mon = (-1920, 0, 1920, 1080);
+        t.place = Place::button(Side::Bottom, (-1000, 1032, -960, 1074), -980, 1.0).on(mon);
+        assert_eq!(t.rest(), (-1030.0, 1016.0 - 25.0));
+        // at that monitor's left edge it keeps 4 px from it, and does not slide onto the next monitor
+        t.place = Place::button(Side::Bottom, (-1920, 1032, -1880, 1074), -1900, 1.0).on(mon);
+        assert_eq!(t.rest().0, -1916.0);
+        t.place = Place::button(Side::Bottom, (-40, 1032, 0, 1074), -20, 1.0).on(mon);
+        assert_eq!(t.rest().0, -104.0, "4 px from the monitor's right edge, which is x = 0");
+        // beside a side bar on that monitor
+        t.place = Place::button(Side::Left, (-1920, 400, -1866, 440), 420, 1.0).on(mon);
+        assert_eq!(t.rest(), (-1866.0 + 12.0, 420.0 - 12.5));
+    }
 
     #[test]
     fn a_label_waiting_out_its_hold_asks_for_a_timer_not_for_frames() {

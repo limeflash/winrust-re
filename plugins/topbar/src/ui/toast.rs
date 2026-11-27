@@ -52,6 +52,8 @@ pub struct Toast {
     /// The bar where it rests, device pixels.
     bar: (i32, i32, i32, i32),
     screen: (i32, i32),
+    /// The top left corner of the monitor it is shown on (the screen above is that monitor's size).
+    origin: (i32, i32),
     scale: f32,
     since: Option<u64>,
     surf: Surface,
@@ -67,6 +69,7 @@ impl Toast {
             side: Side::Bottom,
             bar: (0, 0, 0, 0),
             screen,
+            origin: (0, 0),
             scale,
             since: None,
             surf: Surface::composed(),
@@ -87,6 +90,12 @@ impl Toast {
 
     pub fn hide(&mut self) {
         self.since = None;
+    }
+
+    /// The pill is shown on the monitor `mon` (left, top, width, height, device pixels) from now on.
+    pub fn on(&mut self, mon: (i32, i32, i32, i32)) {
+        self.origin = (mon.0, mon.1);
+        self.screen = (mon.2, mon.3);
     }
 
     /// The pill is moving (it comes in over the first 12 % of its life and goes out over the last 15 %): frames on every tick of
@@ -126,13 +135,14 @@ impl Toast {
     fn rest(&self) -> (f32, f32) {
         let s = self.scale;
         let (sw, sh) = (self.screen.0 as f32 / s, self.screen.1 as f32 / s);
-        let (l, t, r, _) = (self.bar.0 as f32 / s, self.bar.1 as f32 / s, self.bar.2 as f32 / s, self.bar.3);
+        let (ox, oy) = (self.origin.0, self.origin.1);
+        let (l, t, r, _) = ((self.bar.0 - ox) as f32 / s, (self.bar.1 - oy) as f32 / s, (self.bar.2 - ox) as f32 / s, self.bar.3);
         let (cx, bottom) = match self.side {
             Side::Bottom => ((l + r) / 2.0, t - GAP),
             Side::Left => ((r + sw) / 2.0, sh - GAP),
             Side::Right => (l / 2.0, sh - GAP),
         };
-        (cx - self.width / 2.0, bottom - HEIGHT)
+        (cx - self.width / 2.0 + ox as f32 / s, bottom - HEIGHT + oy as f32 / s)
     }
 
     /// Paints the pill at `now`. Returns the window rectangle in device pixels, whether the window should be shown, and its
@@ -224,10 +234,11 @@ pub fn init(hi: HINSTANCE, scale: f32, screen: (i32, i32)) -> bool {
     true
 }
 
-/// Shows `text` over the bar (`bar`: where it rests, device pixels).
-pub fn show(text: &str, side: Side, bar: (i32, i32, i32, i32)) {
+/// Shows `text` over the bar (`bar`: where it rests, device pixels) on the monitor `mon` (left, top, width, height).
+pub fn show(text: &str, side: Side, bar: (i32, i32, i32, i32), mon: (i32, i32, i32, i32)) {
     with(|h| {
         let t = now();
+        h.toast.on(mon);
         h.toast.show(&mut h.gfx, text, side, bar, t);
         h.frame(t);
     });
@@ -287,6 +298,23 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pill_stands_over_the_bar_of_the_monitor_it_is_shown_on() {
+        let mut t = Toast::new(1.0, (2560, 1440));
+        t.width = 200.0;
+        t.side = Side::Bottom;
+        t.bar = (0, 1386, 2560, 1440);
+        assert_eq!(t.rest(), (1280.0 - 100.0, 1386.0 - GAP - HEIGHT));
+        // the monitor to the left (1920x1080 at negative x)
+        t.on((-1920, 0, 1920, 1080));
+        t.bar = (-1920, 1026, 0, 1080);
+        assert_eq!(t.rest(), (-960.0 - 100.0, 1026.0 - GAP - HEIGHT));
+        // beside a left bar: centred on what the bar leaves along the monitor's foot
+        t.side = Side::Left;
+        t.bar = (-1920, 0, -1866, 1080);
+        assert_eq!(t.rest(), (-1920.0 + (54.0 + 1920.0) / 2.0 - 100.0, 1080.0 - GAP - HEIGHT));
+    }
 
     #[test]
     fn a_resting_toast_asks_for_no_frames_only_for_a_timer() {

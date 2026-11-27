@@ -693,7 +693,7 @@ fn tick() -> u64 {
 /// The windows that show notes follow the store: the clock's badge, the pop-ups, the centre if it is open.
 pub fn changed() {
     // SAFETY: on the bar's thread, which owns the windows and the tray table.
-    let anchor = unsafe { crate::anchor(crate::NONE) };
+    let anchor = unsafe { crate::anchor_main(crate::NONE) }; // the pop-ups stand in the corner of the main bar's monitor
     crate::ui::notice_pop::changed(anchor);
     crate::ui::panel::refresh();
     crate::panel_changed();
