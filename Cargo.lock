@@ -539,6 +539,7 @@ dependencies = [
  "windows-core",
  "windows-sys",
  "winrust-common",
+ "winrust-ui",
  "zip",
 ]
 

@@ -35,20 +35,21 @@ impl Progress {
 static JOB: Mutex<Option<Arc<Progress>>> = Mutex::new(None);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// The status line text while a job runs.
-pub fn status_text() -> Option<String> {
+/// The label of the job that runs and how far it is, 0 to 1 (None while its size is not known yet): what the window's status line draws.
+pub fn progress() -> Option<(String, Option<f32>)> {
     let p = JOB.lock().unwrap().clone()?;
     let (b, tb, f, tf) = (p.bytes.load(Relaxed), p.total_bytes.load(Relaxed), p.files.load(Relaxed), p.total_files.load(Relaxed));
-    let secs = p.started.elapsed().as_secs_f64().max(0.1);
-    let mut s = p.what.clone();
-    if tf > 0 {
-        let count = tf!("файлов: {} из {}", "{} of {} files", ja: "{} 個中 {}", pt: "{} de {} arquivos", zh: "第 {} 个文件，共 {} 个", f, tf);
-        s += &format!("  \u{00B7}  {count}");
+    let frac = if tb > 0 { Some((b as f64 / tb as f64).clamp(0.0, 1.0) as f32) } else if tf > 0 { Some((f as f64 / tf as f64).clamp(0.0, 1.0) as f32) } else { None };
+    // "Copying Temp  ·  46%  ·  112 MB/s": the design's label, with how far and how fast
+    let mut label = p.what.clone();
+    if let Some(x) = frac {
+        label += &format!("  \u{00B7}  {}%", (x * 100.0).round());
     }
     if tb > 0 {
-        s += &format!("  \u{00B7}  {}", tf!("{} из {} ({}%)  \u{00B7}  {}/с", "{} of {} ({}%)  \u{00B7}  {}/s", ja: "{}/{} ({}%)  \u{00B7}  {}/秒", pt: "{} de {} ({}%)  \u{00B7}  {}/s", zh: "{} / {}（{}%）  \u{00B7}  {}/秒", super::size_text(b), super::size_text(tb), b * 100 / tb.max(1), super::size_text((b as f64 / secs) as u64)));
+        let secs = p.started.elapsed().as_secs_f64().max(0.1);
+        label += &format!("  \u{00B7}  {}", tf!("{}/с", "{}/s", ja: "{}/秒", pt: "{}/s", zh: "{}/秒", super::size_text((b as f64 / secs) as u64)));
     }
-    Some(s + "\u{2026}")
+    Some((label, frac))
 }
 
 pub fn busy() -> bool {
@@ -72,9 +73,9 @@ fn spawn(h: isize, what: String, f: impl FnOnce(&Progress) -> Result<(), String>
     let ticker = std::thread::spawn({
         let p = p.clone();
         move || {
-            // repaint the status line a few times a second while the job runs
+            // tell the window a few times a second while the job runs: it draws the progress
             while RUNNING.load(Relaxed) {
-                unsafe { super::ui::status_dirty(h as _) };
+                unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(h as _, super::fm::live::MSG_TICK, 0, 0) };
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             drop(p);
