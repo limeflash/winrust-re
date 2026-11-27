@@ -29,6 +29,7 @@ mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
 mod shellwin; // registers the window as a shell window: "Show in folder" from other apps selects the file
 mod menu; // the folder's own menu, painted in our colours
+mod shellmenu; // the bar's menu for files and folders: the shell's items offered to it, what it chooses run here
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
@@ -353,8 +354,10 @@ fn zip_menu(h: HWND, paths: &[PathBuf]) {
 }
 
 /// The shell menu for the selection, with our "Compress to ZIP" / "Extract here" on top.
-fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
+fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf], key: bool) {
     if zipx::split_zip(dir).is_some() { return zip_menu(h, paths); }
+    // the bar draws it (and runs nothing here until it is chosen from); from the keyboard it opens at the selected row
+    if shellmenu::offer(h, dir, paths, if key { shellmenu::row_at(selected().0) } else { None }) { return; }
     let mut extra = vec![(MENU_ZIP, t!("Сжать в ZIP", "Compress to ZIP", ja: "ZIP に圧縮", pt: "Compactar em ZIP", zh: "压缩为 ZIP"))];
     if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
         extra.insert(0, (MENU_EXTRACT, t!("Извлечь сюда", "Extract here", ja: "ここに展開", pt: "Extrair aqui", zh: "解压到此处")));
@@ -929,7 +932,7 @@ mod sh {
     impl Drop for Pidls { fn drop(&mut self) { for p in &self.0 { unsafe { CoTaskMemFree(Some(*p as *const c_void)) }; } } }
 
     /// A shell UI object (IContextMenu, IDataObject...) for items that all live in one folder.
-    fn ui<T: Interface>(h: HWND, paths: &[PathBuf]) -> Result<T> {
+    pub(crate) fn ui<T: Interface>(h: HWND, paths: &[PathBuf]) -> Result<T> {
         unsafe {
             let mut abs = Pidls(vec![]);
             for p in paths {
@@ -985,7 +988,7 @@ mod sh {
         TRUE
     }
 
-    fn top_windows() -> Vec<isize> {
+    pub(crate) fn top_windows() -> Vec<isize> {
         let mut v: Vec<isize> = vec![];
         unsafe { let _ = EnumWindows(Some(collect), LPARAM(&mut v as *mut _ as isize)); }
         v
@@ -993,7 +996,7 @@ mod sh {
 
     /// Dialogs the shell opens for a command ("Open with" > choose another app, Properties) can land partly off screen on some
     /// setups. For a few seconds after the command, any new window that sticks out of its monitor is moved back inside.
-    fn keep_on_screen(before: Vec<isize>) {
+    pub(crate) fn keep_on_screen(before: Vec<isize>) {
         std::thread::spawn(move || unsafe {
             for _ in 0..40 {
                 std::thread::sleep(std::time::Duration::from_millis(150));
@@ -1201,6 +1204,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             if desk() { InvalidateRect(h, ptr::null(), 1); } else { ui::restyle(h); }
             return 0;
         }
+        if m == winrust_common::filemenu::act_msg() { // what the bar's menu for files chose
+            shellmenu::act(h, wp, lp);
+            return 0;
+        }
         if desk() && m == deskmenu::cmd_msg() { // what the bar's desktop menu chose
             if let Some(c) = Cmd::decode(wp, lp) { desktop::command(h, c); }
             return 0;
@@ -1208,6 +1215,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
         match m {
             WM_CREATE => {
                 let inst = GetModuleHandleW(ptr::null());
+                // the bar may run elevated, we do not: what its menu for files chose must not be dropped (UIPI)
+                ChangeWindowMessageFilterEx(h, winrust_common::filemenu::act_msg(), MSGFLT_ALLOW, ptr::null_mut());
                 // desktop mode has no tab bar / address bar: the null handles are harmless to every SendMessage below
                 let (mut tab, mut edit) = (0 as HWND, 0 as HWND);
                 if !desk() {
@@ -1418,7 +1427,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     }
                     NM_RCLICK if nm.hwndFrom == list => {
                         let (_, dir, paths) = selected();
-                        if !paths.is_empty() { item_menu(h, &dir, &paths); } else { bg_menu(h); }
+                        if !paths.is_empty() { item_menu(h, &dir, &paths, false); } else { bg_menu(h); }
                     }
                     LVN_COLUMNCLICK => {
                         let c = (*(lp as *const NMLISTVIEW)).iSubItem as usize;
@@ -1471,7 +1480,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 put(edit, EM_SETSEL, 0, -1);
                                 return 0;
                             }
-                            0x5D if !paths.is_empty() => item_menu(h, &dir, &paths),
+                            0x5D if !paths.is_empty() => item_menu(h, &dir, &paths, true),
                             0x43 | 0x58 if ctrl && !paths.is_empty() => { // from a zip: real files in the temp folder, and only a copy (nothing can be cut out of an archive)
                                 match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, vk == 0x58 && !in_zip()); } Err(e) => warn(h, &e) }
                                 return 0;
@@ -1577,6 +1586,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             // a secondary monitor, where the list does not reach (#125)
             WM_CONTEXTMENU if desk() && (icons_hidden() || wp as HWND == h) => { bg_menu(h); 0 }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
+            WM_TIMER if wp == shellmenu::TIMER => { shellmenu::tick(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
             WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
