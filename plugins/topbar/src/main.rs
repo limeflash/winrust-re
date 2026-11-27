@@ -40,7 +40,7 @@ mod vdesk;
 mod wins;
 mod render;
 mod selftest;
-mod pacing;
+use winrust_ui::pacing;
 mod notify;
 #[allow(dead_code)]
 mod rec;

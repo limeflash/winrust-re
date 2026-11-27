@@ -37,6 +37,7 @@ rust-version = "1.100"
 [workspace]
 members = [
     "common",
+    "ui",
     "ReShell",
     "plugins/topbar",
     "plugins/rtaskmgr-win32",

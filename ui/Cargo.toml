@@ -1,0 +1,12 @@
+[package]
+name = "winrust-ui"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+winrust-common = { path = "../common" }
+windows-numerics = "0.3"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_System_Com", "Win32_Graphics_Gdi", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_DirectComposition", "Win32_Graphics_Imaging", "Win32_UI_WindowsAndMessaging"] }

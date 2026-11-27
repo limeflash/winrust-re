@@ -46,7 +46,7 @@ fn run() {
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
         if s.windows.is_empty() { s.running = false; return; }
         // layered windows (no DirectComposition): a frame is a readback and a copy, 60 of them a second are plenty
-        if !crate::ui::gfx::composed_anywhere() && last.elapsed() < Duration::from_millis(15) { continue; }
+        if !crate::gfx::composed_anywhere() && last.elapsed() < Duration::from_millis(15) { continue; }
         last = Instant::now();
         s.windows.retain(|&hwnd, pending| {
             if !*pending {
