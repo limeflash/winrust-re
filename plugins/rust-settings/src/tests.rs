@@ -1480,9 +1480,9 @@ fn default_apps_list_what_windows_has_and_a_pick_opens_windows_own_chooser() {
     assert_eq!(items.iter().position(|m| m.radio == Some(true)), Some(0));
     let mut cx = Cx::default();
     s.command(TAG_PICK, 2, &mut cx);
-    assert_eq!(d.log(), vec!["assoc_pick .jpg 2".to_string(), "assoc_dialog TEMP/WinRust/defaults/Sample.jpg flags=7".to_string()], "the sample file and Explorer's flags (register ext, exec, no force)");
-    assert_eq!(toasts(&cx).len(), 1, "the toast says Windows asks to confirm");
-    assert_eq!(photos(&s), "Paint", "read again after the dialog");
+    assert_eq!(d.log(), vec!["assoc_pick .jpg 2".to_string()], "Windows' own page is asked to open");
+    assert_eq!(toasts(&cx).len(), 1, "the toast says Windows' settings open");
+    assert_eq!(photos(&s), "WinRust Photos", "nothing is set here: Windows sets it on its page");
     // the rows that are WinRust's own do nothing
     d.clear_log();
     press(&mut s, |l| l.key == "def:Files", P_CTL);
@@ -1539,21 +1539,7 @@ fn the_apps_page_shows_size_and_date_and_sorts_by_them() {
 }
 
 #[test]
-fn the_chooser_is_asked_the_way_explorer_asks_it() {
-    // flags: register the extension and open the sample (without exec Windows shows only "go to Settings"); no force: refused as well
-    assert_eq!(more::CHOOSER_FLAGS, 1 | 2 | 4);
-    assert_eq!(more::CHOOSER_FLAGS & 8, 0);
-    // the sample holds something the chosen app can open
-    assert!(more::sample_bytes(".jpg").starts_with(&[0xFF, 0xD8]) && more::sample_bytes(".JPEG").starts_with(&[0xFF, 0xD8]));
-    assert!(more::sample_bytes(".png").starts_with(b"\x89PNG") && more::sample_bytes(".gif").starts_with(b"GIF8"));
-    assert!(more::sample_bytes(".pdf").starts_with(b"%PDF-") && more::sample_bytes(".txt") == b"WinRust sample\n");
-    assert!(more::sample_bytes(".mkv").is_empty());
-    // the sample: a real file name of that type under the temp folder, only for plain extensions
-    let t = std::path::Path::new("T");
-    let p = more::sample_path(t, ".pdf").unwrap();
-    assert_eq!(p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"), "T/WinRust/defaults/Sample.pdf");
-    assert!(more::sample_path(t, "pdf").is_none() && more::sample_path(t, ".").is_none() && more::sample_path(t, ".a/b").is_none() && more::sample_path(t, "http").is_none());
-    // the link rows say before the click that Windows Settings opens
+fn the_link_rows_say_before_the_click_that_windows_settings_opens() {
     let (s, _d) = win("defaults");
     let sub = |k: &str| s.pg.groups[0].rows.iter().find(|l| l.key == k).map(|l| l.sub.clone()).unwrap();
     assert!(sub("def:Web").contains("Windows") && sub("def:Mail").contains("Windows"), "{} / {}", sub("def:Web"), sub("def:Mail"));

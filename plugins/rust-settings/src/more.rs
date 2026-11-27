@@ -681,36 +681,6 @@ pub struct Assoc {
     pub protocol: bool,
 }
 
-/// What `SHOpenWithDialog` is asked: OAIF_ALLOW_REGISTRATION (1), OAIF_REGISTER_EXT (2) and OAIF_EXEC (4), what Explorer's "Open with >
-/// Choose another app" does, so the user ticks "Always use this app" and Windows records it itself. Without OAIF_EXEC Windows 10 and later
-/// show no chooser at all, only "To change your default apps, go to Settings" (documented for SHOpenWithDialog); with it the chosen app opens
-/// the sample ([`sample_bytes`]). Not OAIF_FORCE_REGISTRATION (8: refused from a program as well).
-pub const CHOOSER_FLAGS: u32 = 1 | 2 | 4;
-
-/// What the sample holds, so the app chosen in the dialog opens something real: a small picture, a one-page PDF, a line of text. Other types
-/// stay empty files.
-#[must_use]
-pub fn sample_bytes(ext: &str) -> &'static [u8] {
-    match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" | "jfif" => include_bytes!("../assets/sample.jpg"),
-        "png" => include_bytes!("../assets/sample.png"),
-        "gif" => include_bytes!("../assets/sample.gif"),
-        "pdf" => b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 45>>stream\nBT /F1 24 Tf 72 760 Td (WinRust sample) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n",
-        "json" => b"{}\n",
-        "txt" | "md" | "log" | "toml" | "ini" | "csv" | "yaml" | "yml" => b"WinRust sample\n",
-        "html" | "htm" => b"<!doctype html><title>WinRust sample</title><p>WinRust sample</p>\n",
-        _ => b"",
-    }
-}
-
-/// The sample file the chooser is pointed at: `<temp>\WinRust\defaults\Sample.<ext>` (a real file of that type, opened by the app chosen).
-/// None for an extension that is not plain.
-#[must_use]
-pub fn sample_path(temp: &std::path::Path, ext: &str) -> Option<std::path::PathBuf> {
-    let e = ext.strip_prefix('.')?;
-    (!e.is_empty() && e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')).then(|| temp.join("WinRust").join("defaults").join(format!("Sample.{e}")))
-}
-
 /// An app Windows has registered for an association: its name and its exe's file name (lower case).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DefApp {
@@ -749,7 +719,7 @@ pub fn defaults_rows() -> Vec<Group> {
     let mut head = Group::new(t!("Открыть в", "Open with", ja: "開くアプリ", pt: "Abrir com", zh: "打开方式"))
         .note(t!("Выберите приложение для каждого вида файлов", "Pick an app for each kind of file"))
         .extra(Extra::Search(String::new()))
-        .foot(t!("Windows попросит подтвердить выбор («Всегда использовать это приложение»).", "Windows asks you to confirm the choice (\u{201c}Always use this app\u{201d})."));
+        .foot(t!("Выбор делается в параметрах Windows: они откроются по нажатию (Windows не даёт приложениям менять это самим).", "The choice is made in Windows\u{2019} settings, which open on a click (Windows lets no app change it on its own)."));
     if q.trim().is_empty() {
         head.rows = DefKind::ALL
             .iter()

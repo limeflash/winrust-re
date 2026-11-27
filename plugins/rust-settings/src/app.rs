@@ -455,10 +455,10 @@ impl Settings {
 
     /// Applies entry `i` of `choices(op)` and does what the window must after it.
     pub fn pick_value(&mut self, op: Op, i: usize, cx: &mut Cx) {
-        // a default app is Windows' to set: its own chooser opens and the user confirms there
+        // a default app is Windows' to set: its own Default apps page opens and the user chooses there
         if let Some(a) = crate::def_assoc(op) {
             os().assoc_pick(&a, i, self.hwnd, note());
-            self.say(if os().assoc_on_page(&a) { t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there") } else { t!("Windows спросит, чем открывать: подтвердите «Всегда использовать это приложение»", "Windows asks which app to use: confirm \u{201c}Always use this app\u{201d}") }, cx);
+            self.say(t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there"), cx);
             self.read_page();
             cx.invalidate();
             return;

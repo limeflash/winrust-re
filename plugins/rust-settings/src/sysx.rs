@@ -733,64 +733,13 @@ pub fn assoc_apps(a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
     (apps, cur)
 }
 
-/// Whether the default for `a` is chosen on Windows' own Default apps page rather than in the "Open with" chooser: a link scheme always,
-/// and a file type when Explorer is not the shell. Windows 11's chooser (OpenWith.exe) needs Explorer's shell like the Settings app does:
-/// without it the dialog came up unowned, 448 x 61 px (its "Just once" button only, the app list never laid out) and centred on the
-/// screen's corner, from an elevated Settings and from a copy with normal rights alike. The page is shown with Explorer lent meanwhile.
-pub fn assoc_on_page(a: &Assoc) -> bool {
-    a.protocol || winrust_common::proc::shell_explorers().is_empty()
-}
-
-/// Opens Windows' own chooser for `a` the way Explorer's "Open with > Choose another app" does: the dialog is pointed at a sample file of that
-/// type, which the chosen app then opens (without OAIF_EXEC Windows shows no chooser, only "go to Settings"), so the user ticks "Always use this
-/// app" and Windows records the choice itself
-/// (nothing here writes UserChoice). When it closes the default is read again and `done` gets a line for the toast: the new default, or a hint
-/// when nothing changed. A link scheme cannot be chosen there: it opens Windows' own settings page (which lends Explorer while it is open).
-pub fn assoc_pick(a: &Assoc, owner: isize, done: Note) {
-    if assoc_on_page(a) {
-        // Windows' page, not ours: "ms-settings:defaultapps" alone now opens this very page of WinRust Settings
-        winrust_common::settings::open_windows("ms-settings:defaultapps");
-        return;
-    }
-    let Some(sample) = crate::more::sample_path(&std::env::temp_dir(), &a.name) else { return };
-    let a = a.clone();
-    std::thread::spawn(move || {
-        use windows::Win32::{
-            Foundation::HWND,
-            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
-            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPEN_AS_INFO_FLAGS, OPENASINFO, SHOpenWithDialog},
-        };
-        use windows::core::HSTRING;
-        // a file of that type with something in it: the app chosen in the dialog opens it (written each time: an older build left empty ones)
-        if sample.parent().is_none_or(|p| std::fs::create_dir_all(p).is_err()) || std::fs::write(&sample, crate::more::sample_bytes(&a.name)).is_err() {
-            return done(t!("Не удалось подготовить образец файла", "Could not prepare the sample file").into());
-        }
-        let (listed, cur0) = assoc_apps(&a);
-        let before = cur0.and_then(|c| listed.get(c)).map(|x| x.exe.clone());
-        let name = HSTRING::from(sample.as_os_str());
-        let flags = OPEN_AS_INFO_FLAGS(crate::more::CHOOSER_FLAGS as i32);
-        debug_assert_eq!(flags, OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC);
-        let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: flags };
-        // SAFETY: a modal shell dialog on this thread, over our window; the app chosen opens the sample (OAIF_EXEC).
-        let shown = unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            SHOpenWithDialog(Some(HWND(owner as *mut _)), &info)
-        };
-        if let Ok(mut c) = handlers_cache().lock() {
-            c.clear(); // what it was is read again
-        }
-        if shown.is_err() {
-            // the dialog would not open for this type on this Windows: Windows' own settings page is the way
-            winrust_common::settings::open_windows("ms-settings:defaultapps");
-            return done(t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there").into());
-        }
-        let (apps, cur) = assoc_apps(&a);
-        let now = cur.and_then(|c| apps.get(c));
-        done(match now {
-            Some(x) if Some(&x.exe) != before.as_ref() => tf!("{} по умолчанию: {}", "Default for {}: {}", a.name, x.name),
-            _ => t!("Отметьте «Всегда использовать это приложение», чтобы оно стало основным", "Tick \u{2018}Always use this app\u{2019} to make it the default").into(),
-        });
-    });
+/// The user chose an app for `a` in our list: Windows' own Default apps page opens, shown with Explorer lent meanwhile, where the choice
+/// is made. Windows lets nothing else set a default: its "Open with" dialog, when a program opens it, offers "Just once" and never
+/// "Always" (Windows 10 and later ignore the registration flags), and without Explorer as the shell it does not even lay out (448 x 61
+/// px, the screen's corner). Nothing here writes UserChoice.
+pub fn assoc_pick(_a: &Assoc, _owner: isize, _done: Note) {
+    // "ms-settings:defaultapps" alone now opens this very page of WinRust Settings: open_windows sends it to Windows' own
+    winrust_common::settings::open_windows("ms-settings:defaultapps");
 }
 
 /// What WinRust's own file manager and terminal are on this PC: not a Windows setting, what is installed.
