@@ -58,7 +58,7 @@ pub fn decode(path: &str, bg: [u8; 3]) -> Result<Img> {
         src.GetSize(&mut w, &mut h)?;
         let mut bgra = vec![0u8; w as usize * h as usize * 4];
         src.CopyPixels(std::ptr::null(), w * 4, &mut bgra)?;
-        for p in bgra.chunks_exact_mut(4) {
+        for p in bgra.as_chunks_mut::<4>().0 {
             let inv = 255 - p[3] as u32; // premultiplied: result = colour + bg * (1 - alpha)
             for c in 0..3 {
                 p[c] = (p[c] as u32 + bg[c] as u32 * inv / 255).min(255) as u8;
@@ -107,13 +107,61 @@ mod tests {
         chunk(&mut png, b"IHDR", &[0, 0, 0, 2, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
         chunk(&mut png, b"IDAT", &z);
         chunk(&mut png, b"IEND", &[]);
-        let p = std::env::temp_dir().join("photoview-test.png");
+        let dir = std::env::temp_dir().join(format!("photoview-decode-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("test.png");
         std::fs::write(&p, png).unwrap();
         com_init();
         let img = decode(p.to_str().unwrap(), [10, 20, 30]).unwrap();
-        let _ = std::fs::remove_file(p);
+        std::fs::remove_dir_all(dir).unwrap();
         assert_eq!((img.w, img.h), (2, 1));
         assert_eq!(img.bgra[..4], [0, 0, 255, 255]); // BGRA of opaque red
         assert_eq!(img.bgra[4..8], [10, 20, 30, 255]); // the background, as given (BGR)
     }
 }
+
+/// Decode without compositing, preserving premultiplied alpha for the new renderer.
+pub fn decode_model(path: &std::path::Path) -> Result<crate::decoder::Decoded> {
+    use crate::decoder::{Decoded, Meta, palette};
+    unsafe {
+        let f: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let dec = f.CreateDecoderFromFilename(&HSTRING::from(path.as_os_str()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+        let frame = dec.GetFrame(0)?;
+        let reader = frame.GetMetadataQueryReader().ok();
+        let query = |name: &str| -> Option<windows::Win32::System::Com::StructuredStorage::PROPVARIANT> {
+            let mut v = Default::default();
+            reader.as_ref()?.GetMetadataByName(&HSTRING::from(name), &mut v).ok()?; Some(v)
+        };
+        let string = |names: &[&str]| -> Option<String> {
+            names.iter().find_map(|name| { let v = query(name)?; windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc(&v).ok().and_then(|p| { let s = p.to_string().ok(); CoTaskMemFree(Some(p.0.cast())); s }).filter(|s| !s.is_empty()) })
+        };
+        let number = |names: &[&str]| -> Option<u32> {
+            names.iter().find_map(|name| { let v = query(name)?; u32::try_from(&v).ok().or_else(|| u16::try_from(&v).ok().map(u32::from)) })
+        };
+        let orientation = number(&["/app1/ifd/{ushort=274}", "/ifd/{ushort=274}"]).unwrap_or(1) as u16;
+        let conv = f.CreateFormatConverter()?;
+        conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+        let mut src: IWICBitmapSource = conv.cast()?;
+        let t = transform(orientation);
+        if t != 0 { let r = f.CreateBitmapFlipRotator()?; r.Initialize(&src, WICBitmapTransformOptions(t))?; src = r.cast()?; }
+        let (mut w, mut h) = (0, 0); src.GetSize(&mut w, &mut h)?;
+        let (original_w, original_h) = (w, h);
+        if w.max(h) > 16384 {
+            let scale = 16384.0 / w.max(h) as f64;
+            w = ((w as f64 * scale).round() as u32).max(1); h = ((h as f64 * scale).round() as u32).max(1);
+            let s = f.CreateBitmapScaler()?; s.Initialize(&src, w, h, WICBitmapInterpolationModeFant)?; src = s.cast()?;
+        }
+        let mut bytes = vec![0u8; w as usize * h as usize * 4]; src.CopyPixels(std::ptr::null(), w * 4, &mut bytes)?;
+        let px: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|p| u32::from_le_bytes(*p)).collect();
+        let meta = Meta { width: original_w, height: original_h, format: path.extension().map(|s| s.to_string_lossy().to_uppercase()).unwrap_or_default(),
+            taken: string(&["/app1/ifd/exif/{ushort=36867}", "/ifd/exif/{ushort=36867}"]),
+            camera: string(&["/app1/ifd/{ushort=272}", "/ifd/{ushort=272}"]),
+            lens: string(&["/app1/ifd/exif/{ushort=42036}", "/ifd/exif/{ushort=42036}"]),
+            exposure: string(&["/app1/ifd/exif/{ushort=33434}", "/ifd/exif/{ushort=33434}"]),
+            iso: number(&["/app1/ifd/exif/{ushort=34855}", "/ifd/exif/{ushort=34855}"]),
+            size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) };
+        let palette = palette(&px, w, h);
+        Ok(Decoded { w, h, px, meta, palette })
+    }
+}
+

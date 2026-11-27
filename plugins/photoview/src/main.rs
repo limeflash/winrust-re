@@ -5,6 +5,10 @@
 // shortcuts: files sorted by plain case-insensitive name (no "2 before 10" ordering), only the shown picture is decoded
 // (no preloading of neighbours), downscaling is GDI halftone; upgrade if browsing 40 MP photos feels slow.
 mod decode;
+#[allow(dead_code)]
+mod decoder;
+#[allow(dead_code)]
+mod folder;
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
