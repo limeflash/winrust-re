@@ -33,6 +33,7 @@ pub const ID_FIRST_SELECT: Id = 1;
 pub const ID_BACK: Id = 2;
 pub const ID_PROFILE: Id = 3;
 pub const ID_SEARCH: Id = 200; // and 201, its clear button
+pub const ID_AQ: Id = 202; // the Apps page's own search box, and 203, its clear button
 pub const ID_NAV: Id = 10; // + the page
 pub const ID_SCROLL: Id = 20; // and 21, its bar
 pub const ID_DLG_SCRIM: Id = 30;
@@ -169,6 +170,8 @@ pub struct Settings {
     pub pg: Page,
     pub hist: Vec<usize>,
     pub q: TextField,
+    /// The Apps page's own search box (what the sidebar's `q` is for every page).
+    pub aq: TextField,
     pub found: Vec<search::Found>,
     index: Option<Vec<Page>>,
     pub scroll: Scroll,
@@ -238,6 +241,7 @@ impl Settings {
             pg: Page { title: String::new(), groups: Vec::new() },
             hist: Vec::new(),
             q: TextField::new(),
+            aq: TextField::new(),
             found: Vec::new(),
             index: None,
             scroll: Scroll::default(),
@@ -824,6 +828,15 @@ impl Settings {
         cx.invalidate();
     }
 
+    /// The Apps page's own search box changed: the list is built again with it.
+    fn edited_apps(&mut self, cx: &mut Cx) {
+        crate::set_app_query(&self.aq.text);
+        self.armed = None;
+        self.scroll = Scroll::default();
+        self.read_page();
+        cx.invalidate();
+    }
+
     /// The first hit's line, as Enter in the search box opens it.
     fn first_hit(&self) -> Option<(usize, Option<String>)> {
         self.found.first().and_then(|f| f.hits.first()).map(|h| (h.page, h.key.clone()))
@@ -928,6 +941,7 @@ impl App for Settings {
         let now = anim::now_ms();
         match id {
             ID_SEARCH => self.q.mouse_down(x, cx.mods.shift, now),
+            ID_AQ => self.aq.mouse_down(x, cx.mods.shift, now),
             i if i == scroll::bar_id(ID_SCROLL) => {
                 scroll::bar_down(&mut self.scroll, y, now);
             }
@@ -951,6 +965,7 @@ impl App for Settings {
         let now = anim::now_ms();
         match id {
             ID_SEARCH => self.q.mouse_drag(x, now),
+            ID_AQ => self.aq.mouse_drag(x, now),
             i if i == scroll::bar_id(ID_SCROLL) => scroll::bar_drag(&mut self.scroll, y, now),
             i if (ID_ARR..ID_ARR + 8).contains(&i) => {
                 if let Some(bx) = self.arr_box {
@@ -979,6 +994,7 @@ impl App for Settings {
     fn release(&mut self, id: Id, cx: &mut Cx) {
         match id {
             ID_SEARCH => self.q.mouse_up(),
+            ID_AQ => self.aq.mouse_up(),
             i if i == scroll::bar_id(ID_SCROLL) => scroll::bar_up(&mut self.scroll),
             _ => {}
         }
@@ -1032,6 +1048,11 @@ impl App for Settings {
                 self.q.set_text("");
                 self.edited_query(cx);
                 cx.focus(ID_SEARCH);
+            }
+            i if i == ID_AQ + 1 => {
+                self.aq.set_text("");
+                self.edited_apps(cx);
+                cx.focus(ID_AQ);
             }
             ID_DLG_KEEP => self.end_confirm(true, cx),
             ID_DLG_REVERT => self.end_confirm(false, cx),
@@ -1149,6 +1170,23 @@ impl App for Settings {
             cx.invalidate();
             return ev.used();
         }
+        if cx.focus == Some(ID_AQ) {
+            let ev = field::key(&mut self.aq, cx, vk, m, now);
+            match ev {
+                Ev::Edited => self.edited_apps(cx),
+                Ev::Esc => {
+                    // Esc empties the box before it does anything else
+                    if self.aq.text.is_empty() {
+                        return false;
+                    }
+                    self.aq.set_text("");
+                    self.edited_apps(cx);
+                }
+                _ => {}
+            }
+            cx.invalidate();
+            return ev.used();
+        }
         let used = match vk {
             F if m.ctrl => {
                 cx.focus(ID_SEARCH);
@@ -1192,6 +1230,9 @@ impl App for Settings {
         } else if cx.focus == Some(ID_SEARCH) {
             field::text(&mut self.q, s, now);
             self.edited_query(cx);
+        } else if cx.focus == Some(ID_AQ) {
+            field::text(&mut self.aq, s, now);
+            self.edited_apps(cx);
         }
         cx.invalidate();
     }
@@ -1308,6 +1349,12 @@ impl Settings {
         self.open = Some(key.to_string());
         self.reveal = Some(key.to_string());
         self.fail(key, err.unwrap_or_default());
+    }
+
+    /// The Apps page's own search box holds `q`.
+    pub fn demo_app_search(&mut self, q: &str) {
+        self.aq.set_text(q);
+        crate::set_app_query(q);
     }
 
     /// The search box holds `q`.

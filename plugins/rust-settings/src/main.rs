@@ -280,6 +280,8 @@ pub enum Extra {
     Drives(Vec<Drive>),
     /// The desktop backgrounds the window offers (the demo's; the real one only has "Choose…").
     Walls(Vec<Wall>),
+    /// The search box of a page's own list (the Apps page): what it says of the result ("3 of 12"), empty while nothing is typed.
+    Search(String),
 }
 
 /// A big status card (the Network page).
@@ -674,6 +676,12 @@ pub const POWER_PAGE: usize = 2;
 thread_local! { static EXPANDED: RefCell<Option<String>> = const { RefCell::new(None) } } // the adapter whose details show
 thread_local! { static RADIO: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) } }
 thread_local! { static PROGRAMS: RefCell<Option<Vec<ext::App>>> = const { RefCell::new(None) } } // read when the Apps page opens
+thread_local! { static APP_QUERY: RefCell<String> = const { RefCell::new(String::new()) } } // what the Apps page's own search box holds
+
+/// The Apps page's own search box now holds `q` (the page shows the programs whose name or publisher has it).
+pub fn set_app_query(q: &str) {
+    APP_QUERY.with_borrow_mut(|a| *a = q.to_string());
+}
 
 /// Shows or hides the details of the adapter named `name`.
 pub fn toggle_adapter(name: &str) {
@@ -997,10 +1005,25 @@ fn bt_rows() -> Vec<Group> {
     gs
 }
 
-fn apps_rows() -> Vec<Group> {
+fn apps_rows(q: &str) -> Vec<Group> {
     let list = PROGRAMS.with_borrow_mut(|p| p.get_or_insert_with(|| os().programs()).clone());
-    let rows = list.iter().take(400).map(|a| Line::new(Row::Item(a.name.clone(), a.version.clone(), Cmd::Uninstall(a.uninstall.clone()))).subtitle(a.version.clone()).tile(Tile::Solid(look::APP_GRID, 0x6b7187))).collect();
-    vec![Group::new(tf!("Приложений: {}", "{} apps", list.len())).rows(rows)]
+    let q = q.trim().to_lowercase();
+    let shown: Vec<&ext::App> = list.iter().filter(|a| q.is_empty() || format!("{} {}", a.name, a.publisher).to_lowercase().contains(&q)).collect();
+    let rows = shown
+        .iter()
+        .take(400)
+        .map(|a| {
+            let sub = if a.publisher.is_empty() { a.version.clone() } else { format!("{} · {}", a.publisher, a.version) };
+            Line::new(Row::Item(a.name.clone(), a.version.clone(), Cmd::Uninstall(a.uninstall.clone()))).subtitle(sub).tile(Tile::Solid(look::APP_GRID, 0x6b7187))
+        })
+        .collect();
+    let count = if q.is_empty() { String::new() } else { tf!("{} из {}", "{} of {}", ja: "{} / {}", pt: "{} de {}", zh: "{} / {}", shown.len(), list.len()) };
+    let head = Group::new(tf!("Приложений: {}", "{} apps", list.len())).extra(Extra::Search(count));
+    let mut g = Group::new("").rows(rows);
+    if shown.is_empty() && !list.is_empty() {
+        g = g.empty(tf!("Нет приложений по запросу «{}». Попробуйте часть названия или издателя.", "No apps match “{}”. Try part of the name or the publisher.", ja: "「{}」に一致するアプリはありません。名前または発行元の一部をお試しください。", pt: "Nenhum app corresponde a “{}”. Tente parte do nome ou do editor.", zh: "没有与“{}”匹配的应用。请尝试名称或发布者的一部分。", q));
+    }
+    vec![head, g]
 }
 
 fn wu_rows() -> Vec<Group> {
@@ -1107,13 +1130,18 @@ pub const PAGES: usize = PAGE_KEYS.len();
 /// Page `i`, built from what the system says now (the Apps page keeps the list of programs it read when it was opened).
 #[must_use]
 pub fn page(i: usize) -> Page {
+    page_with(i, &APP_QUERY.with_borrow(Clone::clone))
+}
+
+/// Page `i` with `apps` in the Apps page's own search box.
+fn page_with(i: usize, apps: &str) -> Page {
     let groups = match i {
         0 => display_rows(),
         1 => sound_rows(),
         2 => power_rows(),
         NET_PAGE => network_rows(),
         BT_PAGE => bt_rows(),
-        APPS_PAGE => apps_rows(),
+        APPS_PAGE => apps_rows(apps),
         WU_PAGE => wu_rows(),
         7 => personal_rows(),
         _ => about_rows(),
@@ -1124,7 +1152,7 @@ pub fn page(i: usize) -> Page {
 /// Every page (what the search looks through).
 #[must_use]
 pub fn pages() -> Vec<Page> {
-    (0..PAGES).map(page).collect()
+    (0..PAGES).map(|i| page_with(i, "")).collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

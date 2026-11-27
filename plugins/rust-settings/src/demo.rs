@@ -18,11 +18,11 @@ use crate::{
 use windows_sys::core::GUID;
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, the pages, and a few more.
-pub const STATES: [&str; 48] = [
+pub const STATES: [&str; 50] = [
     "display", "sound", "power", "network", "bluetooth", "apps", "update", "personal", "about", "battery-charging", "battery-on-battery", "battery-low", "battery-none", "net-wifi", "net-ethernet", "net-no-wifi-adapter",
     "net-offline", "net-airplane", "identify", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
     "appearance-light", "appearance-night-light", "wifi-password", "wifi-connected-open", "adapter-open", "dropdown", "search", "search-page", "search-none", "display-single", "sound-muted", "power-plans-many", "update-checking",
-    "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many",
+    "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many", "apps-search", "apps-none",
 ];
 
 fn guid() -> GUID {
@@ -109,8 +109,8 @@ fn net(ssid: &str, quality: u32, sec: Option<wifi::Sec>, eap: Option<&'static st
     wifi::Net { ssid: ssid.into(), raw: ssid.as_bytes().to_vec(), quality, connected, profile: saved.then(|| ssid.to_string()), sec, eap, iface: guid() }
 }
 
-fn app_entry(name: &str, version: &str) -> ext::App {
-    ext::App { name: name.into(), version: version.into(), uninstall: format!("demo-uninstall {name}") }
+fn app_entry(name: &str, version: &str, publisher: &str) -> ext::App {
+    ext::App { name: name.into(), version: version.into(), publisher: publisher.into(), uninstall: format!("demo-uninstall {name}") }
 }
 
 impl Demo {
@@ -175,18 +175,18 @@ impl Demo {
             proxy: String::new(),
             pac: String::new(),
             programs: vec![
-                app_entry("7-Zip", "24.08"),
-                app_entry("Claude", "1.0.1890"),
-                app_entry("Discord", "1.0.9172"),
-                app_entry("Figma", "124.5.4"),
-                app_entry("Git", "2.47.0"),
-                app_entry("Microsoft Edge", "131.0.2903"),
-                app_entry("Microsoft Outlook", "1.2024.1120"),
-                app_entry("NVIDIA Broadcast", "1.4.0"),
-                app_entry("Spotify", "1.2.52"),
-                app_entry("Steam", "2.10.91"),
-                app_entry("Telegram Desktop", "5.8.3"),
-                app_entry("Visual Studio Code", "1.95.3"),
+                app_entry("7-Zip", "24.08", "Igor Pavlov"),
+                app_entry("Claude", "1.0.1890", "Anthropic"),
+                app_entry("Discord", "1.0.9172", "Discord Inc."),
+                app_entry("Figma", "124.5.4", "Figma, Inc."),
+                app_entry("Git", "2.47.0", "The Git Development Community"),
+                app_entry("Microsoft Edge", "131.0.2903", "Microsoft Corporation"),
+                app_entry("Microsoft Outlook", "1.2024.1120", "Microsoft Corporation"),
+                app_entry("NVIDIA Broadcast", "1.4.0", "NVIDIA Corporation"),
+                app_entry("Spotify", "1.2.52", "Spotify AB"),
+                app_entry("Steam", "2.10.91", "Valve Corporation"),
+                app_entry("Telegram Desktop", "5.8.3", "Telegram FZ-LLC"),
+                app_entry("Visual Studio Code", "1.95.3", "Microsoft Corporation"),
             ],
             wu: wu::State { busy: None, found: Some(Vec::new()), note: "Last checked today, 17:02".into() },
             wu_extra: WuExtra::default(),
@@ -270,7 +270,7 @@ impl Demo {
                 s.mons.truncate(1);
                 s.names.truncate(1);
             }
-            "apps-many" => s.programs = (0..400).map(|i| app_entry(&format!("Program {i:03}"), &format!("{}.{}.{}", i % 9 + 1, i % 7, i % 13))).collect(),
+            "apps-many" => s.programs = (0..400).map(|i| app_entry(&format!("Program {i:03}"), &format!("{}.{}.{}", i % 9 + 1, i % 7, i % 13), "")).collect(),
             "sound-muted" => s.mute = [true, true],
             "power-plans-many" => s.plans = vec!["Power saver".into(), "Balanced".into(), "High performance".into(), "Ultimate Performance".into()],
             "proxy-on" => {
@@ -712,12 +712,13 @@ impl Os for Demo {
 pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
     let d = Rc::new(Demo::for_state(name));
     set_os(d.clone());
+    crate::set_app_query(""); // the Apps page's own search box starts empty in every state
     let page = match name {
         "sound" | "sound-muted" => 1,
         "power" | "battery-charging" | "battery-on-battery" | "battery-low" | "battery-none" | "power-plans-many" => 2,
         "network" | "net-wifi" | "net-ethernet" | "net-no-wifi-adapter" | "net-offline" | "net-airplane" | "wifi-password" | "wifi-connected-open" | "adapter-open" | "network-hidden" | "proxy-on" => 3,
         "bluetooth" | "bt-paired" | "bt-searching" | "bt-needs-pin" | "bt-off" | "bt-pairing" => 4,
-        "apps" | "apps-many" => 5,
+        "apps" | "apps-many" | "apps-search" | "apps-none" => 5,
         "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => 6,
         "personal" | "appearance-dark" | "appearance-light" | "personal-light" => 7,
         "about" => 8,
@@ -734,6 +735,8 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "bt-needs-pin" => s.pin_err = Some("gb".into()),
         "bt-pairing" => s.pairing = Some("px".into()),
         "dropdown" => s.demo_clicks.push(crate::app::ID_FIRST_SELECT), // the Resolution line
+        "apps-search" => s.demo_app_search("micro"),
+        "apps-none" => s.demo_app_search("photoshop"),
         "search" => s.demo_search("net"),
         "search-page" => s.demo_search("blue"),
         "search-none" => s.demo_search("zzzq"),
