@@ -34,6 +34,8 @@ mod lang;
 mod qs;
 mod settings;
 mod menus;
+mod filemenu;
+mod filemenu_demo;
 mod recent;
 mod ui;
 mod vdesk;
@@ -658,6 +660,30 @@ unsafe fn item_icon(path: &str, px: i32) -> HICON {
     let mask = CreateBitmap(px, px, 1, 1, null()); // ignored: the 32-bit colour bitmap carries the alpha
     let mut ii = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
     let ic = CreateIconIndirect(&mut ii);
+    DeleteObject(mask);
+    DeleteObject(color);
+    ic
+}
+
+/// The picture of an image file as the shell has it cached (the thumbnail Explorer shows), at about `px` pixels, as an icon to draw
+/// covering a box. Null when the shell has none made: the caller falls back to the file's icon, never waiting for one to be made.
+unsafe fn item_thumb(path: &str, px: i32) -> HICON {
+    use windows::Win32::{
+        Foundation::SIZE,
+        UI::Shell::{IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_INCACHEONLY, SIIGBF_THUMBNAILONLY},
+    };
+    let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(path).as_ptr()), None) else { return null_mut() };
+    let Ok(f) = item.cast::<IShellItemImageFactory>() else { return null_mut() };
+    let Ok(bmp) = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_THUMBNAILONLY | SIIGBF_INCACHEONLY | SIIGBF_BIGGERSIZEOK) else { return null_mut() };
+    let color = bmp.0 as HBITMAP;
+    let mut bm: BITMAP = zeroed();
+    if GetObjectW(color, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+        DeleteObject(color);
+        return null_mut();
+    }
+    let mask = CreateBitmap(bm.bmWidth, bm.bmHeight, 1, 1, null());
+    let ii = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+    let ic = CreateIconIndirect(&ii);
     DeleteObject(mask);
     DeleteObject(color);
     ic
@@ -2411,6 +2437,35 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         ReplyMessage(1);
         ui::panel::open(content, a);
         return 1;
+    }
+    if msg == WM_COPYDATA
+        && let Some((tag, from, data)) = winrust_common::filemenu::copydata(wp, lp)
+        && menus::is_rust_explorer(from)
+    {
+        // rust-explorer asks for the menu of a file (the request), or brings the items of a submenu the menu asked for. The data
+        // is only valid until this returns: it is decoded first, and the sender is answered before the menu is built.
+        use winrust_common::filemenu::{Request, SubReply, TAG_REQUEST, TAG_SUB};
+        match tag {
+            TAG_REQUEST => {
+                let Some(r) = Request::decode(data) else { return 0 };
+                if ui::panel::hwnd().is_null() {
+                    return 0;
+                }
+                ReplyMessage(1);
+                match menus::file_menu(&r, from) {
+                    Some((content, a)) => ui::panel::open(content, a),
+                    None => _ = winrust_common::filemenu::send_act(from as isize, r.session, winrust_common::filemenu::Act::Done),
+                }
+                return 1;
+            }
+            TAG_SUB => {
+                if let Some(r) = SubReply::decode(data) {
+                    menus::file_sub(&r);
+                }
+                return 1;
+            }
+            _ => {}
+        }
     }
     if msg != 0 && msg == TB_MSG.get() {
         // also our own announce(): act only when explorer's taskbar is a new window (explorer restarted / came back)

@@ -12,6 +12,7 @@ use std::{
 pub mod deskmenu;
 pub mod desktop;
 pub mod fg;
+pub mod filemenu;
 pub mod journal;
 pub mod launch;
 pub mod mem;

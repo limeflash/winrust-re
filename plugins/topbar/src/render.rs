@@ -430,6 +430,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     // the desktop's menu (`desk`): where the pointer is (DIPs) and what the desktop says its state is
     let (mut desk_at, mut desk_sort, mut desk_size, mut desk_auto, mut desk_shown) = ((400.0f32, 300.0f32), "name", "medium", true, true);
     let (mut desk_rec, mut desk_disk) = (false, true);
+    // the menu for files (`filemenu`): which state of the mockup's board, and where the pointer is when it is not that state's own
+    let (mut fm_state, mut fm_at) = ("text", None::<(f32, f32)>);
     let (mut apps_on, mut other_bars, mut one_display) = (String::new(), String::new(), false); // the bar page's monitor rows
     let (mut click, mut after, mut busy, mut per_monitor) = (None::<i32>, 0u64, false, false);
     // the notification centre (`calendar`) and the pop-ups (`popups`): what is in the store
@@ -458,8 +460,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("accent", v)) => accent = Box::leak(v.to_string().into_boxed_str()),
             Some(("dir", v)) => dir_arg = Box::leak(v.to_string().into_boxed_str()),
             Some(("mode", v)) => mode_arg = Box::leak(v.to_string().into_boxed_str()),
-            Some(("x", v)) => desk_at.0 = v.parse().unwrap_or(400.0),
-            Some(("y", v)) => desk_at.1 = v.parse().unwrap_or(300.0),
+            Some(("x", v)) => {
+                desk_at.0 = v.parse().unwrap_or(400.0);
+                fm_at = Some((desk_at.0, fm_at.map_or(desk_at.1, |a| a.1)));
+            }
+            Some(("y", v)) => {
+                desk_at.1 = v.parse().unwrap_or(300.0);
+                fm_at = Some((fm_at.map_or(desk_at.0, |a| a.0), desk_at.1));
+            }
+            Some(("state", v)) => fm_state = Box::leak(v.to_string().into_boxed_str()),
             Some(("sort", v)) => desk_sort = Box::leak(v.to_string().into_boxed_str()),
             Some(("icons", v)) => desk_size = Box::leak(v.to_string().into_boxed_str()),
             Some(("auto", v)) => desk_auto = v == "1",
@@ -768,6 +777,17 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             let px = |v: f32| (v * scale).round() as i32;
             let (at, corner) = place((px(desk_at.0), px(desk_at.1)), (px(bw), px(bh)), (0, 0, sw, if side == Side::Bottom { p.rest.1 } else { sh }), px(12.0), scale);
             Box::new(DeskPanel::new(st, at, corner, |_| {}))
+        } else if what == "filemenu" {
+            use ui::file_menu::{Env, FileMenu, Hooks};
+            let Some(d) = crate::filemenu_demo::demo(fm_state) else { panic!("filemenu: no state called {fm_state}") };
+            let at = fm_at.unwrap_or(d.at);
+            let px = |v: f32| (v * scale).round() as i32;
+            let menu = crate::filemenu::build(&d.facts, &d.items, d.head);
+            let env = Env { scale, at: (px(at.0), px(at.1)), room: (0, 0, sw, if side == Side::Bottom { p.rest.1 } else { sh }), monitor_h: sh as f32 / scale };
+            let panel = FileMenu::new(menu, env, Hooks { pick: Box::new(|_| {}), fill: Box::new(|_| {}) }, Default::default());
+            // `hover=<row>` lights a row of the list; the state's own submenu opens beside its row
+            panel.show(d.more, hover.map(|h: i32| h as usize).or(d.foc), d.sub);
+            Box::new(panel)
         } else if what == "menu" {
             demo_menu(kind, side, (sh as f32 / scale) - 130.0, side == Side::Right)
         } else if let Some(which) = what.strip_prefix("power-") {
@@ -873,6 +893,10 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         }
         if whole {
             (0, 0, sw, sh)
+        } else if what == "filemenu" {
+            // the box and what stands beside it (the submenu, the shadows)
+            let (b, m, side_room) = (popup.rect(), (60.0 * scale) as i32, (350.0 * scale) as i32);
+            ((b.0 - side_room).max(0), (b.1 - m).max(0), (b.0 + b.2 + side_room).min(sw), (b.1 + b.3 + m).min(sh))
         } else if what == "desk" {
             // the box alone with room for its shadow: the desktop's menu stands where the pointer was, not at the bar
             let (b, m) = (popup.rect(), (30.0 * scale) as i32);
