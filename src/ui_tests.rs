@@ -278,8 +278,7 @@ fn the_arrow_keys_walk_down_and_up_the_list_and_do_nothing_while_it_installs() {
     let mut cx = Cx::default();
     assert!(a.key(0x28, Default::default(), &mut cx), "Down is used");
     assert!(cx.reqs.iter().any(|r| matches!(r, Req::Focus(id) if *id == row("shell"))), "the focus goes to the row below");
-    let mut cx = Cx::default();
-    cx.focus = Some(row("shell"));
+    let mut cx = Cx { focus: Some(row("shell")), ..Cx::default() };
     a.key(0x26, Default::default(), &mut cx);
     assert!(cx.reqs.iter().any(|r| matches!(r, Req::Focus(id) if *id == row("topbar"))), "and Up goes back");
     a.phase = Phase::Busy;
