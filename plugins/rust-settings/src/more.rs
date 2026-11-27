@@ -212,6 +212,26 @@ pub struct Security {
     pub scanned: bool,
 }
 
+/// The facts of the About page that are not in the registry's Windows values.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AboutInfo {
+    pub cpu: String,
+    pub ram: String,
+    pub gpus: Vec<String>,
+    pub sys_type: String,
+    /// "26100.2314": the build and its revision.
+    pub build: String,
+    pub winrust: String,
+    /// The name a rename set, while the running one is still the old (it applies after a restart).
+    pub pc_pending: Option<String>,
+}
+
+/// A computer name Windows takes: 1 to 15 letters, digits or hyphens (NetBIOS), not starting or ending with a hyphen, not only digits.
+#[must_use]
+pub fn valid_pc_name(n: &str) -> bool {
+    (1..=15).contains(&n.len()) && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !n.starts_with('-') && !n.ends_with('-') && !n.chars().all(|c| c.is_ascii_digit())
+}
+
 /// A keyboard layout of the sign-in list: the language, the layout, the two letters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {

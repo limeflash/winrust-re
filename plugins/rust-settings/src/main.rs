@@ -157,6 +157,8 @@ pub enum Cmd {
     QuickScan,
     OpenSecurity,
     SyncTime,
+    /// The About page's Computer name: a click unfolds the name field.
+    Rename,
 }
 
 pub const CONFIRM_SECS: u32 = 15;
@@ -1200,18 +1202,39 @@ fn about_rows() -> Vec<Group> {
     let o = os();
     let reg = |n: &str| o.windows_value(n);
     let build: u32 = reg("CurrentBuild").parse().unwrap_or(0);
+    let a = o.about_info();
     let info = |l: &str, v: String| Line::new(Row::Info(l.into(), v));
-    vec![
-        Group::new(t!("Устройство", "Device", ja: "デバイス", pt: "Dispositivo", zh: "设备")).act(t!("Копировать", "Copy"), false, GAct::Copy).rows(vec![
-            info(t!("Имя компьютера", "Computer name", ja: "コンピューター名", pt: "Nome do computador", zh: "计算机名"), o.computer_name()),
-            info(t!("Оперативная память", "Memory", ja: "メモリ", pt: "Memória", zh: "内存"), o.ram_text()),
-        ]),
-        Group::new("Windows").rows(vec![
-            info(t!("Выпуск", "Edition", ja: "エディション", pt: "Edição", zh: "发行版"), os_name(&reg("ProductName"), build)),
-            info(t!("Версия", "Version", ja: "バージョン", pt: "Versão", zh: "版本"), reg("DisplayVersion")),
-            info(t!("Сборка", "Build", ja: "ビルド", pt: "Compilação", zh: "内部版本"), reg("CurrentBuild")),
-        ]),
-    ]
+    let name = o.computer_name();
+    let mut pc = Line::new(Row::Item(t!("Имя компьютера", "Computer name", ja: "コンピューター名", pt: "Nome do computador", zh: "计算机名").into(), t!("Переименовать", "Rename").into(), Cmd::Rename)).key("pcname");
+    pc.sub = match &a.pc_pending {
+        Some(n) => tf!("{} · после перезагрузки: {}", "{} \u{b7} after a restart: {}", name, n),
+        None => name,
+    };
+    if a.pc_pending.is_some() {
+        pc.tone = Tone::Warn;
+    }
+    let mut device = vec![pc];
+    let mut push = |label: &str, v: String| {
+        if !v.is_empty() {
+            device.push(info(label, v));
+        }
+    };
+    push(t!("Процессор", "Processor", ja: "プロセッサ", pt: "Processador", zh: "处理器"), a.cpu.clone());
+    push(t!("Установленная память", "Installed memory", ja: "実装メモリ", pt: "Memória instalada", zh: "已安装的内存"), if a.ram.is_empty() { o.ram_text() } else { a.ram.clone() });
+    for (i, g) in a.gpus.iter().enumerate() {
+        let label = t!("Графика", "Graphics", ja: "グラフィックス", pt: "Gráficos", zh: "显卡");
+        push(&if i == 0 { label.to_string() } else { format!("{label} {}", i + 1) }, g.clone());
+    }
+    push(t!("Тип системы", "System type", ja: "システムの種類", pt: "Tipo de sistema", zh: "系统类型"), a.sys_type.clone());
+    let mut windows = vec![
+        info(t!("Выпуск", "Edition", ja: "エディション", pt: "Edição", zh: "发行版"), os_name(&reg("ProductName"), build)),
+        info(t!("Версия", "Version", ja: "バージョン", pt: "Versão", zh: "版本"), reg("DisplayVersion")),
+        info(t!("Сборка", "Build", ja: "ビルド", pt: "Compilação", zh: "内部版本"), if a.build.is_empty() { reg("CurrentBuild") } else { a.build.clone() }),
+    ];
+    if !a.winrust.is_empty() {
+        windows.push(info("WinRust", a.winrust.clone()));
+    }
+    vec![Group::new(t!("Устройство", "Device", ja: "デバイス", pt: "Dispositivo", zh: "设备")).act(t!("Копировать", "Copy"), false, GAct::Copy).rows(device), Group::new("Windows").rows(windows)]
 }
 
 /// The titles of the pages, in the order of the sidebar.

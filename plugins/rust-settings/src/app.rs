@@ -104,6 +104,8 @@ pub enum Fid {
     Pac,
     /// The Keyboard page's "Try it" field (nothing is done with what is typed).
     Try,
+    /// The About page's new computer name.
+    Pc,
 }
 
 pub struct Fields {
@@ -114,11 +116,12 @@ pub struct Fields {
     pub proxy: TextField,
     pub pac: TextField,
     pub tryit: TextField,
+    pub pc: TextField,
 }
 
 impl Fields {
     fn new() -> Self {
-        Self { user: TextField::new(), pass: TextField::password(), ssid: TextField::new(), pass2: TextField::password(), proxy: TextField::new(), pac: TextField::new(), tryit: TextField::new() }
+        Self { user: TextField::new(), pass: TextField::password(), ssid: TextField::new(), pass2: TextField::password(), proxy: TextField::new(), pac: TextField::new(), tryit: TextField::new(), pc: TextField::new() }
     }
 
     pub fn get(&mut self, f: Fid) -> &mut TextField {
@@ -130,6 +133,7 @@ impl Fields {
             Fid::Proxy => &mut self.proxy,
             Fid::Pac => &mut self.pac,
             Fid::Try => &mut self.tryit,
+            Fid::Pc => &mut self.pc,
         }
     }
 
@@ -573,6 +577,15 @@ impl Settings {
                         self.syncing = true;
                         o.time_sync(note());
                     }
+                    Cmd::Rename => {
+                        // unfolds the name field with the current name in it (or folds it)
+                        let open = self.open.as_deref() == Some(key);
+                        self.open = if open { None } else { Some(key.to_string()) };
+                        self.field_err.clear();
+                        if !open {
+                            self.fields.pc.set_text(&o.computer_name());
+                        }
+                    }
                     Cmd::NotifyApp(_) | Cmd::Uninstall(_) | Cmd::BtUnpair(_) => {}
                 }
             }
@@ -673,6 +686,25 @@ impl Settings {
         cx.invalidate();
     }
 
+    /// Save in the Computer name line: a valid name (letters, digits, hyphens, up to 15) goes to Windows, which keeps it for the next start.
+    fn save_rename(&mut self, cx: &mut Cx) {
+        let name = self.fields.pc.text.trim().to_uppercase();
+        if !more::valid_pc_name(&name) {
+            self.fail("pcname", t!("Только буквы, цифры и дефисы, до 15 знаков, не только цифры, без дефиса в начале и в конце", "Use 1\u{2013}15 letters, digits or hyphens, not only digits, not starting or ending with a hyphen"));
+            return;
+        }
+        match os().rename_pc(&name) {
+            Ok(()) => {
+                self.open = None;
+                self.field_err.clear();
+                self.read_page();
+                self.say(tf!("Переименовано в {} · применится после перезагрузки", "Renamed to {} \u{b7} restart to apply", name), cx);
+            }
+            Err(e) => self.fail("pcname", e),
+        }
+        cx.invalidate();
+    }
+
     /// Enter in a field of the proxy line: the address is saved when it is one.
     fn commit_proxy(&mut self, pac: bool, cx: &mut Cx) {
         let v = if pac { self.fields.pac.text.trim().to_string() } else { self.fields.proxy.text.trim().to_string() };
@@ -704,7 +736,19 @@ impl Settings {
             GAct::WifiRefresh => os().wifi_scan(),
             GAct::Cmd(c) => self.run_cmd("", "", c, cx),
             GAct::Copy => {
-                let text = self.pg.groups.iter().flat_map(|g| &g.rows).filter_map(|l| if let Row::Info(a, b) = &l.row { Some(format!("{a}: {b}")) } else { None }).collect::<Vec<_>>().join(" \u{b7} ");
+                // every fact of the page: the name (its line holds the button), the values, the build
+                let text = self
+                    .pg
+                    .groups
+                    .iter()
+                    .flat_map(|g| &g.rows)
+                    .filter_map(|l| match &l.row {
+                        Row::Info(a, b) => Some(format!("{a}: {b}")),
+                        Row::Item(a, _, Cmd::Rename) => Some(format!("{a}: {}", l.sub)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ");
                 cx.set_clipboard_text(text);
                 self.say(t!("Сведения об устройстве скопированы", "Device details copied"), cx);
             }
@@ -740,6 +784,8 @@ impl Settings {
             Flip(&'static str, &'static str, u32),
             Cmd(Cmd),
             Flag(more::Flag),
+            RenameSave,
+            RenameCancel,
             WifiConnect(wifi::Net),
             Adapter(String),
             Forget(String),
@@ -765,6 +811,8 @@ impl Settings {
             (Row::Item(_, _, cmd @ (Cmd::PrivGo(_) | Cmd::OpenSecurity)), P_BODY) => Do::Cmd(cmd.clone()),
             (Row::Item(_, _, cmd @ Cmd::BtUnpair(_)), P_ACT) => Do::Cmd(cmd.clone()),
             (Row::Item(_, _, Cmd::SyncTime), P_CTL) if self.syncing => Do::Nothing,
+            (Row::Item(_, _, Cmd::Rename), P_ACT) => Do::RenameSave,
+            (Row::Item(_, _, Cmd::Rename), p) if p == P_ACT + 1 => Do::RenameCancel,
             (Row::Item(..), P_CTL) if line.restart => Do::Later,
             (Row::Item(..), P_CTL2) if line.restart => Do::Restart,
             (Row::Item(_, _, cmd), P_CTL) if !line.busy && !(matches!(cmd, Cmd::BtPair(_)) && self.pairing.is_some()) => Do::Cmd(cmd.clone()),
@@ -794,6 +842,11 @@ impl Settings {
             Do::Choose(op, i) => self.pick_value(op, i, cx),
             Do::Op(op) => self.do_op(op, cx),
             Do::Flip(k, n, v) => self.flip(k, n, v, cx),
+            Do::RenameSave => self.save_rename(cx),
+            Do::RenameCancel => {
+                self.open = None;
+                self.field_err.clear();
+            }
             Do::Flag(f) => {
                 let on = os().flag(&f).unwrap_or(false);
                 if !os().flag_set(&f, !on) {
@@ -1205,7 +1258,7 @@ impl App for Settings {
             match ev {
                 Ev::Enter => self.submit_field(fid, cx),
                 Ev::Esc => {
-                    if matches!(fid, Fid::Pass | Fid::User | Fid::Ssid | Fid::Pass2) {
+                    if matches!(fid, Fid::Pass | Fid::User | Fid::Ssid | Fid::Pass2 | Fid::Pc) {
                         self.open = None;
                         self.field_err.clear();
                     }
@@ -1484,6 +1537,7 @@ impl Settings {
             Row::Cycle(_, _, Op::Proxy) => vec![Fid::Proxy],
             Row::Cycle(_, _, Op::Pac) => vec![Fid::Pac],
             Row::Cycle(_, _, Op::Try) => vec![Fid::Try],
+            Row::Item(_, _, Cmd::Rename) if self.open.as_deref() == Some(l.key.as_str()) => vec![Fid::Pc],
             _ => Vec::new(),
         }
     }
@@ -1494,6 +1548,7 @@ impl Settings {
             Fid::Pac => self.commit_proxy(true, cx),
             Fid::Ssid | Fid::Pass2 => self.connect_hidden(cx),
             Fid::Try => {}
+            Fid::Pc => self.save_rename(cx),
             Fid::User | Fid::Pass => {
                 let n = self.open.as_deref().and_then(|k| self.pg.groups.iter().flat_map(|g| &g.rows).find(|l| l.key == k)).and_then(|l| if let Row::Wifi(n, _) = &l.row { Some(clone_net(n)) } else { None });
                 if let Some(n) = n {

@@ -1285,3 +1285,60 @@ fn restart_now_needs_a_second_click_and_only_then_restarts() {
     click(&mut s, ID_NAV);
     assert!(s.armed.is_none());
 }
+
+#[test]
+fn the_about_page_has_every_fact_of_the_design_and_copy_takes_them_all() {
+    let (mut s, _d) = win("about");
+    let labels: Vec<String> = s.pg.groups.iter().flat_map(|g| g.rows.iter().map(|l| l.row.label().to_string())).collect();
+    assert_eq!(labels.len(), 9, "name, processor, memory, graphics, system type, edition, version, build, WinRust: {labels:?}");
+    let cx = {
+        let mut cx = Cx::default();
+        s.click(ID_GACT, Button::Left, 0.0, 0.0, &mut cx);
+        cx
+    };
+    let copied = cx.reqs.iter().find_map(|r| if let Req::Clipboard(t) = r { Some(t.clone()) } else { None });
+    let copied = copied.expect("the details are on the clipboard");
+    for want in ["DANIIAR-PC", "Ryzen", "32 GB", "Radeon 780M", "x64", "26100.2314", "0.5.9"] {
+        assert!(copied.contains(want), "{want} in {copied}");
+    }
+}
+
+#[test]
+fn a_computer_name_is_checked_before_windows_sees_it_and_a_refusal_is_told() {
+    assert!(more::valid_pc_name("DANIIAR-PC") && more::valid_pc_name("A"));
+    for bad in ["", "-A", "A-", "MY PC", "ABCDEFGHIJKLMNOP", "123", "A_B", "\u{43f}\u{43a}"] {
+        assert!(!more::valid_pc_name(bad), "{bad:?}");
+    }
+    let (mut s, d) = win("about");
+    let at = |l: &Line| l.key == "pcname";
+    press(&mut s, at, P_CTL);
+    assert_eq!(s.open.as_deref(), Some("pcname"));
+    assert_eq!(s.fields.pc.text, "DANIIAR-PC", "the field starts with the current name");
+    let flat = s.flat_of(at).unwrap();
+    // a bad name: an error under the field, nothing reaches Windows
+    s.fields.pc.set_text("my pc");
+    press(&mut s, at, P_ACT);
+    assert!(!s.field_err.is_empty() && d.log().is_empty(), "{:?}", d.log());
+    // an administrator is needed: the error is said and nothing changes
+    d.deny_admin();
+    s.fields.pc.set_text("new-pc");
+    press(&mut s, at, P_ACT);
+    assert_eq!(d.log(), vec!["rename_pc NEW-PC"]);
+    assert!(s.field_err.contains("dmin") || s.field_err.contains("дминистр"), "{}", s.field_err);
+    assert_eq!(s.open.as_deref(), Some("pcname"), "it stays open to try again");
+    // Enter in the field saves too; the name waits for a restart
+    let (mut s, d) = win("about");
+    press(&mut s, at, P_CTL);
+    s.fields.pc.set_text("new-pc");
+    let mut cx = Cx { focus: Some(row_id(flat, P_FIELD)), ..Cx::default() };
+    s.key(0x0D, Mods::default(), &mut cx);
+    assert_eq!(d.log(), vec!["rename_pc NEW-PC"]);
+    assert_eq!(toasts(&cx).len(), 1);
+    assert!(s.open.is_none());
+    assert!(s.line(flat).unwrap().sub.contains("NEW-PC"), "{}", s.line(flat).unwrap().sub);
+    // Cancel folds it without a call
+    let (mut s, d) = win("about");
+    press(&mut s, at, P_CTL);
+    press(&mut s, at, P_ACT + 1);
+    assert!(s.open.is_none() && d.log().is_empty());
+}

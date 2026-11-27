@@ -203,6 +203,12 @@ impl Settings {
                 v.push(ExpItem::Field(Fid::Pac, t!("Адрес скрипта (PAC), необязательно", "Setup script (PAC) address, optional")));
                 err(&mut v);
             }
+            Row::Item(_, _, Cmd::Rename) if open => {
+                v.push(ExpItem::Field(Fid::Pc, t!("Имя компьютера", "Computer name")));
+                err(&mut v);
+                v.push(ExpItem::Note(t!("До 15 букв, цифр или дефисов. Применится после перезагрузки.", "Up to 15 letters, digits or hyphens. Takes effect after a restart.").into()));
+                v.push(ExpItem::Acts(vec![Act { label: t!("Сохранить", "Save").into(), kind: BKind::Primary, busy: false }, Act { label: t!("Отмена", "Cancel").into(), kind: BKind::Quiet, busy: false }]));
+            }
             Row::Cycle(_, _, Op::Try) => v.push(ExpItem::Field(Fid::Try, t!("Удерживайте клавишу здесь, чтобы почувствовать скорость повтора", "Hold down a key here to feel the repeat speed"))),
             Row::Item(_, _, Cmd::NotifyApp(_)) if open => {
                 let cur = l.cur.unwrap_or(0);
@@ -668,6 +674,7 @@ impl Settings {
             Row::Item(_, _, cmd) => match cmd {
                 Cmd::BtUnpair(_) | Cmd::NotifyApp(_) => v.push(RItem::Chev(self.open.as_deref() == Some(l.key.as_str()))),
                 Cmd::PrivGo(_) | Cmd::OpenSecurity => v.push(RItem::Chev(false)),
+                Cmd::Rename => v.push(RItem::Btns(vec![RBtn { label: l.val.clone(), kind: BKind::Quiet, busy: false, dis: false }])),
                 Cmd::QuickScan => v.push(RItem::Btns(vec![RBtn { label: l.val.clone(), kind: BKind::Quiet, busy: l.busy, dis: l.busy }])),
                 Cmd::SyncTime => v.push(RItem::Btns(vec![RBtn { label: if self.syncing { t!("Синхронизация", "Syncing").into() } else { l.val.clone() }, kind: BKind::Quiet, busy: self.syncing, dis: self.syncing }])),
                 Cmd::NotifyMode(..) => {}
@@ -932,7 +939,7 @@ impl Settings {
                         let fr = Rect::new(x, y, w, 32.0);
                         let st = winrust_ui::widgets::field::FieldStyle { radius: 8.0, ..winrust_ui::widgets::field::FieldStyle::INPUT };
                         field_with(c, f, id, fr, self.fields.get(*fid), ph, &st);
-                        if !self.field_err.is_empty() && self.field_err_key == key && matches!(fid, Fid::Pass | Fid::Pass2) {
+                        if !self.field_err.is_empty() && self.field_err_key == key && matches!(fid, Fid::Pass | Fid::Pass2 | Fid::Pc) {
                             c.ring(fr, 8.0, 1.0, RED);
                         }
                     }

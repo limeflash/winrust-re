@@ -147,6 +147,10 @@ pub trait Os {
     fn windows_value(&self, name: &str) -> String;
     fn ram_text(&self) -> String;
     fn computer_name(&self) -> String;
+    /// Processor, memory, graphics, system type, build revision, WinRust version, a rename waiting for a restart.
+    fn about_info(&self) -> crate::more::AboutInfo;
+    /// Sets the computer's name (applies after a restart); the error is a line for the user.
+    fn rename_pc(&self, name: &str) -> Result<(), String>;
     fn user_name(&self) -> String;
     fn set_lang(&self, l: winrust_common::Lang) -> bool;
     /// Picks the demo's picture `k` of the Personalization page (nothing in the real one: it has only the picker).
@@ -495,6 +499,12 @@ impl Os for Live {
     }
     fn computer_name(&self) -> String {
         std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+    fn about_info(&self) -> crate::more::AboutInfo {
+        sysx::about_info()
+    }
+    fn rename_pc(&self, name: &str) -> Result<(), String> {
+        sysx::rename_pc(name)
     }
     fn user_name(&self) -> String {
         std::env::var("USERNAME").unwrap_or_default()

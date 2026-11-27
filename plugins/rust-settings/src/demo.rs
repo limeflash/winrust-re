@@ -90,6 +90,8 @@ struct State {
     deny_admin: bool,
     /// The WinRust accent (an index of `style::Accent::ALL`).
     accent: usize,
+    /// A rename waits for a restart.
+    pc_pending: Option<String>,
 }
 
 /// The demo source. `log` says what a test or a render asked it to change.
@@ -269,6 +271,7 @@ impl Demo {
             security: Security { av: Some(true), fw: Some(true), sig: "1.421.316.0".into(), sig_when: Some(when(0, 7, 14)), smart: "Warn".into(), scanning: false, scanned: false },
             deny_admin: false,
             accent: 0,
+            pc_pending: None,
         };
         Self { s: RefCell::new(s), log: RefCell::new(Vec::new()) }
     }
@@ -771,6 +774,27 @@ impl Os for Demo {
     }
     fn computer_name(&self) -> String {
         "DANIIAR-PC".into()
+    }
+    fn about_info(&self) -> crate::more::AboutInfo {
+        crate::more::AboutInfo {
+            cpu: "AMD Ryzen 7 7840HS \u{b7} 3.8 GHz".into(),
+            ram: "32 GB (31.3 GB usable)".into(),
+            gpus: vec!["AMD Radeon 780M".into()],
+            sys_type: "64-bit, x64 processor".into(),
+            build: "26100.2314".into(),
+            winrust: "0.5.9".into(),
+            pc_pending: self.with(|s| s.pc_pending.clone()),
+        }
+    }
+    fn rename_pc(&self, name: &str) -> Result<(), String> {
+        self.note(format!("rename_pc {name}"));
+        self.with(|s| {
+            if s.deny_admin {
+                return Err("Administrator rights are needed: run Settings as administrator".to_string());
+            }
+            s.pc_pending = Some(name.to_string());
+            Ok(())
+        })
     }
     fn user_name(&self) -> String {
         "Daniiar".into()

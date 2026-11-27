@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    more::{CApp, Cap, Consent, RawDesk, group_desktop, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
+    more::{AboutInfo, CApp, Cap, Consent, RawDesk, group_desktop, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
     os::{Note, Ping},
     sys::{self, wide},
 };
@@ -578,9 +578,109 @@ mod live {
             }
         }
         println!("{:?}", security());
+        println!("about {:?}", about_info());
         println!("layouts {:?}", layouts());
         println!("clock {:?} | region {:?} | numbers {:?} | server {:?}", clock_text(), region_text(), numbers_text(), time_server());
         let n = notify_apps();
         println!("{} notifying apps: {:?}", n.len(), n.iter().take(6).collect::<Vec<_>>());
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// About
+
+/// The graphics adapters DXGI lists, the software one (Microsoft Basic Render Driver) left out; read once.
+fn gpus() -> Vec<String> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
+    static G: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let mut v = Vec::new();
+        // SAFETY: a factory made and used here; the description is copied out.
+        unsafe {
+            if let Ok(f) = CreateDXGIFactory1::<IDXGIFactory1>() {
+                let mut i = 0;
+                while let Ok(a) = f.EnumAdapters1(i) {
+                    i += 1;
+                    if let Ok(d) = a.GetDesc1() {
+                        let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                        let name = String::from_utf16_lossy(&d.Description[..n]).trim().to_string();
+                        if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.VendorId != 0x1414 && !name.is_empty() && !v.contains(&name) {
+                            v.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        v
+    })
+    .clone()
+}
+
+fn computer_name_ex(kind: i32) -> String {
+    use windows_sys::Win32::System::SystemInformation::GetComputerNameExW;
+    let mut buf = [0u16; 260];
+    let mut n = buf.len() as u32;
+    // SAFETY: the name goes into a local buffer.
+    if unsafe { GetComputerNameExW(kind, buf.as_mut_ptr(), &mut n) } == 0 { String::new() } else { String::from_utf16_lossy(&buf[..n as usize]) }
+}
+
+/// WinRust's version as the bar's panel says it: the one the updater wrote when it last swapped files, else this release's.
+fn winrust_version() -> String {
+    let file = std::env::var_os("ProgramFiles").map(|p| std::path::PathBuf::from(p).join(r"WinRust\version.txt"));
+    let release = include_str!("../../../Cargo.toml").lines().find_map(|l| l.strip_prefix("version = \"")?.split('"').next()).unwrap_or("0").to_string();
+    file.and_then(|f| std::fs::read_to_string(f).ok()).map(|s| s.trim().trim_start_matches('v').to_string()).filter(|s| !s.is_empty()).unwrap_or(release)
+}
+
+pub fn about_info() -> AboutInfo {
+    use windows_sys::Win32::System::SystemInformation::{GetNativeSystemInfo, GetPhysicallyInstalledSystemMemory, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO};
+    let hklm = HKEY_LOCAL_MACHINE;
+    let cpu_key = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+    let name = sys::string(hklm, cpu_key, "ProcessorNameString").map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let cpu = match sys::dword(hklm, cpu_key, "~MHz") {
+        Some(mhz) if !name.is_empty() => format!("{name} \u{b7} {:.1} GHz", f64::from(mhz) / 1000.0),
+        _ => name,
+    };
+    // SAFETY: plain queries into locals.
+    let (ram, arch) = unsafe {
+        let mut kb = 0u64;
+        let installed = GetPhysicallyInstalledSystemMemory(&mut kb) != 0 && kb > 0;
+        let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
+        mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        let usable = (GlobalMemoryStatusEx(&mut mem) != 0).then(|| crate::gb(mem.ullTotalPhys));
+        let ram = match (installed, usable) {
+            (true, Some(u)) => format!("{} GB ({u} usable)", (kb as f64 / (1024.0 * 1024.0)).round()),
+            (true, None) => format!("{} GB", (kb as f64 / (1024.0 * 1024.0)).round()),
+            (false, u) => u.unwrap_or_default(),
+        };
+        let mut si: SYSTEM_INFO = std::mem::zeroed();
+        GetNativeSystemInfo(&mut si);
+        (ram, si.Anonymous.Anonymous.wProcessorArchitecture)
+    };
+    let sys_type = match arch {
+        9 => t!("64-разрядная, процессор x64", "64-bit, x64 processor"),
+        12 => t!("64-разрядная, процессор ARM64", "64-bit, ARM64 processor"),
+        0 => t!("32-разрядная, процессор x86", "32-bit, x86 processor"),
+        _ => "",
+    };
+    let build = sys::string(hklm, crate::NT, "CurrentBuild").map(|b| match sys::dword(hklm, crate::NT, "UBR") {
+        Some(u) => format!("{b}.{u}"),
+        None => b,
+    });
+    let active = computer_name_ex(0);
+    let physical = computer_name_ex(4);
+    AboutInfo { cpu, ram, gpus: gpus(), sys_type: sys_type.into(), build: build.unwrap_or_default(), winrust: winrust_version(), pc_pending: (!physical.is_empty() && !physical.eq_ignore_ascii_case(&active)).then_some(physical) }
+}
+
+/// Sets the computer's name (it applies after a restart); needs administrator rights, which the error says.
+pub fn rename_pc(name: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::SystemInformation::SetComputerNameExW;
+    if !crate::more::valid_pc_name(name) {
+        return Err(t!("Недопустимое имя", "That is not a valid name").into());
+    }
+    // SAFETY: a documented call with a name that was just checked.
+    if unsafe { SetComputerNameExW(5, wide(name).as_ptr()) } != 0 {
+        return Ok(());
+    }
+    // SAFETY: a plain read of the thread's last error.
+    Err(if unsafe { GetLastError() } == ERROR_ACCESS_DENIED { t!("Нужны права администратора: запустите «Параметры» от имени администратора", "Administrator rights are needed: run Settings as administrator").into() } else { t!("Windows не приняла имя", "Windows did not take the name").into() })
 }
