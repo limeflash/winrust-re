@@ -58,6 +58,20 @@ pub trait App {
     fn close(&mut self, _cx: &mut Cx) -> bool {
         true
     }
+    /// The window exists (its first frame is not drawn yet): `hwnd` is what a worker thread posts to ([`crate::window::post`]).
+    fn start(&mut self, _hwnd: isize) {}
+    /// The wheel with the pointer's place in the window (DIPs): zooming about the pointer needs it. By default it is `wheel`.
+    #[allow(clippy::too_many_arguments)]
+    fn wheel_at(&mut self, id: Option<Id>, _x: f32, _y: f32, dx: f32, dy: f32, mods: Mods, cx: &mut Cx) {
+        self.wheel(id, dx, dy, mods, cx);
+    }
+    /// What is dragged over the window left it without dropping.
+    fn drag_leave(&mut self, _cx: &mut Cx) {}
+    /// `--render`: the items the renderer clicks, one after the other, before it takes the picture (what a state of the design needs
+    /// open: a menu, a toast).
+    fn demo_clicks(&self) -> Vec<Id> {
+        Vec::new()
+    }
 }
 
 /// What Windows is told about a point of the window (`WM_NCHITTEST`).
@@ -109,6 +123,8 @@ pub struct Core {
     last_click: Option<(Id, u64, f32, f32)>,
     cursor: Option<Cursor>,
     pub hwnd: isize,
+    /// Shift and Ctrl at the last click or key: what the host tells it (`Cx::mods`).
+    pub held: Mods,
     born: u64,
     redraw: bool,
     host: Vec<HostReq>,
@@ -131,6 +147,7 @@ impl Core {
             last_click: None,
             cursor: None,
             hwnd: 0,
+            held: Mods::default(),
             born: now,
             redraw: false,
             host: Vec::new(),
@@ -138,7 +155,7 @@ impl Core {
     }
 
     fn cx(&self) -> Cx {
-        Cx { scale: self.scale, hwnd: self.hwnd, ..Cx::default() }
+        Cx { scale: self.scale, hwnd: self.hwnd, focus: self.mo.hits.focus, mods: self.held, pointer: self.pointer, ..Cx::default() }
     }
 
     pub fn hits(&self) -> &Hits {
@@ -149,8 +166,10 @@ impl Core {
     pub fn draw(&mut self, c: &mut Canvas<'_>, now: u64) {
         self.mo.mode = Some(style::anim());
         self.mo.hits.clear();
+        self.mo.due = None;
         self.mo.maximized = self.maximized;
         self.mo.active = self.active;
+        self.mo.menu_open = self.ov.menu_open();
         let (w, h) = self.size;
         let mut f = Frame { now, age: now.saturating_sub(self.born), leaving: 0, hover: self.hover, press: self.press.map(|p| p.0), size: self.size, opacity: 1.0, mo: &mut self.mo };
         self.app.draw(c, &mut f);
@@ -160,6 +179,7 @@ impl Core {
             c.round_corners(win, RADIUS);
             c.ring(win, RADIUS, 1.0, Rgba::white(0.08));
         }
+        self.mo.sweep(now);
         self.redraw = false;
     }
 
@@ -172,7 +192,16 @@ impl Core {
     /// The time a frame is due though nothing moves (a hint's delay, a toast's end).
     #[must_use]
     pub fn deadline(&self, now: u64) -> Option<u64> {
-        self.ov.deadline(now)
+        match (self.ov.deadline(now), self.mo.due.filter(|&d| d > now)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Where the focused text field's caret is, in DIPs of the client (the IME puts its windows there).
+    #[must_use]
+    pub fn ime_caret(&self) -> Option<Rect> {
+        self.mo.hits.caret
     }
 
     /// An `invalidate` has not been answered with a frame yet.
@@ -303,12 +332,14 @@ impl Core {
 
     /// Wheel notches over the window (positive `dy` scrolls up, as the wheel reports it).
     pub fn wheel(&mut self, dx: f32, dy: f32, mods: Mods, now: u64) {
+        self.held = mods;
         if self.ov.modal() {
             return;
         }
         let id = self.hover.filter(|&i| !Overlays::owns(i));
+        let (x, y) = self.pointer.unwrap_or_default();
         let mut cx = self.cx();
-        self.app.wheel(id, dx, dy, mods, &mut cx);
+        self.app.wheel_at(id, x, y, dx, dy, mods, &mut cx);
         self.finish(cx, now);
         self.redraw = true;
     }
@@ -324,6 +355,7 @@ impl Core {
 
     /// A key went down; true when it was used.
     pub fn key(&mut self, vk: u32, mods: Mods, alt: bool, now: u64) -> bool {
+        self.held = mods;
         const TAB: u32 = 0x09;
         const ENTER: u32 = 0x0D;
         const ESC: u32 = 0x1B;
@@ -403,6 +435,21 @@ impl Core {
     pub fn files(&mut self, paths: Vec<String>, x: f32, y: f32, now: u64) {
         let mut cx = self.cx();
         App::drop(self.app.as_mut(), paths, x, y, &mut cx);
+        self.finish(cx, now);
+        self.redraw = true;
+    }
+
+    /// Files are dragged over the window at `(x, y)` DIPs (the first time or again): whether the app takes them.
+    pub fn drag_over(&mut self, paths: &[String], x: f32, y: f32) -> bool {
+        let ok = self.app.drag_over(paths, x, y);
+        self.redraw = true;
+        ok
+    }
+
+    /// What was dragged over the window left it.
+    pub fn drag_leave(&mut self, now: u64) {
+        let mut cx = self.cx();
+        self.app.drag_leave(&mut cx);
         self.finish(cx, now);
         self.redraw = true;
     }

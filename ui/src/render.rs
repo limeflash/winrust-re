@@ -60,6 +60,7 @@ fn frame(g: &mut Gfx, core: &mut Core, surf: &mut Surface, now: u64) -> bool {
 /// device pixels. The window's pointer events are the ones a mouse would make, one at a time, each with a frame between.
 pub fn render_pixels(app: Box<dyn App>, o: &Opts) -> Option<(Vec<u32>, i32, i32)> {
     let s = o.scale;
+    let clicks: Vec<Id> = app.demo_clicks().into_iter().chain(o.click.iter().copied()).collect();
     let px = |d: f32| (d * s).round() as i32;
     let (win_w, win_h) = if o.max { (o.w, o.h) } else { (o.w - 2.0 * STAGE_INSET, o.h - 2.0 * STAGE_INSET) };
     let mut g = Gfx::new(s).ok()?;
@@ -69,7 +70,7 @@ pub fn render_pixels(app: Box<dyn App>, o: &Opts) -> Option<(Vec<u32>, i32, i32)
     let mut t = 1_000_000u64;
     frame(&mut g, &mut core, &mut surf, t);
     let centre = |core: &Core, id: Id| core.hits().get(id).map(|h| (h.r.cx(), h.r.cy()));
-    for &id in &o.click {
+    for &id in &clicks {
         t += 400;
         let Some((x, y)) = centre(&core, id) else { continue };
         core.pointer_move(x, y, t);
@@ -88,14 +89,21 @@ pub fn render_pixels(app: Box<dyn App>, o: &Opts) -> Option<(Vec<u32>, i32, i32)
         core.pointer_move(x, y, t);
         frame(&mut g, &mut core, &mut surf, t);
     }
-    if let Some(id) = o.focus {
-        core.mo.hits.focus = Some(id);
-        core.mo.hits.focus_visible = true;
-    }
     // everything that moves has arrived: hover, menus, the toast (it stands still from 8 % to 90 % of its time), the hint's delay
     t += 1000;
     if !frame(&mut g, &mut core, &mut surf, t) {
         return None;
+    }
+    if let Some(id) = o.focus {
+        core.mo.hits.focus = Some(id);
+        core.mo.hits.focus_visible = true;
+        // a text field's caret restarts at the frame that first sees the focus, and its ring takes 200 ms to come: one frame for
+        // the first, then the picture
+        frame(&mut g, &mut core, &mut surf, t);
+        t += 300;
+        if !frame(&mut g, &mut core, &mut surf, t) {
+            return None;
+        }
     }
 
     let (sw, sh) = (px(o.w), px(o.h));

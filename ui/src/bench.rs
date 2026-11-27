@@ -1,4 +1,4 @@
-//! `--bench [open|hover|menu|scroll|resize|rest|all]`: what an application window costs on this machine, in the form of the bar's
+//! `--bench [open|hover|menu|scroll|glide|type|resize|rest|all]`: what an application window costs on this machine, in the form of the bar's
 //! benchmark. The window is a real composed one, put at (-5000, -5000) where nobody sees it, 2560 × 1440 device pixels big (the
 //! user's screen); the pointer, the wheel and the size are driven by calls, one frame each, and the GPU is waited for after every
 //! frame (`gfx::gpu_wait`) so that what is left to it is counted too.
@@ -8,7 +8,7 @@
 //! `gpu` (what the GPU still needed after the CPU was done). `open` is the time from the start of `main` to the first frame
 //! committed, the median of five runs of the exe; memory is the working set and the private bytes in MB.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -28,7 +28,7 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
         open();
     }
     let all = what == "all";
-    if !matches!(what, "hover" | "menu" | "scroll" | "resize" | "rest") && !all {
+    if !matches!(what, "hover" | "menu" | "scroll" | "pan" | "glide" | "type" | "resize" | "rest") && !all {
         return i32::from(!matches!(what, "open"));
     }
     println!("scenario      | encode  mean    p95     max |    end  mean    p95     max | present mean    p95     max |  total  mean    p95     max |    gpu  mean    p95     max |   ws priv");
@@ -70,8 +70,9 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
         let _ = total;
     };
     if all || what == "hover" {
-        // the pointer sweeps the row of buttons, then the list: every step moves a hover
-        let pts: Vec<(f32, f32)> = (0..300).map(|i| if i < 150 { (30.0 + i as f32 * 4.0, 89.0) } else { (300.0 + (i - 150) as f32 * 3.0, 240.0 + (i - 150) as f32 * 8.0) }).collect();
+        // the pointer sweeps the row of buttons, then runs down the list (10,000 rows): every step moves a hover
+        let low = (ch - 60.0).max(300.0);
+        let pts: Vec<(f32, f32)> = (0..300).map(|i| if i < 150 { (30.0 + i as f32 * 4.0, 89.0) } else { (300.0 + (i - 150) as f32 * 3.0, 300.0 + (i - 150) as f32 * (low - 300.0) / 150.0) }).collect();
         step(hwnd, "hover", pts.len(), Box::new(move |i| drive(hwnd, |h| h.core.pointer_move(pts[i].0, pts[i].1, crate::anim::now_ms()))));
     }
     if all || what == "menu" {
@@ -85,11 +86,53 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
                 }
             }));
             if close {
-                drive(hwnd, |h| h.core.key(0x1B, Default::default(), false, crate::anim::now_ms()));
+                // Esc closes what the click opened (an app without that overlay would take it as "close the window")
+                drive(hwnd, |h| h.core.ov.modal() && h.core.key(0x1B, Default::default(), false, crate::anim::now_ms()));
             } else {
                 click(hwnd, crate::widgets::overlay::TOAST_UNDO); // the toast would still be leaving when `rest` counts
             }
         }
+    }
+    if all || what == "glide" {
+        // a mouse wheel: a notch every 20 frames, each glides for 150 ms
+        step(hwnd, "glide", 300, Box::new(move |i| drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            h.core.pointer_move(400.0, 400.0, now);
+            if i % 20 == 0 {
+                h.core.wheel(0.0, if (i / 100) % 2 == 0 { -1.0 } else { 1.0 }, Default::default(), now);
+            }
+            true
+        })));
+    }
+    if all || what == "type" {
+        // the search field has the focus: a letter a frame, Backspace now and then; the pointer rests over the list
+        click(hwnd, 200);
+        let keys: Vec<char> = "reportbackupdesignholiday".chars().collect();
+        step(hwnd, "type", 300, Box::new(move |i| drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            if i % 24 < 20 {
+                h.core.text(&keys[i % keys.len()].to_string(), now);
+            } else {
+                h.core.key(0x08, Default::default(), false, now);
+            }
+            true
+        })));
+        // the text goes (Ctrl+A, Backspace); what a focused caret costs at rest is the one timer, a frame at each blink
+        drive(hwnd, |h| h.core.key(0x41, crate::frame::Mods { ctrl: true, shift: false }, false, crate::anim::now_ms()));
+        drive(hwnd, |h| h.core.key(0x08, Default::default(), false, crate::anim::now_ms()));
+        pump(800);
+        let n = with(hwnd, |h| h.frames).unwrap_or(0);
+        pump(3000);
+        let m = with(hwnd, |h| h.frames).unwrap_or(0);
+        println!("caret at rest | {} frames in 3 s with the field focused (the blink: two a second, nothing in between)", m - n);
+        // the focus goes (a click on the margin, where nothing is), as `rest` below counts with none
+        drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            h.core.pointer_move(4.0, 400.0, now);
+            h.core.down(crate::frame::Button::Left, 4.0, 400.0, now);
+            h.core.up(crate::frame::Button::Left, 4.0, 400.0, now);
+            true
+        });
     }
     if all || what == "scroll" {
         step(hwnd, "scroll", 300, Box::new(move |i| drive(hwnd, |h| {
@@ -97,6 +140,31 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
             h.core.wheel(0.0, if (i / 60) % 2 == 0 { -0.35 } else { 0.35 }, Default::default(), crate::anim::now_ms());
             true
         })));
+    }
+    if all || what == "pan" {
+        // the wheel zooms in over the middle of the window (an app that zooms), then the button is held and the pointer goes round
+        let (px, py) = (cw * 0.4, ch * 0.55);
+        drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            h.core.pointer_move(px, py, now);
+            for _ in 0..8 {
+                h.core.wheel(0.0, 1.0, Default::default(), now);
+            }
+            true
+        });
+        pump(700);
+        drive(hwnd, |h| {
+            h.core.down(crate::frame::Button::Left, px, py, crate::anim::now_ms());
+            true
+        });
+        step(hwnd, "pan", 300, Box::new(move |i| drive(hwnd, |h| {
+            let a = i as f32 * 0.09;
+            h.core.pointer_move(px + 220.0 * a.cos(), py + 120.0 * a.sin(), crate::anim::now_ms())
+        })));
+        drive(hwnd, |h| {
+            h.core.up(crate::frame::Button::Left, px, py, crate::anim::now_ms());
+            true
+        });
     }
     if all || what == "resize" {
         // the size changes at every step, as when a corner is dragged: WM_SIZE draws the frame, then the shadow follows
@@ -207,6 +275,7 @@ fn open() {
 /// fonts, the first text layouts, the shadow's blur), showing it.
 fn open_once(demo: fn(&str) -> Box<dyn App>) -> i32 {
     let started = crate::render::started();
+    gfx::fast_start();
     let composed = gfx::compose_windows();
     let devices = started.elapsed().as_secs_f64() * 1000.0;
     let o = Options { class: "winrust_ui_open", size: (1160.0, 740.0), icon: 0, place_file: None };
@@ -215,7 +284,8 @@ fn open_once(demo: fn(&str) -> Box<dyn App>) -> i32 {
     // SAFETY: shown off the screen without activation: the frame is really composed.
     unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    pump(Duration::from_millis(100).as_millis() as u64);
+    // the hardware device takes over a little later (`gfx::WM_HARDWARE`): the memory is read after that
+    pump(700);
     let (ws, pv) = memory_now();
     println!("open1 {ms:.1} {ws:.1} {pv:.1} devices {devices:.0} window+first frame {:.0} show {:.0}", made - devices, ms - made);
     0

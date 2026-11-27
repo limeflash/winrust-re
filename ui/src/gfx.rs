@@ -54,7 +54,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE, DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC,
-    DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWriteCreateFactory, IDWriteFactory, IDWriteFactory6,
+    DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWRITE_HIT_TEST_METRICS, DWriteCreateFactory, IDWriteFactory, IDWriteFactory6,
     IDWriteFontCollection2, IDWriteFontSetBuilder1, IDWriteTextFormat, IDWriteTextLayout1,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
@@ -680,10 +680,11 @@ fn primary_adapter() -> Option<IDXGIAdapter> {
     }
 }
 
-fn create_dev(factory: &ID2D1Factory1, compose: bool) -> Result<Dev> {
+/// A hardware Direct3D device: the primary monitor's adapter, else the default one. `None` when the machine has none.
+fn hardware_d3d() -> Option<ID3D11Device> {
     let mut d3d = None;
     let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    // SAFETY: device creation with out-params that are locals; the first adapter that works wins, WARP is the last resort.
+    // SAFETY: device creation with out-params that are locals.
     unsafe {
         if let Some(a) = primary_adapter() {
             let _ = D3D11CreateDevice(&a, D3D_DRIVER_TYPE_UNKNOWN, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None);
@@ -691,8 +692,27 @@ fn create_dev(factory: &ID2D1Factory1, compose: bool) -> Result<Dev> {
         if d3d.is_none() {
             let _ = D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None);
         }
+    }
+    d3d
+}
+
+fn create_dev(factory: &ID2D1Factory1, compose: bool) -> Result<Dev> {
+    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    // SAFETY: device creation with out-params that are locals; the first adapter that works wins, WARP is the last resort.
+    unsafe {
+        let mut d3d = if FAST.get() {
+            // fast start: the hardware device the background thread made if it is there; else WARP for now (it takes ~13 ms where
+            // a hardware device takes ~170) and the hardware device replaces it when it is ready (`use_hardware`)
+            let hw = HARDWARE.lock().ok().and_then(|mut h| h.dev.take());
+            ON_WARP.set(hw.is_none());
+            hw
+        } else {
+            hardware_d3d()
+        };
         if d3d.is_none() {
-            D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None)?;
+            let mut w = None;
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut w), None, None)?;
+            d3d = w;
         }
         let d3d = d3d.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         let d2d = factory.CreateDevice(&d3d.cast::<IDXGIDevice>()?)?;
@@ -700,6 +720,87 @@ fn create_dev(factory: &ID2D1Factory1, compose: bool) -> Result<Dev> {
         let epoch = GEN.get();
         Ok(Dev { epoch, d3d, d2d, dcomp, targets: RefCell::new(HashMap::new()) })
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fast start: the first frame on WARP while the hardware device is made on another thread
+
+/// The message the host window is sent when the hardware device is ready (`WM_APP + 120`; apps' own are `WM_APP + 1 ..= + 99`).
+pub const WM_HARDWARE: u32 = 0x8000 + 120;
+
+#[derive(Default)]
+struct Hardware {
+    started: bool,
+    done: bool,
+    dev: Option<ID3D11Device>,
+    /// The window told when it is done.
+    notify: isize,
+}
+
+static HARDWARE: std::sync::Mutex<Hardware> = std::sync::Mutex::new(Hardware { started: false, done: false, dev: None, notify: 0 });
+
+thread_local! {
+    static FAST: Cell<bool> = const { Cell::new(false) };
+    /// The device in use is WARP only because the hardware one was not ready yet.
+    static ON_WARP: Cell<bool> = const { Cell::new(false) };
+}
+
+fn post_hardware(to: isize) {
+    // SAFETY: posting to a window; one that is gone just drops the message.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(HWND(to as *mut _)), WM_HARDWARE, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    }
+}
+
+/// The first frame of an app's window comes from a WARP device (13 ms) while a thread makes the hardware one (~170 ms, nearly all of
+/// it the GPU driver loading); [`use_hardware`] swaps it in. Call it once, first thing in `main`, before any frame of this thread;
+/// the thread's own device is made by `compose_windows` as always. Without it nothing changes (the bar does not use it).
+pub fn fast_start() {
+    FAST.set(true);
+    let Ok(mut h) = HARDWARE.lock() else { return };
+    if h.started {
+        return;
+    }
+    h.started = true;
+    drop(h);
+    let _ = std::thread::Builder::new().name("d3d-start".into()).spawn(|| {
+        let d3d = hardware_d3d();
+        let Ok(mut h) = HARDWARE.lock() else { return };
+        h.dev = d3d;
+        h.done = true;
+        let (to, any) = (h.notify, h.dev.is_some());
+        drop(h);
+        if to != 0 && any {
+            post_hardware(to);
+        }
+    });
+}
+
+/// `hwnd` is told with [`WM_HARDWARE`] once the hardware device is ready (at once if it is).
+pub fn notify_hardware(hwnd: isize) {
+    let Ok(mut h) = HARDWARE.lock() else { return };
+    h.notify = hwnd;
+    let ready = h.done && h.dev.is_some();
+    drop(h);
+    if ready && ON_WARP.get() {
+        post_hardware(hwnd);
+    }
+}
+
+/// The thread draws on WARP for now and the hardware device is on its way (or ready, not swapped in yet): what is put on the GPU
+/// now would be lost at the swap, so an app that holds big pictures waits.
+pub fn hardware_pending() -> bool {
+    ON_WARP.get() && HARDWARE.lock().is_ok_and(|h| !h.done || h.dev.is_some())
+}
+
+/// The hardware device is ready and the thread runs on WARP: the next frame is made anew on the hardware device (every picture of
+/// the thread is stale, as after a lost device). True when it was swapped.
+pub fn use_hardware() -> bool {
+    if !ON_WARP.get() || !HARDWARE.lock().is_ok_and(|h| h.dev.is_some()) {
+        return false;
+    }
+    lose_device();
+    true
 }
 
 /// The GPU went away (or a test says so): every device-bound thing is rebuilt on its next frame.
@@ -977,6 +1078,9 @@ fn drop_icon(d: &mut Device, key: usize) {
     d.shadows.retain(|k, _| !(k[5] == 1 && (k[0] as usize | (k[1] as usize) << 32) == key)); // the icon's silhouettes (`icon_shadow`)
 }
 
+/// How many text layouts a generation of the cache holds (see `Gfx::layouts`).
+const LAYOUTS_PER_GENERATION: usize = 2048;
+
 type LayoutKey = (String, u32, u16, u32, bool, u32, u32, u8, bool);
 
 /// The renderer: factories, the device, and caches of geometry and text formats.
@@ -988,7 +1092,10 @@ pub struct Gfx {
     dev: Option<Device>,
     paths: HashMap<&'static str, Option<ID2D1PathGeometry>>,
     formats: HashMap<(u32, u16), IDWriteTextFormat>,
+    /// Two generations of text layouts: when `layouts` fills up it becomes `layouts_old` and the older one is let go, so what a
+    /// list scrolled past a moment ago is still there, and what is in use is never dropped all at once.
     layouts: HashMap<LayoutKey, IDWriteTextLayout1>,
+    layouts_old: HashMap<LayoutKey, IDWriteTextLayout1>,
     /// The built-in Inter, when the system can use it.
     inter: Option<(IDWriteFactory6, IDWriteFontCollection2)>,
     face: &'static str,
@@ -1008,6 +1115,7 @@ impl Gfx {
             paths: HashMap::new(),
             formats: HashMap::new(),
             layouts: HashMap::new(),
+            layouts_old: HashMap::new(),
             inter: s.inter.clone(),
             face: s.face,
             scale,
@@ -1215,10 +1323,46 @@ impl Gfx {
         unsafe { lay.GetMetrics(&mut m).map_or(0.0, |()| m.widthIncludingTrailingWhitespace) }
     }
 
+    /// Keeps a layout in the younger generation; a full one becomes the older.
+    fn remember(&mut self, key: LayoutKey, lay: IDWriteTextLayout1) {
+        if self.layouts.len() >= LAYOUTS_PER_GENERATION {
+            self.layouts_old = std::mem::take(&mut self.layouts);
+        }
+        self.layouts.insert(key, lay);
+    }
+
+    /// The caret position (a UTF-16 index into `s`) nearest to `x` DIPs from the start of the line, as a click puts it: the
+    /// edges of clusters, never inside one.
+    pub fn text_hit(&mut self, s: &str, f: Font, x: f32) -> usize {
+        let Some(lay) = self.layout(s, f, 4096.0, f.size * 2.0, Align::Start, false) else { return 0 };
+        let (mut trailing, mut inside) = (windows::core::BOOL(0), windows::core::BOOL(0));
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        // SAFETY: `lay` is live; the out-params are locals.
+        unsafe {
+            if lay.HitTestPoint(x, f.size, &mut trailing, &mut inside, &mut m).is_err() {
+                return 0;
+            }
+        }
+        (m.textPosition + if trailing.as_bool() { m.length } else { 0 }) as usize
+    }
+
+    /// Where the caret at the UTF-16 index `idx` of `s` stands: DIPs from the start of the line.
+    pub fn text_x(&mut self, s: &str, f: Font, idx: usize) -> f32 {
+        let Some(lay) = self.layout(s, f, 4096.0, f.size * 2.0, Align::Start, false) else { return 0.0 };
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        // SAFETY: `lay` is live; the out-params are locals.
+        unsafe { lay.HitTestTextPosition(idx as u32, false, &mut x, &mut y, &mut m).map_or(0.0, |()| x) }
+    }
+
     /// Lays out one line of text; `None` if the font could not be made.
     fn layout(&mut self, s: &str, f: Font, w: f32, h: f32, align: Align, trim: bool) -> Option<IDWriteTextLayout1> {
         let key = (s.to_owned(), f.size.to_bits(), f.weight, f.tracking.to_bits(), f.tabular, w.to_bits(), h.to_bits(), align as u8, trim);
         if let Some(layout) = self.layouts.get(&key) { return Some(layout.clone()); }
+        if let Some(layout) = self.layouts_old.remove(&key) {
+            self.remember(key, layout.clone());
+            return Some(layout);
+        }
         let fmt = self.format(f)?;
         let wide: Vec<u16> = s.encode_utf16().collect();
         // SAFETY: plain DirectWrite layout creation.
@@ -1246,8 +1390,7 @@ impl Gfx {
                 let _ = ty.AddFontFeature(DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 });
                 let _ = lay.SetTypography(&ty, all);
             }
-            if self.layouts.len() >= 2048 { self.layouts.clear(); }
-            self.layouts.insert(key, lay.clone());
+            self.remember(key, lay.clone());
             Some(lay)
         }
     }
@@ -1737,6 +1880,16 @@ impl Canvas<'_> {
         self.draw_text(s, r, f, c, align, false);
     }
 
+    /// See [`Gfx::text_hit`].
+    pub fn text_hit(&mut self, s: &str, f: Font, x: f32) -> usize {
+        self.g.text_hit(s, f, x)
+    }
+
+    /// See [`Gfx::text_x`].
+    pub fn text_x(&mut self, s: &str, f: Font, idx: usize) -> f32 {
+        self.g.text_x(s, f, idx)
+    }
+
     /// Like [`Canvas::text`], and what does not fit in `r` ends in an ellipsis.
     pub fn text_fit(&mut self, s: &str, r: Rect, f: Font, c: Rgba, align: Align) {
         self.draw_text(s, r, f, c, align, true);
@@ -2108,6 +2261,13 @@ impl Canvas<'_> {
     /// Bakes what is on the screen behind a panel: `px` (`w`×`h` device pixels, opaque) blurred with a Gaussian of
     /// `sigma` DIPs (CSS `blur(r)`: `r` is the standard deviation) and saturated by `saturate` (CSS `saturate(k)`).
     pub fn glass(&mut self, px: &[u32], w: i32, h: i32, sigma: f32, saturate: f32) -> Option<Picture> {
+        // Light glass over a dark desktop: a light tint at the design's alpha over the blurred picture comes out muddy grey.
+        // Like the light acrylic of Windows, the blurred picture is first lifted towards white, so the glass reads frosted
+        // and still lets the colours through.
+        self.bake_blur(px, w, h, sigma, saturate, if winrust_common::style::light() { 0.5 } else { 0.0 })
+    }
+
+    fn bake_blur(&mut self, px: &[u32], w: i32, h: i32, sigma: f32, saturate: f32, lift: f32) -> Option<Picture> {
         if w <= 0 || h <= 0 || px.len() < (w * h) as usize {
             return None;
         }
@@ -2141,10 +2301,6 @@ impl Canvas<'_> {
                 cm.SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32, D2D1_PROPERTY_TYPE_MATRIX_5X4, &bytes).ok()?;
                 out = cm.GetOutput().ok()?;
             }
-            // Light glass over a dark desktop: a light tint at the design's alpha over the blurred picture comes out muddy grey.
-            // Like the light acrylic of Windows, the blurred picture is first lifted towards white, so the glass reads frosted
-            // and still lets the colours through.
-            let lift = if winrust_common::style::light() { 0.5 } else { 0.0 };
             if lift > 0.0 {
                 let k = 1.0 - lift;
                 let m = [k, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 0.0, 1.0, lift, lift, lift, 0.0];
@@ -2383,6 +2539,108 @@ impl Canvas<'_> {
     }
 }
 
+/// How [`Canvas::picture_in`] samples the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sample {
+    /// Pixels stay square (a picture shown at 300 %).
+    Nearest,
+    Linear,
+    /// Direct2D's high-quality cubic: filters properly when the picture is drawn smaller than it is (a 24 MP photo at fit size).
+    Smooth,
+}
+
+impl Canvas<'_> {
+    /// Draws the whole picture into `dst` (DIPs), turned by `turn` degrees about the middle of `dst`, at `opacity`.
+    pub fn picture_in(&mut self, p: &Picture, dst: Rect, turn: f32, opacity: f32, how: Sample) {
+        use windows::Win32::Graphics::Direct2D::{D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR};
+        if p.epoch != self.dev().epoch || dst.w <= 0.0 || dst.h <= 0.0 {
+            return;
+        }
+        let mode = match how {
+            Sample::Nearest => D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            Sample::Linear => D2D1_INTERPOLATION_MODE_LINEAR,
+            Sample::Smooth => D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+        };
+        let ctx = self.dev().cur.clone();
+        let cur = self.world();
+        // SAFETY: drawing inside BeginDraw/EndDraw; the transform is restored.
+        unsafe {
+            if turn != 0.0 {
+                ctx.SetTransform(&(Matrix3x2::translation(-dst.cx(), -dst.cy()) * Matrix3x2::rotation(turn) * Matrix3x2::translation(dst.cx(), dst.cy()) * cur));
+            }
+            ctx.DrawBitmap(&p.bmp, Some(&dst.d2d()), opacity, mode, None, None);
+            if turn != 0.0 {
+                ctx.SetTransform(&cur);
+            }
+        }
+    }
+
+    /// Runs `f` turned by `deg` degrees about `(cx, cy)` (CSS `transform: rotate()`); it composes with an enclosing transform.
+    pub fn rotated(&mut self, cx: f32, cy: f32, deg: f32, f: impl FnOnce(&mut Self)) {
+        let (rt, cur) = (self.rt(), self.world());
+        // SAFETY: the enclosing transform is restored after `f`.
+        unsafe { rt.SetTransform(&(Matrix3x2::translation(-cx, -cy) * Matrix3x2::rotation(deg) * Matrix3x2::translation(cx, cy) * cur)) };
+        f(self);
+        // SAFETY: restoring the enclosing transform.
+        unsafe { rt.SetTransform(&cur) };
+    }
+
+    /// CSS `border: <w>px dashed` round a rounded rectangle: `r` is the border box, the dashes lie inside it, `dash` and `gap` are in
+    /// units of `w`.
+    pub fn dashed_round(&mut self, r: Rect, radius: f32, w: f32, dash: f32, gap: f32, c: Rgba) {
+        if c.a <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let b = self.brush(c);
+        let props = D2D1_STROKE_STYLE_PROPERTIES1 {
+            startCap: D2D1_CAP_STYLE_FLAT,
+            endCap: D2D1_CAP_STYLE_FLAT,
+            dashCap: D2D1_CAP_STYLE_FLAT,
+            lineJoin: D2D1_LINE_JOIN_ROUND,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_CUSTOM,
+            dashOffset: 0.0,
+            transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        let ctx = self.dev().cur.clone();
+        let factory = self.g.factory.clone();
+        let rad = (radius - w / 2.0).max(0.0);
+        let rr = D2D1_ROUNDED_RECT { rect: r.inset(w / 2.0).d2d(), radiusX: rad, radiusY: rad };
+        // SAFETY: a stroke style and a geometry made and used inside BeginDraw/EndDraw.
+        unsafe {
+            let Ok(style) = factory.CreateStrokeStyle(&props, Some(&[dash, gap])) else { return };
+            let Ok(geo) = factory.CreateRoundedRectangleGeometry(&rr) else { return };
+            ctx.DrawGeometry(&geo, &b, w, &style);
+        }
+    }
+
+    /// CSS `linear-gradient(<deg>deg, stops..)` in a rounded rectangle: 0 is towards the top, 90 towards the right, 180 down.
+    pub fn gradient_angle(&mut self, r: Rect, radius: f32, deg: f32, stops: &[(f32, Rgba)]) {
+        let stops: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|(p, c)| D2D1_GRADIENT_STOP { position: *p, color: c.d2d() }).collect();
+        let (rt, rr) = (self.rt(), D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius });
+        let a = deg.to_radians();
+        let (dx, dy) = (a.sin(), -a.cos());
+        let half = (r.w * dx.abs() + r.h * dy.abs()) / 2.0;
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe {
+            let Some(coll) = self.stops(&stops) else { return };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: Vector2 { X: r.cx() - dx * half, Y: r.cy() - dy * half },
+                endPoint: Vector2 { X: r.cx() + dx * half, Y: r.cy() + dy * half },
+            };
+            if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
+                rt.FillRoundedRectangle(&rr, &b);
+            }
+        }
+    }
+
+    /// Like [`Canvas::glass`], without the lift towards white in light mode: a small picture (`w`×`h` device pixels) blurred with a
+    /// Gaussian of `sigma` DIPs of the picture and saturated by `saturate`: the ambient light behind a photo.
+    pub fn blurred(&mut self, px: &[u32], w: i32, h: i32, sigma: f32, saturate: f32) -> Option<Picture> {
+        self.bake_blur(px, w, h, sigma, saturate, 0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2489,6 +2747,44 @@ mod tests {
         frame(&mut g, &mut s);
         assert!(current_dev().expect("a new device").epoch > epoch);
         assert_eq!(before, s.pixels(), "the frame after the loss is the same frame");
+    }
+
+    #[test]
+    fn layouts_in_use_survive_a_full_cache() {
+        let mut g = gfx();
+        let f = Font::new(13.0, 400);
+        let key = |i: usize| format!("row {i}");
+        let hot = g.layout("hot", f, 100.0, 20.0, Align::Start, false).expect("a layout");
+        for i in 0..2 * LAYOUTS_PER_GENERATION + 100 {
+            g.layout(&key(i), f, 100.0, 20.0, Align::Start, false).expect("a layout");
+            if i % 500 == 0 {
+                // a list that scrolls draws its visible rows again at every frame: they must not be rebuilt when the cache turns over
+                let again = g.layout("hot", f, 100.0, 20.0, Align::Start, false).expect("a layout");
+                assert!(again.as_raw() == hot.as_raw(), "the layout in use was dropped at row {i}");
+            }
+        }
+        assert!(g.layouts.len() <= LAYOUTS_PER_GENERATION && g.layouts_old.len() <= LAYOUTS_PER_GENERATION, "two generations at most");
+        // what has not been asked for since a whole generation went by is gone: the cache is bounded
+        assert!(g.layouts.len() + g.layouts_old.len() <= 2 * LAYOUTS_PER_GENERATION);
+    }
+
+    #[test]
+    fn a_click_lands_on_a_caret_position_and_the_caret_is_drawn_back_where_it_was() {
+        let mut g = gfx();
+        let f = Font::new(13.0, 400);
+        let s = "Hello 😀 мир";
+        // UTF-16: "Hello " is 6 units, the emoji 2, then " мир"
+        assert_eq!(g.text_hit(s, f, -5.0), 0, "left of the text");
+        assert_eq!(g.text_hit(s, f, 4000.0), s.encode_utf16().count(), "right of the text");
+        for idx in [0, 3, 6, 8, 9, 12] {
+            let x = g.text_x(s, f, idx);
+            assert_eq!(g.text_hit(s, f, x + 0.5), idx, "the caret at {idx} (x = {x}) is where a click on it lands");
+        }
+        assert!(g.text_x(s, f, 6) > g.text_x(s, f, 3) && g.text_x(s, f, 12) > g.text_x(s, f, 9));
+        // a click on the middle of the emoji goes to one of its two edges, never between the surrogates
+        let (a, b) = (g.text_x(s, f, 6), g.text_x(s, f, 8));
+        let mid = g.text_hit(s, f, (a + b) / 2.0 + 1.0);
+        assert!(mid == 6 || mid == 8, "inside the emoji: {mid}");
     }
 
     #[test]
