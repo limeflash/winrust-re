@@ -112,6 +112,8 @@ pub struct Data {
     ema: HashMap<u32, f32>,
     pub svcs: Vec<sys::Svc>,
     pub svc_pids: HashMap<u32, Vec<String>>,
+    /// Command lines that are told, not read (the made-up processes of the demo); empty for the real thing.
+    pub cmds: HashMap<u32, String>,
     pub startup: Vec<startup::Item>,
     pub hist: Vec<Vec<String>>,
     pub series: Series,
@@ -166,7 +168,7 @@ pub fn group_key(name: &str) -> String {
 impl Data {
     pub fn new(cfg: store::Settings) -> Data {
         let is_admin = sys::is_admin();
-        let mut d = Data::new_inner(cfg, is_admin);
+        let mut d = Data::new_inner(cfg, is_admin, true);
         d.gpus = gpu::adapters()
             .into_iter()
             .map(|a| GpuState { reg: hw::gpu_registry(&a.name), adapter: a, util: 0.0, ded_used: 0, shr_used: 0, temp: None, series: GpuSeries::default() })
@@ -174,14 +176,23 @@ impl Data {
         d
     }
 
-    fn new_inner(cfg: store::Settings, is_admin: bool) -> Data {
+    /// A data set that reads nothing of this computer and never will (no ticks, no per-process network): the made-up numbers of the
+    /// renders, the benchmark and the tests are put into its fields by hand (`demo.rs`).
+    pub fn blank(cfg: store::Settings) -> Data {
+        Data::new_inner(store::Settings { etw: false, ..cfg }, false, false)
+    }
+
+    /// `live` reads what this computer is (the network adapters, the counters, the processor, the memory modules); without it the
+    /// set is empty and costs nothing.
+    fn new_inner(cfg: store::Settings, is_admin: bool, live: bool) -> Data {
         Data {
             sys: System::new().expect("sysinfo"),
-            nets: Networks::new_with_refreshed_list().expect("сетевые интерфейсы"),
+            nets: if live { Networks::new_with_refreshed_list() } else { Networks::new() }.expect("сетевые интерфейсы"),
             procs: vec![],
             ema: HashMap::new(),
             svcs: vec![],
             svc_pids: HashMap::new(),
+            cmds: HashMap::new(),
             startup: vec![],
             hist: vec![],
             series: Series::default(),
@@ -193,9 +204,9 @@ impl Data {
             sig: suspect::SigCache::new(),
             susp_info: HashMap::new(),
             net: HashMap::new(),
-            perf: perf::Perf::new(),
+            perf: if live { perf::Perf::new() } else { None },
             sample: perf::Sample::default(),
-            sysinfo: perf::static_info(),
+            sysinfo: if live { perf::static_info() } else { perf::SysInfo::default() },
             meminfo: perf::MemInfo::default(),
             res: ResCache::new(),
             cpu_total: 0.0,
@@ -206,7 +217,7 @@ impl Data {
             efficiency: Default::default(),
             suspended: Default::default(),
             disk_total: 0,
-            hw_mem: hw::memory_hw(),
+            hw_mem: if live { hw::memory_hw() } else { hw::MemHw::default() },
             gpus: vec![],
             disks: vec![],
             nics: vec![],
@@ -623,6 +634,9 @@ fn disk_capacity() -> u64 {
 }
 
 pub fn process_cmd(d: &Data, pid: u32) -> String {
+    if let Some(c) = d.cmds.get(&pid) {
+        return c.clone();
+    }
     d.sys.process(Pid::from_u32(pid)).map(|p| p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")).unwrap_or_default()
 }
 

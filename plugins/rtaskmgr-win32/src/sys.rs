@@ -263,18 +263,6 @@ pub fn system_dark() -> bool {
     rc == 0 && data == 0
 }
 
-#[link(name = "dwmapi")]
-unsafe extern "system" {
-    fn DwmSetWindowAttribute(h: winapi::shared::windef::HWND, attr: u32, v: *const std::ffi::c_void, size: u32) -> i32;
-}
-
-
-/// Тёмная/светлая рамка и заголовок окна.
-pub fn set_dark_titlebar(h: winapi::shared::windef::HWND, dark: bool) {
-    let v = dark as i32;
-    unsafe { DwmSetWindowAttribute(h, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &v as *const i32 as *const _, 4) };
-}
-
 /// Заголовки видимых окон верхнего уровня по PID (без окон-владельцев и без пустых заголовков).
 pub fn window_titles() -> HashMap<u32, String> {
     use winapi::shared::{minwindef::{BOOL, LPARAM}, windef::HWND};

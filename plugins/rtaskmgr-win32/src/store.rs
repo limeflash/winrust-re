@@ -122,6 +122,11 @@ pub fn trim_history(max: usize) {
     }
 }
 
+/// Deletes the history file (the program's own): the usage history starts again from empty.
+pub fn clear_history() {
+    let _ = fs::remove_file(hist_path());
+}
+
 /// Последние `limit` записей, новые сверху.
 pub fn read_history(limit: usize) -> Vec<Vec<String>> {
     let t = fs::read_to_string(hist_path()).unwrap_or_default();

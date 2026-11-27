@@ -1012,7 +1012,8 @@ pub fn run(app: Box<dyn App>, o: Options) -> i32 {
     let Some(hwnd) = create(app, &o, composed, None) else { return 1 };
     // SAFETY: the loop of our own thread; the first frame is on the surface, so showing the window cannot flash.
     unsafe {
-        if IsZoomed(hwnd) == 0 {
+        let hidden = with(hwnd, |h| h.core.app.start_hidden()).unwrap_or(false);
+        if IsZoomed(hwnd) == 0 && !hidden {
             ShowWindow(hwnd, SW_SHOW);
         }
         let mut m: MSG = std::mem::zeroed();

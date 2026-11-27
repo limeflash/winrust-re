@@ -2803,3 +2803,85 @@ mod tests {
         assert_eq!((first, last), (Some(50), Some(149)), "the mask follows the world transform");
     }
 }
+
+// dynamic paths: the charts of the Task Manager and the sparklines (an icon's path is `&'static str`; these come from data)
+
+impl Canvas<'_> {
+    /// A line through `pts` (DIPs), `w` wide, round joins and caps, in one colour: a chart's curve.
+    pub fn polyline(&mut self, pts: &[(f32, f32)], w: f32, c: Rgba) {
+        if c.a <= 0.0 || pts.len() < 2 {
+            return;
+        }
+        let at = |p: &(f32, f32)| svg::Pt { x: p.0, y: p.1 };
+        let mut segs = vec![Seg::Move(at(&pts[0]))];
+        segs.extend(pts[1..].iter().map(|p| Seg::Line(at(p))));
+        let Ok(geo) = build_path(&self.g.factory, &segs) else { return };
+        let (rt, b, round) = (self.rt(), self.brush(c), self.g.round.clone());
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe { rt.DrawGeometry(&geo, &b, w, &round) };
+    }
+
+    /// The area between the line through `pts` and the horizontal `base_y`, filled with a vertical gradient from `top` (at the
+    /// highest point of the line) to `bottom` (at `base_y`); the same colour twice is a flat fill.
+    pub fn area(&mut self, pts: &[(f32, f32)], base_y: f32, top: Rgba, bottom: Rgba) {
+        if pts.len() < 2 || (top.a <= 0.0 && bottom.a <= 0.0) {
+            return;
+        }
+        let at = |x: f32, y: f32| svg::Pt { x, y };
+        let mut segs = vec![Seg::Move(at(pts[0].0, base_y))];
+        segs.extend(pts.iter().map(|p| Seg::Line(at(p.0, p.1))));
+        segs.push(Seg::Line(at(pts[pts.len() - 1].0, base_y)));
+        segs.push(Seg::Close);
+        let Ok(geo) = build_path(&self.g.factory, &segs) else { return };
+        let rt = self.rt();
+        // SAFETY: drawing inside BeginDraw/EndDraw.
+        unsafe {
+            if top == bottom {
+                let b = self.brush(top);
+                rt.FillGeometry(&geo, &b, None);
+                return;
+            }
+            let high = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).min(base_y);
+            let stops = [D2D1_GRADIENT_STOP { position: 0.0, color: top.d2d() }, D2D1_GRADIENT_STOP { position: 1.0, color: bottom.d2d() }];
+            let Some(coll) = self.stops(&stops) else { return };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: 0.0, Y: high }, endPoint: Vector2 { X: 0.0, Y: base_y.max(high + 1.0) } };
+            if let Ok(b) = rt.CreateLinearGradientBrush(&props, None, &coll) {
+                rt.FillGeometry(&geo, &b, None);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod polyline_tests {
+    use super::*;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+
+    #[test]
+    fn a_polyline_and_an_area_draw_where_their_points_are_and_nowhere_else() {
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).expect("direct2d");
+        let mut s = Surface::new();
+        g.paint(&mut s, 100, 60, |c| {
+            let pts = [(10.0, 40.0), (50.0, 20.0), (90.0, 40.0)];
+            c.area(&pts, 55.0, Rgba::hex(0x3366cc), Rgba::hex(0x3366cc));
+            c.polyline(&pts, 2.0, Rgba::hex(0xff0000));
+        })
+        .expect("a frame");
+        let px = |x: usize, y: usize| s.pixels()[y * 100 + x];
+        assert_eq!(px(50, 45) >> 24, 255, "under the peak, inside the area");
+        assert_eq!(px(50, 10) >> 24, 0, "above the line nothing is drawn");
+        assert_eq!(px(5, 45) >> 24, 0, "left of the first point nothing is drawn");
+        assert_eq!(px(50, 58) >> 24, 0, "below the base nothing is drawn");
+        assert!(((px(50, 20) >> 16) & 255) > 200 && (px(50, 20) & 255) < 60, "the line is red where it peaks");
+        // too few points, or a clear colour, draw nothing and do not fail
+        let mut s2 = Surface::new();
+        g.paint(&mut s2, 20, 20, |c| {
+            c.polyline(&[(1.0, 1.0)], 2.0, Rgba::hex(0xff0000));
+            c.area(&[(1.0, 1.0), (9.0, 9.0)], 15.0, Rgba::TRANSPARENT, Rgba::TRANSPARENT);
+        })
+        .expect("a frame");
+        assert!(s2.pixels().iter().all(|p| p >> 24 == 0));
+    }
+}

@@ -128,6 +128,11 @@ pub fn set_lang(l: Lang) -> bool {
     }
 }
 
+/// Switches this process only, writing nothing: what a render or a test of one program uses to show a language of its choice.
+pub fn use_lang(l: Lang) {
+    LANG.store(l as u8, Relaxed);
+}
+
 /// `lang!()`: the current `Lang`. `cfg!(test)` is checked in the calling crate, so its unit tests keep their Russian expectations.
 #[macro_export]
 macro_rules! lang {

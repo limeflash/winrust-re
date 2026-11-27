@@ -33,10 +33,6 @@ pub static NAV: std::sync::LazyLock<[(Page, char, &'static str); 11]> = std::syn
     (Page::Boost, '\u{E945}', t!("Ускорение", "Speed", ja: "速度", pt: "Velocidade", zh: "速度")),
 ]);
 
-pub fn page_title(p: Page) -> &'static str {
-    NAV.iter().find(|n| n.0 == p).map_or("", |n| n.2)
-}
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Align {
     Left,

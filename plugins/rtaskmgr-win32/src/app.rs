@@ -1,95 +1,90 @@
-//! Окно приложения: состояние интерфейса, раскладка, события, меню и действия.
-use crate::{data::*, draw::*, model::*, startup, store, sys, ui::*};
-use native_windows_gui as nwg;
-use std::{
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    ptr::{null, null_mut},
-    time::{Duration, Instant},
+//! The Task Manager's window: what is on the screen and what a click or a key does. It is an [`App`] of `winrust-ui`: it never sees
+//! a window, so `--render`, `--bench`, `--selftest` and the tests run it with none, on a [`Machine`] that touches nothing. How it is
+//! drawn is `draw.rs`; the numbers it shows, `data.rs`, `model.rs`, `perfview.rs`; what changes the system, `backend.rs`.
+use crate::{
+    backend::{MSG_HOTKEY, MSG_START, MSG_TRAY_CMD, MSG_TRAY_SHOW, Machine, TrayItem},
+    boost,
+    data::*,
+    demo::Demo,
+    model::*,
+    perfview::*,
+    store, sys,
 };
-use winapi::shared::windef::{HMENU, HWND};
-use winapi::um::winuser::*;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use winrust_common::style;
+use winrust_ui::{
+    anim::now_ms,
+    core::App,
+    frame::{Button, Cx, Frame, Id, Mods},
+    gfx::{Canvas, Rect, Rgba},
+    widgets::{
+        field,
+        field_model::{Ev, TextField},
+        list::{ColItem, col_of, row_of},
+        list_model::{Col as LCol, Columns, ListState},
+        overlay::{Dialog, MenuItem},
+        scroll,
+        scroll_model::Scroll,
+    },
+};
+
+// ---- ids of the window's items (0 and up; the window's own buttons and the overlays are negative)
+pub const ID_NAV: Id = 10;
+pub const ID_SEARCH: Id = 30;
+pub const ID_ACT: Id = 40;
+pub const ID_ALERT_SHOW: Id = 50;
+pub const ID_ALERT_END: Id = 51;
+pub const ID_ALERT_HIDE: Id = 52;
+pub const ID_PHEAD: Id = 60;
+pub const ID_PERF: Id = 70;
+pub const ID_PROC: Id = 100;
+pub const ID_SCROLL_USERS: Id = 110;
+pub const ID_SCROLL_SPEED: Id = 120;
+pub const ID_SCROLL_SET: Id = 130;
+pub const ID_SCROLL_INS: Id = 140;
+pub const ID_COLS: Id = 150;
+pub const ID_CHART: Id = 160;
+pub const ID_UMET: Id = 200;
+pub const ID_USER: Id = 210;
+pub const ID_UEND: Id = 230;
+pub const ID_UBTN: Id = 290;
+pub const ID_PROF: Id = 300;
+pub const ID_MEM_CLEAR: Id = 310;
+pub const ID_MEM_AUTO: Id = 311;
+pub const ID_TWEAK: Id = 320;
+pub const ID_SETSEG: Id = 400;
+pub const ID_SETSW: Id = 410;
+pub const ID_SETBTN: Id = 420;
+pub const ID_PROW: Id = 10_000;
+pub const ID_CHEV: Id = 50_000;
+pub const ID_TABLE: Id = 100_000;
+/// The switch in row `i` of the startup table is `ID_SWITCH + i`.
+pub const ID_SWITCH: Id = 300_000;
+/// The column of a table that holds no model cell: the startup table's switches.
+pub const SWITCH_COL: usize = 99;
+/// A 1 x 1 item in the corner that `--render` clicks to open the menu or the dialog of a state of the design (see `demo`).
+pub const ID_DEMO: Id = 9999;
+
+pub const TAG_ROW_MENU: u32 = 1;
+pub const TAG_MORE_MENU: u32 = 2;
+pub const TAG_END: u32 = 3;
+pub const TAG_TRAY: u32 = 4;
+pub const TAG_BOOST: u32 = 5;
+
+/// What the pages of the sidebar are, in its order.
+pub const NAV_PAGES: [Page; 10] = [Page::Processes, Page::Performance, Page::History, Page::Startup, Page::Users, Page::Details, Page::Services, Page::Boost, Page::Rules, Page::Settings];
+
+pub const ROW_H: f32 = 40.0;
+pub const KID_H: f32 = 36.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Btn {
-    RunTask,
-    EndTask,
-    Efficiency,
-    More,
-    SvcStart,
-    SvcStop,
-    StartEnable,
-    StartDisable,
-    RuleDelete,
-    BoostOn,
-    BoostOff,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Hit {
-    None,
-    NavToggle,
-    Nav(usize),
-    Button(Btn),
-    Header(usize),
-    Row(usize),
-    Chevron(usize),
-    VBar,
-    PerfItem(usize),
-    Setting(usize),
-}
-
-#[derive(Clone)]
-pub struct Lay {
-    pub client: R,
-    pub nav: R,
-    pub nav_toggle: R,
-    pub nav_items: Vec<R>,
-    pub band: R,
-    pub title: R,
-    pub search: R,
-    pub buttons: Vec<(R, Btn, &'static str, char)>,
-    pub body: R,
-    pub header: R,
-    pub rows_area: R,
-    pub col_x: Vec<i32>,
-    pub vbar: R,
-    pub perf_list: R,
-    pub perf_items: Vec<R>,
-    pub perf_main: R,
-    pub setting_cards: Vec<(R, SettingId)>,
-}
-
-pub struct Ui {
-    pub page: Page,
-    pub nav_open: bool,
-    pub th: Theme,
-    pub rows: Vec<Row>,
-    pub sel: Option<String>,
-    pub expanded: HashSet<String>,
-    pub sorts: HashMap<Page, (usize, bool)>,
-    pub search: String,
-    pub hit: Hit,
-    pub mouse: (i32, i32),
-    pub scroll: f64,
-    pub drag: Option<(i32, f64)>,
-    pub perf_sel: PerfKind,
-    pub toast: Option<(String, Instant)>,
-    pub tip: Option<(String, (i32, i32))>,
-    pub lay: Option<Lay>,
-    pub last_click: Option<(Instant, String)>,
-}
-
-impl Ui {
-    pub fn sort_of(&self, p: Page) -> (usize, bool) {
-        self.sorts.get(&p).copied().unwrap_or_else(|| default_sort(p))
-    }
-    pub fn page_has_search(&self) -> bool {
-        matches!(self.page, Page::Processes | Page::Users | Page::Details | Page::Services | Page::Startup | Page::History | Page::Rules)
-    }
-    pub fn has_table(&self) -> bool {
-        self.page_has_search() || self.page == Page::Boost
-    }
+pub enum UMetric {
+    Mem,
+    Cpu,
+    Disk,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -110,9 +105,8 @@ pub enum Act {
     SvcStop,
     StartEnable,
     StartDisable,
-    BoostOn,
-    BoostOff,
     Export,
+    ClearHistory,
     SetTheme(u8),
     ToggleTray,
     ToggleAutostart,
@@ -125,1164 +119,1118 @@ pub enum Act {
     Go(Page),
 }
 
-pub enum MI {
-    Item(&'static str, Act),
-    Check(&'static str, Act, bool),
-    Sep,
-    Sub(&'static str, Vec<MI>),
+/// What a button of the head does.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum HeadAct {
+    Do(Act),
+    More,
 }
 
-pub struct App {
-    pub win: nwg::Window,
-    pub search: nwg::TextInput,
-    #[allow(dead_code, deprecated)] // owned only to stay alive: dropping it stops the 1 s refresh
-    pub timer: nwg::Timer,
-    pub tray: nwg::TrayNotification,
-    #[allow(dead_code)] // the tray and the window keep using these handles: they must outlive them
-    pub tray_icon: nwg::Icon,
-    #[allow(dead_code)]
-    pub icon_big: nwg::Icon,
-    pub data: RefCell<Data>,
-    pub ui: RefCell<Ui>,
-    pub fonts: Fonts,
-    pub scale: f64,
-    pub edit_brush: Cell<isize>,
-    pub search_rect: Cell<R>,
-    pub last_tick: Cell<Instant>,
+/// What waits for a "yes" in a dialog.
+#[derive(Clone, Debug)]
+pub enum Ask {
+    /// End these processes (a group, or a tree).
+    End(Act, Vec<u32>),
+    /// Switch a thing of the Speed page on.
+    Boost(boost::Id),
 }
 
-fn layout_log_path() -> Option<&'static std::ffi::OsString> {
-    static P: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-    P.get_or_init(|| std::env::var_os("RTASKMGR_LAYOUT_LOG")).as_ref()
+pub struct Toast {
+    pub text: String,
+    pub dot: Rgba,
+    /// The frame clock when it was first drawn.
+    pub born: Option<u64>,
+    pub serial: u32,
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
+/// How long a toast stays (`tm_toast` of the mockup).
+pub const TOAST_MS: u64 = 2200;
+
+/// What the Speed page shows of a thing it can switch.
+#[derive(Clone, Debug)]
+pub struct SpeedItem {
+    pub id: boost::Id,
+    pub state: boost::State,
 }
 
-fn page_buttons(p: Page) -> Vec<(Btn, &'static str, char)> {
+pub struct Tm {
+    pub m: Arc<dyn Machine>,
+    pub d: Data,
+    /// The made-up extras of a render, a benchmark or a test (memory numbers, the users): `None` for the real thing.
+    pub demo: Option<Demo>,
+    pub hwnd: isize,
+    /// Started with `--tray`: the window waits in the tray.
+    pub hidden_start: bool,
+    pub page: Page,
+    pub rows: Vec<Row>,
+    pub sel: Option<String>,
+    pub expanded: HashSet<String>,
+    pub sorts: HashMap<Page, (usize, bool)>,
+    pub search: TextField,
+    pub proc_sc: Scroll,
+    pub list: ListState,
+    pub cols: Columns,
+    pub cols_page: Option<Page>,
+    pub perf_sel: PerfKind,
+    pub u_open: HashSet<String>,
+    pub u_metric: UMetric,
+    pub u_sc: Scroll,
+    pub speed_sc: Scroll,
+    pub tw_open: HashSet<usize>,
+    pub set_sc: Scroll,
+    pub ins_sc: Scroll,
+    pub alert_off: HashSet<String>,
+    pub toast: Option<Toast>,
+    toast_serial: u32,
+    pub ask: Option<Ask>,
+    pub menu_acts: Vec<Act>,
+    pub quitting: bool,
+    pub speed: Vec<SpeedItem>,
+    /// The window's size from the last frame (what a page-sized key step needs).
+    pub size: (f32, f32),
+    /// Where the buttons of the head stood in the last frame (a menu hangs from one).
+    pub head_rects: Vec<Rect>,
+    /// The window waits in the tray or is minimized: only the numbers are kept, nothing is drawn.
+    pub away: bool,
+    /// The row the keys moved to last, that the next frame brings into view.
+    pub reveal: Option<usize>,
+}
+
+pub fn nav_label(p: Page) -> &'static str {
     match p {
-        Page::Processes => vec![(Btn::RunTask, t!("Запустить новую задачу", "Run new task", ja: "新しいタスクの実行", pt: "Executar nova tarefa", zh: "运行新任务"), '\u{E710}'), (Btn::EndTask, t!("Снять задачу", "End task", ja: "タスクの終了", pt: "Finalizar tarefa", zh: "结束任务"), '\u{E711}'), (Btn::Efficiency, t!("Режим эффективности", "Efficiency mode", ja: "効率モード", pt: "Modo de eficiência", zh: "能效模式"), '\u{E945}'), (Btn::More, "", '\u{E712}')],
-        Page::Users => vec![(Btn::EndTask, t!("Снять задачу", "End task", ja: "タスクの終了", pt: "Finalizar tarefa", zh: "结束任务"), '\u{E711}'), (Btn::More, "", '\u{E712}')],
-        Page::Details => vec![(Btn::RunTask, t!("Запустить новую задачу", "Run new task", ja: "新しいタスクの実行", pt: "Executar nova tarefa", zh: "运行新任务"), '\u{E710}'), (Btn::EndTask, t!("Снять задачу", "End task", ja: "タスクの終了", pt: "Finalizar tarefa", zh: "结束任务"), '\u{E711}'), (Btn::More, "", '\u{E712}')],
-        Page::Services => vec![(Btn::SvcStart, t!("Запустить", "Start", ja: "開始", pt: "Iniciar", zh: "启动"), '\u{E768}'), (Btn::SvcStop, t!("Остановить", "Stop", ja: "停止", pt: "Parar", zh: "停止"), '\u{E71A}'), (Btn::More, "", '\u{E712}')],
-        Page::Startup => vec![(Btn::StartEnable, t!("Включить", "Enable", ja: "有効にする", pt: "Ativar", zh: "启用"), '\u{E73E}'), (Btn::StartDisable, t!("Отключить", "Disable", ja: "無効にする", pt: "Desativar", zh: "禁用"), '\u{E711}'), (Btn::More, "", '\u{E712}')],
-        Page::Rules => vec![(Btn::RuleDelete, t!("Удалить правило", "Delete rule", ja: "ルールを削除", pt: "Excluir regra", zh: "删除规则"), '\u{E74D}'), (Btn::More, "", '\u{E712}')],
-        Page::History => vec![(Btn::More, "", '\u{E712}')],
-        Page::Boost => vec![(Btn::BoostOn, t!("Включить", "Enable", ja: "有効にする", pt: "Ativar", zh: "启用"), '\u{E73E}'), (Btn::BoostOff, t!("Выключить", "Disable", ja: "無効にする", pt: "Desativar", zh: "禁用"), '\u{E711}')],
-        _ => vec![],
+        Page::Processes => t!("Процессы", "Processes", ja: "プロセス", pt: "Processos", zh: "进程"),
+        Page::Performance => t!("Производительность", "Performance", ja: "パフォーマンス", pt: "Desempenho", zh: "性能"),
+        Page::History => t!("Журнал приложений", "App history", ja: "アプリの履歴", pt: "Histórico de apps", zh: "应用历史记录"),
+        Page::Startup => t!("Автозагрузка", "Startup apps", ja: "スタートアップ アプリ", pt: "Apps de inicialização", zh: "启动应用"),
+        Page::Users => t!("Пользователи", "Users", ja: "ユーザー", pt: "Usuários", zh: "用户"),
+        Page::Details => t!("Подробности", "Details", ja: "詳細", pt: "Detalhes", zh: "详细信息"),
+        Page::Services => t!("Службы", "Services", ja: "サービス", pt: "Serviços", zh: "服务"),
+        Page::Boost => t!("Ускорение", "Speed", ja: "速度", pt: "Velocidade", zh: "速度"),
+        Page::Rules => t!("Правила", "Rules", ja: "ルール", pt: "Regras", zh: "规则"),
+        Page::Settings => t!("Параметры", "Settings", ja: "設定", pt: "Configurações", zh: "设置"),
+        Page::Insights => t!("Что тормозит", "What's slow", ja: "遅い原因", pt: "O que está lento", zh: "什么在变慢"),
     }
 }
 
-impl App {
-    // ================= раскладка =================
-    pub fn compute_layout(&self, g: &G, ui: &Ui, d: &Data, w: i32, h: i32) -> Lay {
-        let s = g.s;
-        let px = |v: f64| (v * s).round() as i32;
-        let nav_w = px(if ui.nav_open { NAV_W_OPEN } else { NAV_W });
-        let nav = R::new(0, 0, nav_w, h);
-        let nav_toggle = R::new(0, px(6.0), px(NAV_W), px(6.0 + 44.0));
-        let nav_items: Vec<R> = (0..NAV.len()).map(|i| R::new(0, px(56.0 + i as f64 * 44.0), nav_w, px(56.0 + i as f64 * 44.0 + 44.0))).collect();
-        let band = R::new(nav_w, 0, w, px(BAND_H));
-        let title = R::new(band.l + px(20.0), 0, band.l + px(320.0), band.b);
-        // кнопки справа налево
-        let mut buttons = vec![];
-        let mut right = band.r - px(12.0);
-        for (btn, label, glyph) in page_buttons(ui.page).into_iter().rev() {
-            let bw = if label.is_empty() { px(36.0) } else { g.text_w(label, Font::Ui) + px(48.0) };
-            let r = R::new(right - bw, px(10.0), right, px(10.0 + 32.0));
-            buttons.push((r, btn, label, glyph));
-            right -= bw + px(4.0);
-        }
-        buttons.reverse();
-        let btn_left = buttons.first().map_or(band.r, |b| b.0.l);
-        let sw = px(440.0).min((btn_left - title.l - px(220.0)).max(px(160.0)));
-        let sx = (band.l + btn_left) / 2 - sw / 2 + px(60.0);
-        let search = R::new(sx.max(title.l + px(190.0)), px(10.0), (sx.max(title.l + px(190.0))) + sw, px(10.0 + 32.0));
-        let body = R::new(nav_w, band.b, w, h);
-        let mut lay = Lay {
-            client: R::new(0, 0, w, h),
-            nav,
-            nav_toggle,
-            nav_items,
-            band,
-            title,
-            search,
-            buttons,
-            body,
-            header: R::new(0, 0, 0, 0),
-            rows_area: R::new(0, 0, 0, 0),
-            col_x: vec![],
-            vbar: R::new(0, 0, 0, 0),
-            perf_list: R::new(0, 0, 0, 0),
-            perf_items: vec![],
-            perf_main: R::new(0, 0, 0, 0),
-            setting_cards: vec![],
+/// The CSV's file name for the page.
+fn page_file(p: Page) -> String {
+    nav_label(p).chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// The generic tables of the design: which column of the model each shows, its width (0: what the others leave) and its least.
+pub fn table_spec(p: Page) -> &'static [(usize, f32, f32)] {
+    match p {
+        Page::History => &[(0, 96.0, 70.0), (1, 220.0, 90.0), (2, 220.0, 90.0), (3, 110.0, 80.0), (4, 120.0, 80.0), (5, 0.0, 140.0)],
+        Page::Startup => &[(0, 301.0, 160.0), (1, 180.0, 100.0), (3, 120.0, 90.0), (4, 0.0, 140.0), (SWITCH_COL, 52.0, 52.0)],
+        Page::Details => &[(0, 200.0, 120.0), (1, 72.0, 50.0), (2, 110.0, 80.0), (3, 64.0, 44.0), (4, 96.0, 70.0), (5, 84.0, 60.0), (6, 0.0, 140.0)],
+        Page::Rules => &[(0, 290.0, 120.0), (1, 0.0, 140.0), (2, 200.0, 120.0), (3, 140.0, 90.0)],
+        _ => &[(0, 160.0, 100.0), (2, 0.0, 140.0), (1, 80.0, 50.0), (3, 120.0, 90.0)],
+    }
+}
+
+impl Tm {
+    #[must_use]
+    pub fn new(m: Arc<dyn Machine>, d: Data, demo: Option<Demo>, hidden_start: bool, page: Page) -> Self {
+        let mut sorts = HashMap::new();
+        sorts.insert(Page::Processes, (d.cfg.sort.min(7), d.cfg.desc));
+        let mut me = Self {
+            m,
+            d,
+            demo,
+            hwnd: 0,
+            hidden_start,
+            page,
+            rows: Vec::new(),
+            sel: None,
+            expanded: HashSet::new(),
+            sorts,
+            search: TextField::new(),
+            proc_sc: Scroll::default(),
+            list: ListState::default(),
+            cols: Columns::default(),
+            cols_page: None,
+            perf_sel: PerfKind::Cpu,
+            u_open: HashSet::new(),
+            u_metric: UMetric::Mem,
+            u_sc: Scroll::default(),
+            speed_sc: Scroll::default(),
+            tw_open: HashSet::new(),
+            set_sc: Scroll::default(),
+            ins_sc: Scroll::default(),
+            alert_off: HashSet::new(),
+            toast: None,
+            toast_serial: 0,
+            ask: None,
+            menu_acts: Vec::new(),
+            quitting: false,
+            speed: Vec::new(),
+            size: (1280.0, 780.0),
+            head_rects: Vec::new(),
+            away: hidden_start,
+            reveal: None,
         };
-        if ui.has_table() {
-            let cols = columns(ui.page);
-            let hh = px(if ui.page == Page::Processes { 56.0 } else { 36.0 });
-            lay.header = R::new(body.l, body.t, body.r, body.t + hh);
-            lay.rows_area = R::new(body.l, body.t + hh, body.r, body.b);
-            let fixed: f64 = cols.iter().map(|c| c.w).sum();
-            let rest = (body.w() as f64 - fixed * s).max(px(140.0) as f64);
-            let mut x = body.l;
-            lay.col_x.push(x);
-            for c in &cols {
-                x += if c.w == 0.0 { rest as i32 } else { px(c.w) };
-                lay.col_x.push(x);
-            }
-            lay.vbar = lay.rows_area;
-        }
-        match ui.page {
-            Page::Performance => {
-                lay.perf_list = R::new(body.l, body.t, body.l + px(268.0), body.b);
-                let n = perf_kinds(d).len().max(1) as i32;
-                let item_h = px(76.0).min((body.h() - px(16.0)) / n); // при множестве устройств пункты сжимаются
-                lay.perf_items = (0..n).map(|i| R::new(lay.perf_list.l + px(6.0), body.t + px(8.0) + i * item_h, lay.perf_list.r - px(6.0), body.t + px(8.0) + (i + 1) * item_h)).collect();
-                lay.perf_main = R::new(lay.perf_list.r + px(24.0), body.t + px(16.0), body.r - px(24.0), body.b - px(12.0));
-            }
-            Page::Settings => {
-                let ids = [SettingId::Theme, SettingId::Tray, SettingId::Autostart, SettingId::Etw, SettingId::GpuTemp];
-                let cw = (body.w() - px(48.0)).min(px(900.0));
-                lay.setting_cards = ids.iter().enumerate().map(|(i, id)| (R::new(body.l + px(24.0), body.t + px(16.0) + i as i32 * px(76.0), body.l + px(24.0) + cw, body.t + px(16.0) + i as i32 * px(76.0) + px(66.0)), *id)).collect();
-            }
+        me.enter_page();
+        me
+    }
+
+    pub fn sort_of(&self, p: Page) -> (usize, bool) {
+        self.sorts.get(&p).copied().unwrap_or_else(|| default_sort(p))
+    }
+
+    /// The pages whose body is a table of `rows`, with a search box.
+    pub fn page_has_search(&self) -> bool {
+        matches!(self.page, Page::Processes | Page::Details | Page::Services | Page::Startup | Page::History | Page::Rules)
+    }
+
+    pub fn is_demo(&self) -> bool {
+        self.demo.is_some()
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // pages and rows
+
+    /// What a page needs when it is entered: its data read, its rows built, its scrolling and selection fresh.
+    fn enter_page(&mut self) {
+        match self.page {
+            Page::Startup => self.m.load_startup(&mut self.d),
+            Page::History => self.m.load_history(&mut self.d),
             _ => {}
         }
-        let _ = d;
-        lay
-    }
-
-    fn content_height(&self, g: &G, ui: &Ui, lay: &Lay, d: &Data) -> f64 {
-        match ui.page {
-            Page::Insights => {
-                let w = (lay.body.w() - g.px(48.0)).min(g.px(900.0));
-                d.hints().iter().map(|h| (g.wrap_h(h, Font::Ui, w - g.px(32.0)) + g.px(34.0)) as f64).sum::<f64>() + g.px(32.0) as f64
-            }
-            _ => ui.rows.len() as f64 * g.px(ROW_H) as f64,
-        }
-    }
-
-    // ================= рисование =================
-    pub fn paint(&self, hwnd: HWND) {
-        let (Ok(d), Ok(mut ui)) = (self.data.try_borrow(), self.ui.try_borrow_mut()) else {
-            unsafe { InvalidateRect(hwnd, null(), 0) };
-            return;
-        };
-        unsafe {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            let mut rc = std::mem::zeroed();
-            GetClientRect(hwnd, &mut rc);
-            let (w, h) = (rc.right, rc.bottom);
-            if w > 0 && h > 0 {
-                let mem = winapi::um::wingdi::CreateCompatibleDC(hdc);
-                let bmp = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
-                let old = winapi::um::wingdi::SelectObject(mem, bmp as *mut _);
-                let g = G { dc: mem, s: self.scale, th: ui.th, fonts: &self.fonts };
-                let lay = self.compute_layout(&g, &ui, &d, w, h);
-                // прокрутка не должна выходить за содержимое
-                let area_h = if ui.has_table() { lay.rows_area.h() } else { lay.body.h() } as f64;
-                let max_scroll = (self.content_height(&g, &ui, &lay, &d) - area_h).max(0.0);
-                ui.scroll = ui.scroll.clamp(0.0, max_scroll);
-                g.fill(lay.client, ui.th.bg);
-                match ui.page {
-                    Page::Performance => self.draw_performance(&g, &ui, &d, &lay),
-                    Page::Insights => self.draw_insights(&g, &ui, &d, &lay),
-                    Page::Settings => self.draw_settings(&g, &ui, &d, &lay),
-                    _ => self.draw_table(&g, &ui, &d, &lay),
-                }
-                self.draw_band(&g, &ui, &d, &lay);
-                self.draw_nav(&g, &ui, &lay);
-                self.draw_overlay(&g, &ui, lay.client);
-                winapi::um::wingdi::BitBlt(hdc, 0, 0, w, h, mem, 0, 0, winapi::um::wingdi::SRCCOPY);
-                winapi::um::wingdi::SelectObject(mem, old);
-                winapi::um::wingdi::DeleteObject(bmp as *mut _);
-                winapi::um::wingdi::DeleteDC(mem);
-                if let Some(path) = layout_log_path() {
-                    // только для автотестов: где лежат кнопки, шапка и первая строка (физические пиксели клиентской области)
-                    let mut t = format!("scale={}\nrow0={:?}\nheader={:?}\n", self.scale, (lay.rows_area.l, lay.rows_area.t, lay.rows_area.r, lay.rows_area.b), (lay.header.l, lay.header.t, lay.header.r, lay.header.b));
-                    for (r, b, _, _) in &lay.buttons {
-                        t += &format!("{:?}={},{},{},{}\n", b, r.l, r.t, r.r, r.b);
-                    }
-                    for (i, r) in lay.nav_items.iter().enumerate() {
-                        t += &format!("nav{i}={},{},{},{}\n", r.l, r.t, r.r, r.b);
-                    }
-                    t += &format!("toggle={},{},{},{}\ncols={:?}\n", lay.nav_toggle.l, lay.nav_toggle.t, lay.nav_toggle.r, lay.nav_toggle.b, lay.col_x);
-                    let _ = std::fs::write(path, t);
-                }
-                ui.lay = Some(lay);
-            }
-            EndPaint(hwnd, &ps);
-        }
-        drop(ui);
-        self.place_search();
-    }
-
-    /// Ставит поле поиска в шапку (оно настоящее, а рамка вокруг нарисована).
-    pub fn place_search(&self) {
-        let ui = self.ui.borrow();
-        let Some(lay) = &ui.lay else { return };
-        let show = ui.page_has_search();
-        let s = self.scale;
-        let r = lay.search;
-        if self.search_rect.get() != r || self.search.visible() != show {
-            self.search_rect.set(r);
-            let lg = |v: i32| (v as f64 / s).round() as i32;
-            self.search.set_position(lg(r.l) + 10, lg(r.t) + 7);
-            self.search.set_size((lg(r.w()) - 44).max(40) as u32, 20);
-            self.search.set_visible(show);
-        }
-    }
-
-    pub fn invalidate(&self) {
-        if let Some(h) = self.win.handle.hwnd() {
-            unsafe { InvalidateRect(h, null(), 0) };
-        }
-    }
-
-    // ================= проверка попаданий =================
-    fn hit_test(&self, ui: &Ui, x: i32, y: i32) -> Hit {
-        let Some(lay) = &ui.lay else { return Hit::None };
-        if lay.nav_toggle.contains(x, y) {
-            return Hit::NavToggle;
-        }
-        if let Some(i) = lay.nav_items.iter().position(|r| r.contains(x, y)) {
-            return Hit::Nav(i);
-        }
-        if lay.band.contains(x, y) {
-            return lay.buttons.iter().find(|b| b.0.contains(x, y)).map_or(Hit::None, |b| Hit::Button(b.1));
-        }
-        match ui.page {
-            Page::Performance => lay.perf_items.iter().position(|r| r.contains(x, y)).map_or(Hit::None, Hit::PerfItem),
-            Page::Settings => lay.setting_cards.iter().position(|c| c.0.contains(x, y)).map_or(Hit::None, Hit::Setting),
-            _ if ui.has_table() => {
-                if lay.header.contains(x, y) {
-                    let cols = columns(ui.page);
-                    return (0..cols.len()).find(|&i| x >= lay.col_x[i] && x < lay.col_x[i + 1]).map_or(Hit::None, Hit::Header);
-                }
-                if lay.rows_area.contains(x, y) {
-                    let content = ui.rows.len() as f64 * (ROW_H * self.scale).round();
-                    if content > lay.rows_area.h() as f64 && x >= lay.rows_area.r - (10.0 * self.scale) as i32 {
-                        return Hit::VBar;
-                    }
-                    let i = ((y - lay.rows_area.t) as f64 + ui.scroll) / (ROW_H * self.scale).round();
-                    let i = i.floor() as usize;
-                    if i < ui.rows.len() {
-                        let r = &ui.rows[i];
-                        let chev_x = lay.col_x[0] + (12.0 * self.scale) as i32 + r.depth as i32 * (22.0 * self.scale) as i32;
-                        if matches!(ui.page, Page::Processes | Page::Users) && r.expandable && x >= chev_x - (4.0 * self.scale) as i32 && x < chev_x + (22.0 * self.scale) as i32 {
-                            return Hit::Chevron(i);
-                        }
-                        return Hit::Row(i);
-                    }
-                }
-                Hit::None
-            }
-            _ => Hit::None,
-        }
-    }
-
-    pub fn btn_enabled(&self, ui: &Ui, d: &Data, b: Btn) -> bool {
-        let has_sel = ui.sel.is_some();
-        match b {
-            Btn::RunTask | Btn::More => true,
-            Btn::EndTask | Btn::Efficiency | Btn::SvcStart | Btn::SvcStop | Btn::StartEnable | Btn::StartDisable | Btn::RuleDelete | Btn::BoostOn | Btn::BoostOff => {
-                let _ = d;
-                has_sel
-            }
-        }
-    }
-
-    // ================= события мыши/клавиатуры =================
-    pub fn on_mouse_move(&self, hwnd: HWND, x: i32, y: i32) {
-        let mut ui = self.ui.borrow_mut();
-        ui.mouse = (x, y);
-        let hit = self.hit_test(&ui, x, y);
-        let mut redraw = hit != ui.hit;
-        ui.hit = hit;
-        if let Some((sy, s0)) = ui.drag
-            && let Some(lay) = ui.lay.clone() {
-                let content = ui.rows.len() as f64 * (ROW_H * self.scale).round();
-                let area = lay.rows_area.h() as f64;
-                if content > area {
-                    let thumb = ((area / content) * area).max(24.0 * self.scale);
-                    ui.scroll = (s0 + (y - sy) as f64 * (content - area) / (area - thumb)).clamp(0.0, content - area);
-                    redraw = true;
-                }
-            }
-        // подсказка над ячейкой «Подозрительное»: появляется после короткой паузы
-        let mut want_tip: Option<(String, (i32, i32))> = None;
-        if let (Hit::Row(i), Some(lay)) = (hit, &ui.lay)
-            && ui.page == Page::Processes {
-                let last = lay.col_x.len() - 2;
-                if x >= lay.col_x[last] && x < lay.col_x[last + 1]
-                    && let Some(r) = ui.rows.get(i)
-                        && !r.tip.is_empty() {
-                            want_tip = Some((r.tip.clone(), (x, y)));
-                        }
-            }
-        if want_tip.is_none() && ui.tip.is_some() {
-            ui.tip = None;
-            redraw = true;
-        }
-        let pending = want_tip.is_some();
-        drop(ui);
-        unsafe {
-            if pending {
-                *self.pending_tip().borrow_mut() = want_tip;
-                SetTimer(hwnd, 77, 350, None);
-            } else {
-                KillTimer(hwnd, 77);
-            }
-            let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-            TrackMouseEvent(&mut t);
-        }
-        if redraw {
-            self.invalidate();
-        }
-    }
-
-    fn pending_tip(&self) -> &'static RefCell<Option<(String, (i32, i32))>> {
-        thread_local! { static P: &'static RefCell<Option<(String, (i32, i32))>> = Box::leak(Box::new(RefCell::new(None))); }
-        P.with(|p| *p)
-    }
-
-    pub fn on_tip_timer(&self, hwnd: HWND) {
-        unsafe { KillTimer(hwnd, 77) };
-        let Some(tip) = self.pending_tip().borrow_mut().take() else { return };
-        if let Some(log) = std::env::var_os("RTASKMGR_TIP_LOG") {
-            let _ = std::fs::write(log, &tip.0); // только для автотестов: какой текст показала бы подсказка
-        }
-        self.ui.borrow_mut().tip = Some(tip);
-        self.invalidate();
-    }
-
-    pub fn on_mouse_leave(&self) {
-        let mut ui = self.ui.borrow_mut();
-        ui.hit = Hit::None;
-        ui.tip = None;
-        drop(ui);
-        self.invalidate();
-    }
-
-    pub fn on_lbutton_down(&self, hwnd: HWND, x: i32, y: i32) {
-        unsafe { SetFocus(hwnd) };
-        let hit = {
-            let mut ui = self.ui.borrow_mut();
-            ui.tip = None;
-            self.hit_test(&ui, x, y)
-        };
-        match hit {
-            Hit::NavToggle => {
-                let mut ui = self.ui.borrow_mut();
-                ui.nav_open = !ui.nav_open;
-            }
-            Hit::Nav(i) => self.go_page(NAV[i].0),
-            Hit::Button(b) => self.on_button(hwnd, b),
-            Hit::Header(i) => {
-                {
-                    let mut ui = self.ui.borrow_mut();
-                    let cols = columns(ui.page);
-                    let cur = ui.sort_of(ui.page);
-                    let numeric = cols[i].align == Align::Right || cols[i].metric.is_some();
-                    let ns = if cur.0 == i { (i, !cur.1) } else { (i, numeric) };
-                    let p = ui.page;
-                    ui.sorts.insert(p, ns);
-                }
-                self.rebuild();
-            }
-            Hit::Chevron(i) => {
-                let key = self.ui.borrow().rows.get(i).map(|r| r.key.clone());
-                if let Some(k) = key {
-                    self.toggle_expand(&k);
-                }
-            }
-            Hit::Row(i) => {
-                let mut dbl: Option<String> = None;
-                {
-                    let mut ui = self.ui.borrow_mut();
-                    if let Some(r) = ui.rows.get(i) {
-                        let key = r.key.clone();
-                        let now = Instant::now();
-                        if let Some((t, k)) = &ui.last_click
-                            && *k == key && now.duration_since(*t) < Duration::from_millis(450) {
-                                dbl = Some(key.clone());
-                            }
-                        ui.last_click = Some((now, key.clone()));
-                        ui.sel = Some(key);
-                    }
-                }
-                if let Some(k) = dbl {
-                    self.toggle_expand(&k);
-                }
-            }
-            Hit::VBar => {
-                let mut ui = self.ui.borrow_mut();
-                ui.drag = Some((y, ui.scroll));
-                unsafe { SetCapture(hwnd) };
-            }
-            Hit::PerfItem(i) => {
-                let kind = perf_kinds(&self.data.borrow()).get(i).copied();
-                if let Some(k) = kind {
-                    self.ui.borrow_mut().perf_sel = k;
-                    self.data.borrow_mut().want_gpu_temp = matches!(k, PerfKind::Gpu(_)); // температура сразу, не ждать следующего такта
-                }
-            }
-            Hit::Setting(i) => self.on_setting(i, x),
-            Hit::None => {}
-        }
-        self.invalidate();
-    }
-
-    pub fn on_lbutton_up(&self) {
-        let mut ui = self.ui.borrow_mut();
-        if ui.drag.take().is_some() {
-            unsafe { ReleaseCapture() };
-        }
-    }
-
-    pub fn on_wheel(&self, delta: i16) {
-        let mut ui = self.ui.borrow_mut();
-        ui.scroll -= delta as f64 / 120.0 * 3.0 * (ROW_H * self.scale).round();
-        ui.tip = None;
-        drop(ui);
-        self.invalidate();
-    }
-
-    pub fn on_rbutton_up(&self, hwnd: HWND, x: i32, y: i32) {
-        let hit = {
-            let ui = self.ui.borrow();
-            self.hit_test(&ui, x, y)
-        };
-        if let Hit::Row(i) | Hit::Chevron(i) = hit {
-            {
-                let mut ui = self.ui.borrow_mut();
-                if let Some(r) = ui.rows.get(i) {
-                    ui.sel = Some(r.key.clone());
-                }
-            }
-            self.invalidate();
-            let items = self.row_menu();
-            let (px, py) = self.to_screen(hwnd, x, y);
-            if let Some(a) = self.show_menu(hwnd, &items, px, py) {
-                self.do_act(a);
-            }
-        }
-    }
-
-    fn to_screen(&self, hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
-        let mut p = winapi::shared::windef::POINT { x, y };
-        unsafe { ClientToScreen(hwnd, &mut p) };
-        (p.x, p.y)
-    }
-
-    pub fn on_key(&self, hwnd: HWND, vk: u32) {
-        let ctrl = unsafe { GetKeyState(VK_CONTROL) } < 0;
-        let (page, n) = {
-            let ui = self.ui.borrow();
-            (ui.page, ui.rows.len())
-        };
-        if ctrl && vk == 'F' as u32 && self.ui.borrow().page_has_search() {
-            unsafe { SetFocus(self.search.handle.hwnd().unwrap_or(hwnd)) };
-            return;
-        }
-        if !self.ui.borrow().has_table() || n == 0 {
-            return;
-        }
-        let cur = {
-            let ui = self.ui.borrow();
-            ui.sel.as_ref().and_then(|k| ui.rows.iter().position(|r| &r.key == k))
-        };
-        let step = ((self.ui.borrow().lay.as_ref().map_or(10, |l| l.rows_area.h()) as f64 / (ROW_H * self.scale).round()) as usize).max(1);
-        let target = match vk as i32 {
-            VK_DOWN => Some(cur.map_or(0, |c| (c + 1).min(n - 1))),
-            VK_UP => Some(cur.map_or(0, |c| c.saturating_sub(1))),
-            VK_NEXT => Some(cur.map_or(0, |c| (c + step).min(n - 1))),
-            VK_PRIOR => Some(cur.map_or(0, |c| c.saturating_sub(step))),
-            VK_HOME => Some(0),
-            VK_END => Some(n - 1),
-            VK_RIGHT | VK_LEFT => {
-                let key = self.ui.borrow().sel.clone();
-                if let Some(k) = key {
-                    let want_open = vk as i32 == VK_RIGHT;
-                    let open = self.ui.borrow().expanded.contains(&k);
-                    if want_open != open && matches!(page, Page::Processes | Page::Users) {
-                        self.toggle_expand(&k);
-                    }
-                }
-                None
-            }
-            VK_DELETE => {
-                self.do_act(Act::EndTask);
-                None
-            }
-            VK_F5 => {
-                self.tick();
-                None
-            }
-            _ => None,
-        };
-        if let Some(t) = target {
-            let mut ui = self.ui.borrow_mut();
-            ui.sel = Some(ui.rows[t].key.clone());
-            // держим выбранную строку в видимой области
-            if let Some(lay) = ui.lay.clone() {
-                let rh = (ROW_H * self.scale).round();
-                let (top, bot) = (t as f64 * rh, (t as f64 + 1.0) * rh);
-                if top < ui.scroll {
-                    ui.scroll = top;
-                } else if bot > ui.scroll + lay.rows_area.h() as f64 {
-                    ui.scroll = bot - lay.rows_area.h() as f64;
-                }
-            }
-        }
-        self.invalidate();
-    }
-
-    // ================= страницы, строки =================
-    pub fn go_page(&self, p: Page) {
-        {
-            let mut ui = self.ui.borrow_mut();
-            if ui.page == p {
-                return;
-            }
-            ui.page = p;
-            ui.scroll = 0.0;
-            ui.sel = None;
-            ui.search.clear();
-            ui.rows.clear();
-            ui.tip = None;
-        }
-        self.search.set_text("");
-        {
-            let mut d = self.data.borrow_mut();
-            match p {
-                Page::Startup => d.load_startup(),
-                Page::History => d.load_history(),
-                _ => {}
-            }
-        }
+        self.sel = None;
+        self.proc_sc = Scroll::default();
+        self.list = ListState::default();
+        self.cols_page = None;
         self.rebuild();
+    }
+
+    pub fn go_page(&mut self, p: Page) {
+        if self.page == p {
+            return;
+        }
+        self.page = p;
+        self.search.set_text("");
+        self.enter_page();
         self.save_settings();
     }
 
-    pub fn rebuild(&self) {
-        let d = self.data.borrow();
-        let mut ui = self.ui.borrow_mut();
-        if !ui.has_table() {
+    pub fn rebuild(&mut self) {
+        if self.page == Page::Boost {
+            let admin = self.d.is_admin;
+            self.speed = boost::ALL.iter().map(|&id| SpeedItem { id, state: self.m.boost_state(id, admin) }).collect();
+        }
+        if !self.page_has_search() {
             return;
         }
-        let rows = {
-            let ctx = BuildCtx { page: ui.page, search: &ui.search, expanded: &ui.expanded, sort: ui.sort_of(ui.page) };
-            build_rows(&d, &ctx)
+        self.rows = {
+            let ctx = BuildCtx { page: self.page, search: &self.search.text, expanded: &self.expanded, sort: self.sort_of(self.page) };
+            build_rows(&self.d, &ctx)
         };
-        if let Some(k) = ui.sel.clone()
-            && !rows.iter().any(|r| r.key == k) {
-                ui.sel = None;
-            }
-        ui.rows = rows;
+        if let Some(dm) = &self.demo {
+            dm.post_rows(self.page, &mut self.rows);
+        }
+        if let Some(k) = self.sel.clone()
+            && !self.rows.iter().any(|r| r.key == k)
+        {
+            self.sel = None;
+        }
     }
 
-    fn toggle_expand(&self, key: &str) {
-        {
-            let mut ui = self.ui.borrow_mut();
-            if !ui.expanded.remove(key) {
-                ui.expanded.insert(key.to_string());
-            }
+    pub fn row_index(&self, key: &str) -> Option<usize> {
+        self.rows.iter().position(|r| r.key == key)
+    }
+
+    pub fn selected_row(&self) -> Option<&Row> {
+        self.sel.as_ref().and_then(|k| self.rows.iter().find(|r| &r.key == k))
+    }
+
+    fn toggle_expand(&mut self, key: &str) {
+        if !self.expanded.remove(key) {
+            self.expanded.insert(key.to_string());
         }
         self.rebuild();
     }
 
-    /// Из таймера: Windows-таймер может тикать чаще заданного, поэтому режем частоту.
-    /// Hidden in the tray or minimized: nothing is drawn, so a look every 5 s (rules, history, notices) is enough.
-    fn hidden(&self) -> bool {
-        self.win.handle.hwnd().is_none_or(|h| unsafe { IsWindowVisible(h) == 0 || IsIconic(h) != 0 })
+    /// The columns of a generic table: the design's widths with the model's titles; one column takes what the rest leave.
+    pub fn table_cols(&mut self, p: Page) -> &Columns {
+        if self.cols_page != Some(p) {
+            let mc = columns(p);
+            let spec = table_spec(p);
+            let cols: Vec<LCol> = spec.iter().map(|&(mi, w, min)| LCol { title: mc.get(mi).map_or(String::new(), |c| c.title.to_string()), w, min: min.min(mc.get(mi).map_or(min, |c| c.w as f32)), align_right: mc.get(mi).is_some_and(|c| c.align == Align::Right) }).collect();
+            let flex = cols.iter().position(|c| c.w == 0.0).unwrap_or(0);
+            let mut c = Columns::new(cols);
+            c.flex = flex;
+            let (ci, desc) = self.sort_of(p);
+            c.sort = spec.iter().position(|s| s.0 == ci && ci != SWITCH_COL).map(|k| (k, !desc));
+            self.cols = c;
+            self.cols_page = Some(p);
+        }
+        &self.cols
     }
 
-    pub fn on_timer(&self) {
-        let every = if self.hidden() { 4900 } else { 900 };
-        if self.last_tick.get().elapsed() >= Duration::from_millis(every) {
-            self.last_tick.set(Instant::now());
-            self.tick();
-        }
+    // ---------------------------------------------------------------------------------------------------------------
+    // the clock
+
+    pub fn hidden(&self) -> bool {
+        self.m.window_hidden(self.hwnd)
     }
 
-    pub fn tick(&self) {
-        {
-            let ui = self.ui.borrow();
-            self.data.borrow_mut().want_gpu_temp = ui.page == Page::Performance && matches!(ui.perf_sel, PerfKind::Gpu(_));
-        }
-        let mut notes = self.data.borrow_mut().refresh();
-        notes.extend(crate::boost::take_done()); // фоновые действия страницы «Ускорение»
+    /// One tick of the numbers (the window's, and the tray's every 5 s).
+    pub fn tick(&mut self) {
+        self.d.want_gpu_temp = self.page == Page::Performance && matches!(self.perf_sel, PerfKind::Gpu(_));
+        let mut notes = self.m.refresh(&mut self.d);
+        notes.extend(self.m.boost_done());
         if !notes.is_empty() {
             let msg = notes.join("; ");
-            self.toast(&msg);
-            self.tray.show(&msg, Some(t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器")), None, None);
-        }
-        if self.hidden() {
-            return; // the table, the page lists and the repaint wait until the window is shown
-        }
-        {
-            let (page, ticks) = (self.ui.borrow().page, self.data.borrow().ticks);
-            let mut d = self.data.borrow_mut();
-            if page == Page::Startup && ticks % 10 == 0 {
-                d.load_startup();
+            self.say(&msg, crate::look::DOT_OK);
+            if self.away {
+                self.m.tray_balloon(&msg);
             }
-            if page == Page::History && ticks % 30 == 0 {
-                d.load_history();
-            }
+        }
+        if self.away {
+            return; // the table and the page lists wait until the window is shown
+        }
+        let ticks = self.d.ticks;
+        if self.page == Page::Startup && ticks.is_multiple_of(10) {
+            self.m.load_startup(&mut self.d);
+        }
+        if self.page == Page::History && ticks.is_multiple_of(30) {
+            self.m.load_history(&mut self.d);
         }
         self.rebuild();
-        {
-            let mut ui = self.ui.borrow_mut();
-            if ui.toast.as_ref().is_some_and(|t| t.1.elapsed() > Duration::from_secs(4)) {
-                ui.toast = None;
+    }
+
+    pub fn say(&mut self, text: &str, dot: Rgba) {
+        self.toast_serial += 1;
+        self.toast = Some(Toast { text: text.to_string(), dot, born: None, serial: self.toast_serial });
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // settings, theme, the tray
+
+    pub fn save_settings(&mut self) {
+        let d = &mut self.d;
+        d.cfg.view = NAV.iter().position(|n| n.0 == self.page).unwrap_or(0);
+        let (sc, sd) = self.sorts.get(&Page::Processes).copied().unwrap_or((2, true));
+        d.cfg.sort = sc;
+        d.cfg.desc = sd;
+        d.cfg.rules = d.rules.clone();
+        d.cfg.etw = d.etw.is_some();
+        self.m.save_settings(&d.cfg);
+    }
+
+    /// The colours the user chose: Light and Dark are theirs, "System" is Windows' (the host follows it).
+    pub fn apply_theme(&self) {
+        match self.d.cfg.theme {
+            0 => {
+                style::set_light(true);
             }
-        }
-        self.invalidate();
-    }
-
-    pub fn toast(&self, msg: &str) {
-        self.ui.borrow_mut().toast = Some((msg.to_string(), Instant::now()));
-        self.invalidate();
-    }
-
-    pub fn on_search_changed(&self) {
-        let t = self.search.text();
-        {
-            let mut ui = self.ui.borrow_mut();
-            ui.search = t;
-            ui.scroll = 0.0;
-        }
-        self.rebuild();
-        self.invalidate();
-    }
-
-    // ================= кнопки, настройки =================
-    fn on_button(&self, hwnd: HWND, b: Btn) {
-        match b {
-            Btn::RunTask => self.do_act(Act::RunTask),
-            Btn::EndTask => self.do_act(Act::EndTask),
-            Btn::Efficiency => self.do_act(Act::Efficiency),
-            Btn::SvcStart => self.do_act(Act::SvcStart),
-            Btn::SvcStop => self.do_act(Act::SvcStop),
-            Btn::StartEnable => self.do_act(Act::StartEnable),
-            Btn::StartDisable => self.do_act(Act::StartDisable),
-            Btn::RuleDelete => self.do_act(Act::RuleDelete),
-            Btn::BoostOn => self.do_act(Act::BoostOn),
-            Btn::BoostOff => self.do_act(Act::BoostOff),
-            Btn::More => {
-                let items = self.more_menu();
-                let r = self.ui.borrow().lay.as_ref().and_then(|l| l.buttons.iter().find(|x| x.1 == Btn::More).map(|x| x.0));
-                if let Some(r) = r {
-                    let (x, y) = self.to_screen(hwnd, r.r - 220, r.b + 2);
-                    if let Some(a) = self.show_menu(hwnd, &items, x, y) {
-                        self.do_act(a);
-                    }
-                }
+            1 => {
+                style::set_light(false);
             }
+            _ => {}
         }
     }
 
-    fn on_setting(&self, i: usize, x: i32) {
-        let id = self.ui.borrow().lay.as_ref().and_then(|l| l.setting_cards.get(i).map(|c| (c.1, c.0)));
-        let Some((id, r)) = id else { return };
-        match id {
-            SettingId::Theme => {
-                let ctl_l = r.r - (200.0 * self.scale) as i32;
-                let seg = ((x - ctl_l) / (((200.0 * self.scale) as i32 - (16.0 * self.scale) as i32) / 3).max(1)).clamp(0, 2);
-                self.do_act(Act::SetTheme(seg as u8));
+    pub fn tray_items(&self) -> Vec<TrayItem> {
+        let d = &self.d;
+        let mut v = vec![
+            TrayItem::new(t!("Показать окно", "Show window", ja: "ウィンドウを表示", pt: "Mostrar janela", zh: "显示窗口"), 1, false),
+            TrayItem::sep(),
+            TrayItem::new(t!("Закрытие окна сворачивает в трей", "Closing the window minimizes to tray", ja: "ウィンドウを閉じるとトレイに最小化", pt: "Fechar a janela minimiza para a bandeja", zh: "关闭窗口时最小化到托盘"), 2, d.cfg.to_tray),
+            TrayItem::new(t!("Запускать при входе в Windows", "Start with Windows", ja: "Windows と同時に起動", pt: "Iniciar com o Windows", zh: "随 Windows 启动"), 3, self.m.self_autostart()),
+            TrayItem::new(t!("Сеть по процессам (ETW, администратор)", "Per-process network (ETW, administrator)", ja: "プロセスごとのネットワーク (ETW、管理者)", pt: "Rede por processo (ETW, administrador)", zh: "按进程统计网络（ETW，管理员）"), 4, d.etw.is_some()),
+            TrayItem::sep(),
+        ];
+        if !d.is_admin {
+            v.push(TrayItem::new(t!("Перезапустить от имени администратора", "Restart as administrator", ja: "管理者として再起動", pt: "Reiniciar como administrador", zh: "以管理员身份重启"), 5, false));
+        }
+        v.push(TrayItem::new(t!("Выход", "Exit", ja: "終了", pt: "Sair", zh: "退出"), 6, false));
+        v
+    }
+
+    fn refresh_tray_menu(&self) {
+        self.m.tray_menu(self.tray_items());
+    }
+
+    /// The window comes back from the tray (the icon, the hotkey).
+    fn show_window(&mut self, cx: &mut Cx) {
+        self.m.show_window(self.hwnd);
+        self.away = false;
+        self.tick();
+        cx.invalidate();
+        cx.wake_in(1000);
+    }
+
+    /// Hides the window and keeps running: history and rules go on.
+    fn hide_to_tray(&mut self) {
+        self.save_settings();
+        self.away = true;
+        self.m.hide_window(self.hwnd);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // menus
+
+    pub fn row_menu(&mut self) -> Vec<MenuItem> {
+        let acts = std::cell::RefCell::new(Vec::new());
+        let it = |label: &str, icon: &'static str, a: Act, kbd: &str, danger: bool| -> MenuItem {
+            acts.borrow_mut().push(a);
+            let mut m = MenuItem::new(label).icon(icon).kbd(kbd);
+            if danger {
+                m = m.danger();
             }
-            SettingId::Tray => self.do_act(Act::ToggleTray),
-            SettingId::Autostart => self.do_act(Act::ToggleAutostart),
-            SettingId::Etw => self.do_act(Act::ToggleEtw),
-            SettingId::GpuTemp => self.do_act(Act::ToggleGpuTemp),
-        }
-    }
-
-    // ================= меню =================
-    fn selected_row(&self) -> Option<Row> {
-        let ui = self.ui.borrow();
-        ui.sel.as_ref().and_then(|k| ui.rows.iter().find(|r| &r.key == k).cloned())
-    }
-
-    fn row_menu(&self) -> Vec<MI> {
-        let page = self.ui.borrow().page;
-        match page {
+            m
+        };
+        let items = match self.page {
             Page::Processes | Page::Users | Page::Details => {
-                let mut v = vec![];
-                if let Some(r) = self.selected_row()
-                    && r.expandable {
-                        v.push(MI::Item(if r.expanded { t!("Свернуть", "Collapse", ja: "折りたたむ", pt: "Recolher", zh: "折叠") } else { t!("Развернуть", "Expand", ja: "展開", pt: "Expandir", zh: "展开") }, Act::Toggle));
-                        v.push(MI::Sep);
-                    }
-                v.extend([
-                    MI::Item(t!("Снять задачу", "End task", ja: "タスクの終了", pt: "Finalizar tarefa", zh: "结束任务"), Act::EndTask),
-                    MI::Item(t!("Завершить дерево процессов", "End process tree", ja: "プロセス ツリーの終了", pt: "Finalizar árvore de processos", zh: "结束进程树"), Act::EndTree),
-                    MI::Item(t!("Режим эффективности", "Efficiency mode", ja: "効率モード", pt: "Modo de eficiência", zh: "能效模式"), Act::Efficiency),
-                    MI::Item(t!("Приостановить", "Suspend", ja: "中断", pt: "Suspender", zh: "挂起"), Act::Suspend(true)),
-                    MI::Item(t!("Возобновить", "Resume", ja: "再開", pt: "Retomar", zh: "继续"), Act::Suspend(false)),
-                    MI::Sep,
-                    MI::Sub(t!("Приоритет", "Priority", ja: "優先度", pt: "Prioridade", zh: "优先级"), sys::PRIORITIES.iter().map(|p| MI::Item(p.0, Act::Prio(p.1))).collect()),
-                    MI::Sub(t!("Ядра процессора", "CPU cores", ja: "CPU コア", pt: "Núcleos da CPU", zh: "CPU 核心"), vec![MI::Item(t!("Все ядра", "All cores", ja: "すべてのコア", pt: "Todos os núcleos", zh: "所有核心"), Act::Affinity(false)), MI::Item(t!("Только половина ядер", "Half of the cores only", ja: "コアの半分のみ", pt: "Apenas metade dos núcleos", zh: "仅一半核心"), Act::Affinity(true))]),
-                    MI::Sep,
-                    MI::Item(t!("Открыть расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置"), Act::OpenDir),
-                    MI::Item(t!("Копировать командную строку", "Copy command line", ja: "コマンド ラインをコピー", pt: "Copiar linha de comando", zh: "复制命令行"), Act::CopyCmd),
-                    MI::Sep,
-                    MI::Item(t!("Правило: понижать приоритет при ЦП > 25% дольше 60 с", "Rule: lower priority when CPU > 25% for over 60 s", ja: "ルール: CPU が 60 秒を超えて 25% を超えたら優先度を下げる", pt: "Regra: reduzir a prioridade quando a CPU > 25% por mais de 60 s", zh: "规则：CPU 超过 25% 持续 60 秒以上时降低优先级"), Act::RuleLower),
-                    MI::Item(t!("Правило: уведомлять при ЦП > 25% дольше 60 с", "Rule: notify when CPU > 25% for over 60 s", ja: "ルール: CPU が 60 秒を超えて 25% を超えたら通知する", pt: "Regra: avisar quando a CPU > 25% por mais de 60 s", zh: "规则：CPU 超过 25% 持续 60 秒以上时通知"), Act::RuleNotify),
-                ]);
+                let (expandable, expanded, pids) = self.selected_row().map(|r| (r.expandable, r.expanded, r.pids.clone())).unwrap_or_default();
+                let mut v = Vec::new();
+                if expandable {
+                    v.push(it(if expanded { t!("Свернуть", "Collapse", ja: "折りたたむ", pt: "Recolher", zh: "折叠") } else { t!("Развернуть", "Expand", ja: "展開", pt: "Expandir", zh: "展开") }, crate::look::I_EXPAND, Act::Toggle, "", false));
+                    v.push(MenuItem::sep());
+                }
+                let eco = !pids.is_empty() && pids.iter().all(|p| self.d.efficiency.contains(p));
+                let susp = !pids.is_empty() && pids.iter().all(|p| self.d.suspended.contains(p));
+                v.push(it(t!("Снять задачу", "End task", ja: "タスクの終了", pt: "Finalizar tarefa", zh: "结束任务"), crate::look::I_END, Act::EndTask, "Del", true));
+                v.push(it(t!("Завершить дерево процессов", "End process tree", ja: "プロセス ツリーの終了", pt: "Finalizar árvore de processos", zh: "结束进程树"), crate::look::I_TREE, Act::EndTree, "", true));
+                v.push(it(if eco { t!("Выключить режим эффективности", "Turn off efficiency mode", ja: "効率モードをオフにする", pt: "Desligar o modo de eficiência", zh: "关闭能效模式") } else { t!("Режим эффективности", "Efficiency mode", ja: "効率モード", pt: "Modo de eficiência", zh: "能效模式") }, crate::look::I_LEAF, Act::Efficiency, "", false));
+                v.push(if susp { it(t!("Возобновить", "Resume", ja: "再開", pt: "Retomar", zh: "继续"), crate::look::I_START, Act::Suspend(false), "", false) } else { it(t!("Приостановить", "Suspend", ja: "中断", pt: "Suspender", zh: "挂起"), crate::look::I_PAUSE, Act::Suspend(true), "", false) });
+                v.push(MenuItem::sep());
+                let prio = pids.first().map(|&p| self.m.priority_name(p)).unwrap_or_default();
+                let mut sub = Vec::new();
+                for p in sys::PRIORITIES.iter().rev() {
+                    acts.borrow_mut().push(Act::Prio(p.1));
+                    sub.push(MenuItem::new(p.0).radio(p.0 == prio));
+                }
+                v.push(MenuItem::new(t!("Приоритет", "Priority", ja: "優先度", pt: "Prioridade", zh: "优先级")).icon(crate::look::I_PRIO).submenu(sub));
+                acts.borrow_mut().push(Act::Affinity(false));
+                acts.borrow_mut().push(Act::Affinity(true));
+                let sub = vec![MenuItem::new(t!("Все ядра", "All cores", ja: "すべてのコア", pt: "Todos os núcleos", zh: "所有核心")).radio(true), MenuItem::new(t!("Только половина ядер", "Half of the cores only", ja: "コアの半分のみ", pt: "Apenas metade dos núcleos", zh: "仅一半核心")).radio(false)];
+                v.push(MenuItem::new(t!("Ядра процессора", "CPU cores", ja: "CPU コア", pt: "Núcleos da CPU", zh: "CPU 核心")).icon(crate::look::I_CORE).submenu(sub));
+                v.push(MenuItem::sep());
+                v.push(it(t!("Открыть расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置"), crate::look::I_FOLDER, Act::OpenDir, "", false));
+                v.push(it(t!("Копировать командную строку", "Copy command line", ja: "コマンド ラインをコピー", pt: "Copiar linha de comando", zh: "复制命令行"), crate::look::I_COPY, Act::CopyCmd, "", false));
+                v.push(MenuItem::sep());
+                acts.borrow_mut().push(Act::RuleLower);
+                acts.borrow_mut().push(Act::RuleNotify);
+                let sub = vec![
+                    MenuItem::new(t!("Понижать приоритет при ЦП > 25% дольше 60 с", "Lower priority if CPU > 25% for 60 s", ja: "CPU > 25% が 60 秒続いたら優先度を下げる", pt: "Reduzir a prioridade se CPU > 25% por 60 s", zh: "CPU > 25% 持续 60 秒则降低优先级")),
+                    MenuItem::new(t!("Уведомлять при ЦП > 25% дольше 60 с", "Notify if CPU > 25% for 60 s", ja: "CPU > 25% が 60 秒続いたら通知", pt: "Avisar se CPU > 25% por 60 s", zh: "CPU > 25% 持续 60 秒则通知")),
+                ];
+                v.push(MenuItem::new(t!("Добавить правило", "Add rule", ja: "ルールを追加", pt: "Adicionar regra", zh: "添加规则")).icon(crate::look::I_RULE).submenu(sub));
                 v
             }
-            Page::Services => vec![MI::Item(t!("Запустить службу", "Start service", ja: "サービスを開始", pt: "Iniciar serviço", zh: "启动服务"), Act::SvcStart), MI::Item(t!("Остановить службу", "Stop service", ja: "サービスを停止", pt: "Parar serviço", zh: "停止服务"), Act::SvcStop)],
-            Page::Startup => vec![MI::Item(t!("Включить", "Enable", ja: "有効にする", pt: "Ativar", zh: "启用"), Act::StartEnable), MI::Item(t!("Отключить", "Disable", ja: "無効にする", pt: "Desativar", zh: "禁用"), Act::StartDisable), MI::Sep, MI::Item(t!("Открыть расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置"), Act::OpenDir)],
-            Page::Rules => vec![MI::Item(t!("Удалить правило", "Delete rule", ja: "ルールを削除", pt: "Excluir regra", zh: "删除规则"), Act::RuleDelete)],
-            Page::Boost => vec![MI::Item(t!("Включить", "Enable", ja: "有効にする", pt: "Ativar", zh: "启用"), Act::BoostOn), MI::Item(t!("Выключить", "Disable", ja: "無効にする", pt: "Desativar", zh: "禁用"), Act::BoostOff)],
+            Page::Services => vec![it(t!("Запустить службу", "Start service", ja: "サービスを開始", pt: "Iniciar serviço", zh: "启动服务"), crate::look::I_START, Act::SvcStart, "", false), it(t!("Остановить службу", "Stop service", ja: "サービスを停止", pt: "Parar serviço", zh: "停止服务"), crate::look::I_STOP, Act::SvcStop, "", true)],
+            Page::Startup => vec![
+                it(t!("Включить", "Enable", ja: "有効にする", pt: "Ativar", zh: "启用"), crate::look::I_CHECK, Act::StartEnable, "", false),
+                it(t!("Отключить", "Disable", ja: "無効にする", pt: "Desativar", zh: "禁用"), crate::look::I_END, Act::StartDisable, "", false),
+                MenuItem::sep(),
+                it(t!("Открыть расположение файла", "Open file location", ja: "ファイルの場所を開く", pt: "Abrir local do arquivo", zh: "打开文件所在位置"), crate::look::I_FOLDER, Act::OpenDir, "", false),
+            ],
+            Page::Rules => vec![it(t!("Удалить правило", "Delete rule", ja: "ルールを削除", pt: "Excluir regra", zh: "删除规则"), crate::look::I_TRASH, Act::RuleDelete, "", true)],
             _ => vec![],
-        }
-    }
-
-    fn more_menu(&self) -> Vec<MI> {
-        let d = self.data.borrow();
-        vec![
-            MI::Item(t!("Запустить новую задачу", "Run new task", ja: "新しいタスクの実行", pt: "Executar nova tarefa", zh: "运行新任务"), Act::RunTask),
-            MI::Item(t!("Экспорт в CSV", "Export to CSV", ja: "CSV にエクスポート", pt: "Exportar para CSV", zh: "导出为 CSV"), Act::Export),
-            MI::Sep,
-            MI::Sub(t!("Тема", "Theme", ja: "テーマ", pt: "Tema", zh: "主题"), vec![MI::Check(t!("Светлая", "Light", ja: "ライト", pt: "Claro", zh: "浅色"), Act::SetTheme(0), d.cfg.theme == 0), MI::Check(t!("Тёмная", "Dark", ja: "ダーク", pt: "Escuro", zh: "深色"), Act::SetTheme(1), d.cfg.theme == 1), MI::Check(t!("Системная", "System", ja: "システム", pt: "Sistema", zh: "系统"), Act::SetTheme(2), d.cfg.theme == 2)]),
-            MI::Item(t!("Параметры", "Settings", ja: "設定", pt: "Configurações", zh: "设置"), Act::Go(Page::Settings)),
-        ]
-        .into_iter()
-        .chain((!d.is_admin).then_some([MI::Sep, MI::Item(t!("Перезапустить от имени администратора", "Restart as administrator", ja: "管理者として再起動", pt: "Reiniciar como administrador", zh: "以管理员身份重启"), Act::RelaunchAdmin)]).into_iter().flatten())
-        .collect()
-    }
-
-    pub fn tray_menu(&self) -> Vec<MI> {
-        let d = self.data.borrow();
-        vec![
-            MI::Item(t!("Показать окно", "Show window", ja: "ウィンドウを表示", pt: "Mostrar janela", zh: "显示窗口"), Act::ShowWindow),
-            MI::Sep,
-            MI::Check(t!("Закрытие окна сворачивает в трей", "Closing the window minimizes to tray", ja: "ウィンドウを閉じるとトレイに最小化", pt: "Fechar a janela minimiza para a bandeja", zh: "关闭窗口时最小化到托盘"), Act::ToggleTray, d.cfg.to_tray),
-            MI::Check(t!("Запускать при входе в Windows", "Start with Windows", ja: "Windows と同時に起動", pt: "Iniciar com o Windows", zh: "随 Windows 启动"), Act::ToggleAutostart, startup::self_autostart()),
-            MI::Check(t!("Сеть по процессам (ETW, администратор)", "Per-process network (ETW, administrator)", ja: "プロセスごとのネットワーク (ETW、管理者)", pt: "Rede por processo (ETW, administrador)", zh: "按进程统计网络（ETW，管理员）"), Act::ToggleEtw, d.etw.is_some()),
-            MI::Sep,
-        ]
-        .into_iter()
-        .chain((!d.is_admin).then_some(MI::Item(t!("Перезапустить от имени администратора", "Restart as administrator", ja: "管理者として再起動", pt: "Reiniciar como administrador", zh: "以管理员身份重启"), Act::RelaunchAdmin)))
-        .chain([MI::Item(t!("Выход", "Exit", ja: "終了", pt: "Sair", zh: "退出"), Act::Exit)])
-        .collect()
-    }
-
-    pub fn show_menu(&self, hwnd: HWND, items: &[MI], x: i32, y: i32) -> Option<Act> {
-        if items.is_empty() {
-            return None;
-        }
-        set_menu_theme(self.ui.borrow().th.dark);
-        let mut acts: Vec<Act> = vec![];
-        let menu = build_menu(items, &mut acts);
-        let id = unsafe {
-            SetForegroundWindow(hwnd);
-            TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, x, y, hwnd, null_mut())
         };
-        unsafe { DestroyMenu(menu) };
-        (id > 0).then(|| acts[id as usize - 1])
+        self.menu_acts = acts.into_inner();
+        items
     }
 
-    // ================= действия =================
-    pub fn do_act(&self, act: Act) {
+    pub fn more_menu(&mut self) -> Vec<MenuItem> {
+        let mut acts = Vec::new();
+        let mut it = |label: &str, icon: &'static str, a: Act| -> MenuItem {
+            acts.push(a);
+            MenuItem::new(label).icon(icon)
+        };
+        let theme = self.d.cfg.theme;
+        let mut v = vec![
+            it(t!("Запустить новую задачу", "Run new task", ja: "新しいタスクの実行", pt: "Executar nova tarefa", zh: "运行新任务"), crate::look::I_PLUS, Act::RunTask),
+            it(t!("Экспорт в CSV", "Export to CSV", ja: "CSV にエクスポート", pt: "Exportar para CSV", zh: "导出为 CSV"), crate::look::I_CSV, Act::Export),
+            it(t!("Что тормозит", "What's slow", ja: "遅い原因", pt: "O que está lento", zh: "什么在变慢"), crate::look::NAV_BOOST, Act::Go(Page::Insights)),
+            MenuItem::sep(),
+        ];
+        acts.extend([Act::SetTheme(0), Act::SetTheme(1), Act::SetTheme(2)]);
+        let sub = vec![
+            MenuItem::new(t!("Светлая", "Light", ja: "ライト", pt: "Claro", zh: "浅色")).radio(theme == 0),
+            MenuItem::new(t!("Тёмная", "Dark", ja: "ダーク", pt: "Escuro", zh: "深色")).radio(theme == 1),
+            MenuItem::new(t!("Системная", "System", ja: "システム", pt: "Sistema", zh: "系统")).radio(theme == 2),
+        ];
+        v.push(MenuItem::new(t!("Тема", "Theme", ja: "テーマ", pt: "Tema", zh: "主题")).icon(crate::look::I_THEME).submenu(sub));
+        acts.push(Act::Go(Page::Settings));
+        v.push(MenuItem::new(t!("Параметры", "Settings", ja: "設定", pt: "Configurações", zh: "设置")).icon(crate::look::NAV_SET));
+        if !self.d.is_admin {
+            acts.push(Act::RelaunchAdmin);
+            v.push(MenuItem::sep());
+            v.push(MenuItem::new(t!("Перезапустить от имени администратора", "Restart as administrator", ja: "管理者として再起動", pt: "Reiniciar como administrador", zh: "以管理员身份重启")).icon(crate::look::I_SHIELD));
+        }
+        self.menu_acts = acts;
+        v
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // actions (what the old window did, with its toasts and its questions)
+
+    /// A menu, a button or the tray asked for `act`.
+    pub fn do_act(&mut self, act: Act, cx: &mut Cx) {
         match act {
-            Act::ShowWindow => return self.show_window(),
-            Act::Exit => return self.quit(),
+            Act::ShowWindow => return self.show_window(cx),
+            Act::Exit => {
+                self.quitting = true;
+                return cx.close_window();
+            }
             Act::RelaunchAdmin => {
                 self.save_settings(); // the new instance reads them at start: same page, same columns
-                if sys::relaunch_as_admin("") {
-                    return self.quit();
+                if self.m.relaunch_admin() {
+                    self.quitting = true;
+                    return cx.close_window();
                 }
-                return self.toast(t!("Запуск от имени администратора отменён", "Running as administrator was cancelled", ja: "管理者としての実行がキャンセルされました", pt: "A execução como administrador foi cancelada", zh: "已取消以管理员身份运行"));
+                return self.say(t!("Запуск от имени администратора отменён", "Running as administrator was cancelled", ja: "管理者としての実行がキャンセルされました", pt: "A execução como administrador foi cancelada", zh: "已取消以管理员身份运行"), crate::look::DOT_WARN);
             }
             Act::Go(p) => return self.go_page(p),
-            Act::RunTask => {
-                // стандартное окно «Выполнить»
-                let _ = std::process::Command::new("explorer.exe").arg("shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}").spawn();
-                return;
-            }
-            Act::SetTheme(t) => {
-                self.data.borrow_mut().cfg.theme = t;
+            Act::RunTask => return self.m.run_dialog(),
+            Act::SetTheme(th) => {
+                self.d.cfg.theme = th;
+                if th == 2 {
+                    style::set_light(!self.m.system_dark());
+                }
                 self.apply_theme();
-                self.save_settings();
-                return;
+                return self.save_settings();
             }
             Act::ToggleTray => {
                 let on = {
-                    let mut d = self.data.borrow_mut();
+                    let d = &mut self.d;
                     d.cfg.to_tray = !d.cfg.to_tray;
                     d.cfg.tray_asked = true;
                     d.cfg.to_tray
                 };
-                self.toast(if on { t!("Закрытие окна будет сворачивать в трей", "Closing the window will minimize to tray", ja: "ウィンドウを閉じるとトレイに最小化されます", pt: "Fechar a janela vai minimizar para a bandeja", zh: "关闭窗口将最小化到托盘") } else { t!("Закрытие окна завершит программу", "Closing the window will quit the program", ja: "ウィンドウを閉じるとプログラムが終了します", pt: "Fechar a janela vai encerrar o programa", zh: "关闭窗口将退出程序") });
-                self.save_settings();
-                return;
+                self.say(if on { t!("Закрытие окна будет сворачивать в трей", "Closing the window will minimize to tray", ja: "ウィンドウを閉じるとトレイに最小化されます", pt: "Fechar a janela vai minimizar para a bandeja", zh: "关闭窗口将最小化到托盘") } else { t!("Закрытие окна завершит программу", "Closing the window will quit the program", ja: "ウィンドウを閉じるとプログラムが終了します", pt: "Fechar a janela vai encerrar o programa", zh: "关闭窗口将退出程序") }, crate::look::DOT_OK);
+                self.refresh_tray_menu();
+                return self.save_settings();
             }
             Act::ToggleAutostart => {
-                let want = !startup::self_autostart();
-                let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-                let ok = startup::set_self_autostart(want, &exe);
-                self.toast(match (ok, startup::self_autostart()) {
-                    (true, true) => t!("Программа будет запускаться при входе в Windows (сразу в трей)", "The program will start with Windows (straight to the tray)", ja: "プログラムは Windows と同時に起動します (トレイに直接)", pt: "O programa vai iniciar com o Windows (direto na bandeja)", zh: "程序将随 Windows 启动（直接进托盘）"),
-                    (true, false) => t!("Автозапуск программы отключён", "Autostart is disabled", ja: "自動起動は無効です", pt: "A inicialização automática está desativada", zh: "已禁用自动启动"),
-                    _ => t!("Не удалось изменить автозапуск", "Could not change autostart", ja: "自動起動を変更できませんでした", pt: "Não foi possível alterar a inicialização automática", zh: "无法更改自动启动"),
-                });
+                let want = !self.m.self_autostart();
+                let ok = self.m.set_self_autostart(want);
+                let (text, dot) = match (ok, self.m.self_autostart()) {
+                    (true, true) => (t!("Программа будет запускаться при входе в Windows (сразу в трей)", "The program will start with Windows (straight to the tray)", ja: "プログラムは Windows と同時に起動します (トレイに直接)", pt: "O programa vai iniciar com o Windows (direto na bandeja)", zh: "程序将随 Windows 启动（直接进托盘）"), crate::look::DOT_OK),
+                    (true, false) => (t!("Автозапуск программы отключён", "Autostart is disabled", ja: "自動起動は無効です", pt: "A inicialização automática está desativada", zh: "已禁用自动启动"), crate::look::DOT_OK),
+                    _ => (t!("Не удалось изменить автозапуск", "Could not change autostart", ja: "自動起動を変更できませんでした", pt: "Não foi possível alterar a inicialização automática", zh: "无法更改自动启动"), crate::look::DOT_WARN),
+                };
+                self.say(text, dot);
+                self.refresh_tray_menu();
                 return;
             }
             Act::ToggleEtw => {
-                let msg = {
-                    let mut d = self.data.borrow_mut();
-                    if !d.is_admin {
-                        t!("Сеть по процессам требует прав администратора — запустите программу от имени администратора", "Per-process network needs administrator rights - run the program as administrator", ja: "プロセスごとのネットワークには管理者権限が必要です。管理者として実行してください", pt: "A rede por processo exige direitos de administrador - execute o programa como administrador", zh: "按进程统计网络需要管理员权限——请以管理员身份运行程序").to_string()
-                    } else if let Some(s) = d.etw.take() {
-                        crate::net::stop(s);
-                        d.net.clear();
-                        d.cfg.etw = false;
-                        t!("Сеть по процессам выключена", "Per-process network is off", ja: "プロセスごとのネットワークはオフです", pt: "A rede por processo está desligada", zh: "按进程统计网络已关闭").into()
+                let (msg, dot) = {
+                    if !self.d.is_admin {
+                        (t!("Сеть по процессам требует прав администратора — запустите программу от имени администратора", "Per-process network needs administrator rights - run the program as administrator", ja: "プロセスごとのネットワークには管理者権限が必要です。管理者として実行してください", pt: "A rede por processo exige direitos de administrador - execute o programa como administrador", zh: "按进程统计网络需要管理员权限——请以管理员身份运行程序").to_string(), crate::look::DOT_WARN)
+                    } else if let Some(s) = self.d.etw.take() {
+                        self.m.etw_stop(s);
+                        self.d.net.clear();
+                        self.d.cfg.etw = false;
+                        (t!("Сеть по процессам выключена", "Per-process network is off", ja: "プロセスごとのネットワークはオフです", pt: "A rede por processo está desligada", zh: "按进程统计网络已关闭").to_string(), crate::look::DOT_OK)
                     } else {
-                        d.etw = crate::net::start();
-                        d.cfg.etw = d.etw.is_some();
-                        if d.etw.is_some() { t!("Сеть по процессам включена (колонка «Сеть»)", "Per-process network is on ('Network' column)", ja: "プロセスごとのネットワークはオンです (「ネットワーク」列)", pt: "A rede por processo está ligada (coluna 'Rede')", zh: "按进程统计网络已开启（「网络」列）").into() } else { t!("Не удалось запустить ETW", "Could not start ETW", ja: "ETW を開始できませんでした", pt: "Não foi possível iniciar o ETW", zh: "无法启动 ETW").into() }
+                        self.d.etw = self.m.etw_start();
+                        self.d.cfg.etw = self.d.etw.is_some();
+                        if self.d.etw.is_some() { (t!("Сеть по процессам включена (колонка «Сеть»)", "Per-process network is on ('Network' column)", ja: "プロセスごとのネットワークはオンです (「ネットワーク」列)", pt: "A rede por processo está ligada (coluna 'Rede')", zh: "按进程统计网络已开启（「网络」列）").to_string(), crate::look::DOT_OK) } else { (t!("Не удалось запустить ETW", "Could not start ETW", ja: "ETW を開始できませんでした", pt: "Não foi possível iniciar o ETW", zh: "无法启动 ETW").to_string(), crate::look::DOT_WARN) }
                     }
                 };
-                self.toast(&msg);
-                self.save_settings();
-                return;
+                self.say(&msg, dot);
+                self.refresh_tray_menu();
+                return self.save_settings();
             }
             Act::ToggleGpuTemp => {
-                let on = {
-                    let mut d = self.data.borrow_mut();
-                    d.cfg.gpu_temp_always = !d.cfg.gpu_temp_always;
-                    d.cfg.gpu_temp_always
-                };
-                self.toast(if on { t!("Температура GPU читается постоянно", "GPU temperature is read continuously", ja: "GPU 温度を常時読み取ります", pt: "A temperatura da GPU é lida continuamente", zh: "正在持续读取 GPU 温度") } else { t!("Температура GPU читается только на странице GPU", "GPU temperature is read only on the GPU page", ja: "GPU 温度は GPU ページでのみ読み取ります", pt: "A temperatura da GPU é lida só na página da GPU", zh: "仅在 GPU 页面读取 GPU 温度") });
-                self.save_settings();
-                return;
+                self.d.cfg.gpu_temp_always = !self.d.cfg.gpu_temp_always;
+                let on = self.d.cfg.gpu_temp_always;
+                self.say(if on { t!("Температура GPU читается постоянно", "GPU temperature is read continuously", ja: "GPU 温度を常時読み取ります", pt: "A temperatura da GPU é lida continuamente", zh: "正在持续读取 GPU 温度") } else { t!("Температура GPU читается только на странице GPU", "GPU temperature is read only on the GPU page", ja: "GPU 温度は GPU ページでのみ読み取ります", pt: "A temperatura da GPU é lida só na página da GPU", zh: "仅在 GPU 页面读取 GPU 温度") }, crate::look::DOT_OK);
+                return self.save_settings();
             }
             Act::Export => return self.export(),
+            Act::ClearHistory => {
+                self.m.clear_history();
+                self.d.hist.clear();
+                self.rebuild();
+                return self.say(t!("История использования очищена", "Usage history cleared", ja: "使用履歴を消去しました", pt: "Histórico de uso apagado", zh: "已清除使用历史记录"), crate::look::DOT_OK);
+            }
             _ => {}
         }
-        let page = self.ui.borrow().page;
-        let Some(row) = self.selected_row() else {
-            self.toast(t!("Сначала выберите строку в списке", "Select a row in the list first", ja: "先にリストで行を選択してください", pt: "Selecione primeiro uma linha na lista", zh: "请先在列表中选择一行"));
-            return;
+        let Some(row) = self.selected_row().cloned() else {
+            return self.say(t!("Сначала выберите строку в списке", "Select a row in the list first", ja: "先にリストで行を選択してください", pt: "Selecione primeiro uma linha na lista", zh: "请先在列表中选择一行"), crate::look::DOT_WARN);
         };
         if act == Act::Toggle {
             return self.toggle_expand(&row.key);
         }
-        match page {
+        match self.page {
             Page::Services => return self.act_service(&row, act),
             Page::Startup => return self.act_startup(&row, act),
-            Page::Boost => return self.act_boost(&row, act),
             Page::Rules => {
                 if act == Act::RuleDelete {
-                    if let Ok(i) = row.key.parse::<usize>() {
-                        let mut d = self.data.borrow_mut();
-                        if i < d.rules.len() {
-                            d.rules.remove(i);
-                        }
+                    if let Ok(i) = row.key.parse::<usize>()
+                        && i < self.d.rules.len()
+                    {
+                        self.d.rules.remove(i);
                     }
                     self.save_settings();
-                    self.toast(t!("Правило удалено", "Rule deleted", ja: "ルールを削除しました", pt: "Regra excluída", zh: "已删除规则"));
+                    self.say(t!("Правило удалено", "Rule deleted", ja: "ルールを削除しました", pt: "Regra excluída", zh: "已删除规则"), crate::look::DOT_BAD);
                     self.rebuild();
                 }
                 return;
             }
             _ => {}
         }
-        self.act_process(&row, act);
+        self.act_process(&row, act, cx);
     }
 
-    fn act_process(&self, row: &Row, act: Act) {
+    fn act_process(&mut self, row: &Row, act: Act, cx: &mut Cx) {
         let mut pids: Vec<u32> = row.pids.iter().copied().filter(|&p| p != 0).collect();
         if pids.is_empty() {
             return;
         }
         if matches!(act, Act::EndTask | Act::EndTree | Act::Suspend(true)) {
-            let d = self.data.borrow();
             let total = pids.len();
-            pids.retain(|&p| d.sys.process(sysinfo::Pid::from_u32(p)).is_none_or(|x| !CRITICAL.contains(&x.name().to_string_lossy().to_lowercase().as_str())));
+            pids.retain(|&p| self.d.procs.iter().find(|x| x.pid == p).is_none_or(|x| !CRITICAL.contains(&x.name.to_lowercase().as_str())));
             if pids.len() < total {
-                drop(d);
-                self.toast(t!("Критичные системные процессы (csrss, lsass, smss и т.п.) защищены и пропущены", "Critical system processes (csrss, lsass, smss, etc.) are protected and skipped", ja: "重要なシステム プロセス (csrss、lsass、smss など) は保護されているためスキップされます", pt: "Processos críticos do sistema (csrss, lsass, smss etc.) são protegidos e ignorados", zh: "关键系统进程（csrss、lsass、smss 等）受保护，将被跳过"));
+                self.say(t!("Критичные системные процессы (csrss, lsass, smss и т.п.) защищены и пропущены", "Critical system processes (csrss, lsass, smss, etc.) are protected and skipped", ja: "重要なシステム プロセス (csrss、lsass、smss など) は保護されているためスキップされます", pt: "Processos críticos do sistema (csrss, lsass, smss etc.) são protegidos e ignorados", zh: "关键系统进程（csrss、lsass、smss 等）受保护，将被跳过"), crate::look::DOT_WARN);
                 if pids.is_empty() {
                     return;
                 }
             }
         }
-        if (act == Act::EndTask && pids.len() > 1 || act == Act::EndTree) && !self.confirm(&tf!("Завершить процессов: {} (для дерева — вместе с потомками)?", "End {} processes (for a tree, together with their children)?", ja: "{} 個のプロセスを終了しますか (ツリーの場合は子プロセスも含む)?", pt: "Finalizar {} processos (no caso de árvore, junto com os filhos)?", zh: "结束 {} 个进程（若是进程树，将连同子进程一起结束）？", pids.len())) {
+        if act == Act::EndTree || (act == Act::EndTask && pids.len() > 1) {
+            // what cannot be undone is asked first: nothing is ended until the dialog's red button is pressed
+            let first = row.cells.first().cloned().unwrap_or_default();
+            let name = first.rsplit_once(" (").map_or(first.clone(), |(n, _)| n.to_string());
+            let n = pids.len();
+            let (title, text, ok) = if act == Act::EndTree {
+                (tf!("Завершить «{name}» и всё, что оно запустило?", "End {name} and everything it started?", ja: "{name} と、それが起動したものすべてを終了しますか?", pt: "Finalizar {name} e tudo o que ele iniciou?", zh: "结束 {name} 及其启动的所有进程？"), tf!("Дочерние процессы закроются вместе с «{name}». Несохранённая работа в них будет потеряна.", "Child processes close together with {name}. Unsaved work in them will be lost.", ja: "子プロセスも {name} と一緒に閉じられます。保存していない作業は失われます。", pt: "Os processos filhos fecham junto com {name}. O trabalho não salvo neles será perdido.", zh: "子进程将与 {name} 一起关闭。其中未保存的工作将丢失。"), t!("Завершить дерево", "End process tree", ja: "プロセス ツリーを終了", pt: "Finalizar árvore", zh: "结束进程树").to_string())
+            } else {
+                (tf!("Завершить все процессы «{name}» ({n})?", "End all {n} {name} processes?", ja: "{name} の {n} 個のプロセスをすべて終了しますか?", pt: "Finalizar todos os {n} processos de {name}?", zh: "结束 {name} 的全部 {n} 个进程？"), tf!("Вся группа закроется сразу. Несохранённая работа в «{name}» будет потеряна.", "The whole group closes at once. Unsaved work in {name} will be lost.", ja: "グループ全体が一度に閉じられます。{name} の保存していない作業は失われます。", pt: "O grupo inteiro fecha de uma vez. O trabalho não salvo em {name} será perdido.", zh: "整个分组将一次性关闭。{name} 中未保存的工作将丢失。"), tf!("Завершить ({n})", "End {n} processes", ja: "{n} 個を終了", pt: "Finalizar {n}", zh: "结束 {n} 个"))
+            };
+            self.ask = Some(Ask::End(act, pids));
+            cx.dialog(TAG_END, Dialog::new(title, text, &[t!("Отмена", "Cancel", ja: "キャンセル", pt: "Cancelar", zh: "取消"), &ok]).icon(crate::look::I_TREE, true));
             return;
         }
-        let report = |what: &str, ok: usize| {
-            self.toast(&if ok == pids.len() { tf!("{what}: готово ({ok})", "{what}: done ({ok})", ja: "{what}: 完了 ({ok})", pt: "{what}: concluído ({ok})", zh: "{what}：完成（{ok}）") } else { tf!("{what}: удалось {ok} из {} — для остальных нужны права администратора{}", "{what}: {ok} of {} succeeded - the rest need administrator rights{}", ja: "{what}: {} 件中 {ok} 件が成功しました。残りは管理者権限が必要です{}", pt: "{what}: {ok} de {} concluídos - o restante exige direitos de administrador{}", zh: "{what}：{ok} 个成功，共 {} 个——其余需要管理员权限{}", pids.len(), if self.data.borrow().is_admin { "" } else { t!(" (меню «…» → «Перезапустить от имени администратора»)", " (menu '…' → 'Restart as administrator')", ja: " (メニュー「…」→「管理者として再起動」)", pt: " (menu '…' → 'Reiniciar como administrador')", zh: " （菜单「…」→「以管理员身份重启」）") }) });
+        self.run_process_act(act, &pids, cx);
+    }
+
+    /// Does `act` to `pids` (the questions are asked already) and says how it went.
+    pub fn run_process_act(&mut self, act: Act, pids: &[u32], cx: &mut Cx) {
+        let n = pids.len();
+        let report = |me: &mut Self, what: &str, ok: usize| {
+            let text = if ok == n { tf!("{what}: готово ({ok})", "{what}: done ({ok})", ja: "{what}: 完了 ({ok})", pt: "{what}: concluído ({ok})", zh: "{what}：完成（{ok}）") } else { tf!("{what}: удалось {ok} из {} — для остальных нужны права администратора{}", "{what}: {ok} of {} succeeded - the rest need administrator rights{}", ja: "{what}: {} 件中 {ok} 件が成功しました。残りは管理者権限が必要です{}", pt: "{what}: {ok} de {} concluídos - o restante exige direitos de administrador{}", zh: "{what}：{ok} 个成功，共 {} 个——其余需要管理员权限{}", n, if me.d.is_admin { "" } else { t!(" (меню «…» → «Перезапустить от имени администратора»)", " (menu '…' → 'Restart as administrator')", ja: " (メニュー「…」→「管理者として再起動」)", pt: " (menu '…' → 'Reiniciar como administrador')", zh: " （菜单「…」→「以管理员身份重启」）") }) };
+            me.say(&text, if ok == n { crate::look::DOT_OK } else { crate::look::DOT_WARN });
         };
         match act {
             Act::EndTask => {
-                let d = self.data.borrow();
-                let ok = pids.iter().filter(|&&p| d.sys.process(sysinfo::Pid::from_u32(p)).is_some_and(|x| x.kill())).count();
-                drop(d);
-                report(t!("Завершение", "Ending", ja: "終了中", pt: "Finalizando", zh: "正在结束"), ok);
+                let ok = pids.iter().filter(|&&p| self.m.kill(&self.d, p)).count();
+                self.sel = None;
+                report(self, t!("Завершение", "Ending", ja: "終了中", pt: "Finalizando", zh: "正在结束"), ok);
             }
             Act::EndTree => {
-                let d = self.data.borrow();
-                let parents: HashMap<u32, u32> = d.procs.iter().map(|p| (p.pid, p.ppid)).collect();
-                let all = descendants(&parents, &pids);
-                let ok = all.iter().filter(|&&p| d.sys.process(sysinfo::Pid::from_u32(p)).is_some_and(|x| x.kill())).count();
-                drop(d);
-                self.toast(&tf!("Завершено {ok} из {} (с потомками)", "Ended {ok} of {} (with children)", ja: "{} 件中 {ok} 件を終了しました (子プロセス含む)", pt: "Finalizados {ok} de {} (com os filhos)", zh: "已结束 {ok} 个，共 {} 个（含子进程）", all.len()));
+                let parents: HashMap<u32, u32> = self.d.procs.iter().map(|p| (p.pid, p.ppid)).collect();
+                let all = descendants(&parents, pids);
+                let ok = all.iter().filter(|&&p| self.m.kill(&self.d, p)).count();
+                self.sel = None;
+                let text = tf!("Завершено {ok} из {} (с потомками)", "Ended {ok} of {} (with children)", ja: "{} 件中 {ok} 件を終了しました (子プロセス含む)", pt: "Finalizados {ok} de {} (com os filhos)", zh: "已结束 {ok} 个，共 {} 个（含子进程）", all.len());
+                self.say(&text, crate::look::DOT_BAD);
             }
-            Act::Prio(c) => report(t!("Приоритет", "Priority", ja: "優先度", pt: "Prioridade", zh: "优先级"), pids.iter().filter(|&&p| sys::set_priority(p, c)).count()),
+            Act::Prio(c) => {
+                let ok = pids.iter().filter(|&&p| self.m.set_priority(p, c)).count();
+                report(self, t!("Приоритет", "Priority", ja: "優先度", pt: "Prioridade", zh: "优先级"), ok);
+            }
             Act::Suspend(on) => {
-                let ok: Vec<u32> = pids.iter().copied().filter(|&p| sys::suspend(p, on)).collect();
-                {
-                    let mut d = self.data.borrow_mut();
-                    for p in &ok {
-                        if on { d.suspended.insert(*p) } else { d.suspended.remove(p) };
-                    }
+                let ok: Vec<u32> = pids.iter().copied().filter(|&p| self.m.suspend(p, on)).collect();
+                for p in &ok {
+                    if on { self.d.suspended.insert(*p) } else { self.d.suspended.remove(p) };
                 }
-                report(if on { t!("Приостановка", "Suspending", ja: "中断中", pt: "Suspendendo", zh: "正在挂起") } else { t!("Возобновление", "Resuming", ja: "再開中", pt: "Retomando", zh: "正在继续") }, ok.len());
+                report(self, if on { t!("Приостановка", "Suspending", ja: "中断中", pt: "Suspendendo", zh: "正在挂起") } else { t!("Возобновление", "Resuming", ja: "再開中", pt: "Retomando", zh: "正在继续") }, ok.len());
             }
             Act::Efficiency => {
-                let on = !pids.iter().all(|p| self.data.borrow().efficiency.contains(p));
-                let ok: Vec<u32> = pids.iter().copied().filter(|&p| sys::set_efficiency(p, on)).collect();
-                {
-                    let mut d = self.data.borrow_mut();
-                    for p in &ok {
-                        if on { d.efficiency.insert(*p) } else { d.efficiency.remove(p) };
-                    }
+                let on = !pids.iter().all(|p| self.d.efficiency.contains(p));
+                let ok: Vec<u32> = pids.iter().copied().filter(|&p| self.m.set_efficiency(p, on)).collect();
+                for p in &ok {
+                    if on { self.d.efficiency.insert(*p) } else { self.d.efficiency.remove(p) };
                 }
-                report(if on { t!("Режим эффективности включён", "Efficiency mode on", ja: "効率モードをオンにしました", pt: "Modo de eficiência ligado", zh: "能效模式已开启") } else { t!("Режим эффективности выключен", "Efficiency mode off", ja: "効率モードをオフにしました", pt: "Modo de eficiência desligado", zh: "能效模式已关闭") }, ok.len());
+                report(self, if on { t!("Режим эффективности включён", "Efficiency mode on", ja: "効率モードをオンにしました", pt: "Modo de eficiência ligado", zh: "能效模式已开启") } else { t!("Режим эффективности выключен", "Efficiency mode off", ja: "効率モードをオフにしました", pt: "Modo de eficiência desligado", zh: "能效模式已关闭") }, ok.len());
             }
-            Act::Affinity(half) => report(t!("Привязка к ядрам", "Core affinity", ja: "コア アフィニティ", pt: "Afinidade de núcleos", zh: "CPU 相关性"), pids.iter().filter(|&&p| sys::set_affinity(p, half)).count()),
+            Act::Affinity(half) => {
+                let ok = pids.iter().filter(|&&p| self.m.set_affinity(p, half)).count();
+                report(self, t!("Привязка к ядрам", "Core affinity", ja: "コア アフィニティ", pt: "Afinidade de núcleos", zh: "CPU 相关性"), ok);
+            }
             Act::OpenDir => {
-                let d = self.data.borrow();
-                let path = pids.iter().find_map(|&p| d.procs.iter().find(|x| x.pid == p).and_then(|x| x.exe.clone()));
-                drop(d);
+                let path = pids.iter().find_map(|&p| self.d.procs.iter().find(|x| x.pid == p).and_then(|x| x.exe.clone()));
                 match path {
-                    Some(p) => winrust_common::reveal(&p.replace("\\..\\", "\\")),
-                    None => self.toast(t!("Путь к файлу недоступен (системный или защищённый процесс)", "File path unavailable (system or protected process)", ja: "ファイルのパスを取得できません (システムまたは保護されたプロセス)", pt: "Caminho do arquivo indisponível (processo do sistema ou protegido)", zh: "无法获取文件路径（系统进程或受保护进程）")),
+                    Some(p) => self.m.reveal(&p.replace("\\..\\", "\\")),
+                    None => self.say(t!("Путь к файлу недоступен (системный или защищённый процесс)", "File path unavailable (system or protected process)", ja: "ファイルのパスを取得できません (システムまたは保護されたプロセス)", pt: "Caminho do arquivo indisponível (processo do sistema ou protegido)", zh: "无法获取文件路径（系统进程或受保护进程）"), crate::look::DOT_WARN),
                 }
             }
             Act::CopyCmd => {
-                let d = self.data.borrow();
-                let cmd = process_cmd(&d, pids[0]);
-                drop(d);
+                let cmd = process_cmd(&self.d, pids[0]);
                 if cmd.is_empty() {
-                    self.toast(t!("Командная строка недоступна для этого процесса", "Command line unavailable for this process", ja: "このプロセスのコマンド ラインを取得できません", pt: "Linha de comando indisponível para este processo", zh: "此进程无法获取命令行"));
+                    self.say(t!("Командная строка недоступна для этого процесса", "Command line unavailable for this process", ja: "このプロセスのコマンド ラインを取得できません", pt: "Linha de comando indisponível para este processo", zh: "此进程无法获取命令行"), crate::look::DOT_WARN);
                 } else {
-                    nwg::Clipboard::set_data_text(&self.win, &cmd);
-                    self.toast(t!("Командная строка скопирована", "Command line copied", ja: "コマンド ラインをコピーしました", pt: "Linha de comando copiada", zh: "已复制命令行"));
+                    cx.set_clipboard_text(cmd);
+                    self.say(t!("Командная строка скопирована", "Command line copied", ja: "コマンド ラインをコピーしました", pt: "Linha de comando copiada", zh: "已复制命令行"), crate::look::DOT_OK);
                 }
             }
             Act::RuleLower | Act::RuleNotify => {
-                let name = {
-                    let d = self.data.borrow();
-                    d.procs.iter().find(|p| p.pid == pids[0]).map(|p| p.name.to_lowercase())
-                };
+                let name = self.d.procs.iter().find(|p| p.pid == pids[0]).map(|p| p.name.to_lowercase());
                 let Some(name) = name else { return };
                 let act = if act == Act::RuleLower { store::RuleAct::Lower } else { store::RuleAct::Notify };
-                let msg = {
-                    let mut d = self.data.borrow_mut();
-                    if d.rules.iter().any(|r| r.proc == name && r.act == act) {
-                        t!("Такое правило уже есть (страница «Правила»)", "This rule already exists ('Rules' page)", ja: "このルールはすでに存在します (「ルール」ページ)", pt: "Esta regra já existe (página 'Regras')", zh: "该规则已存在（「规则」页面）").to_string()
-                    } else {
-                        d.rules.push(store::Rule { proc: name.clone(), cpu: 25.0, secs: 60, act, hits: 0 });
-                        tf!("Правило добавлено: «{name}» — ЦП > 25% дольше 60 с", "Rule added: '{name}' - CPU > 25% for over 60 s", ja: "ルールを追加しました: '{name}' - CPU が 60 秒を超えて 25% 超", pt: "Regra adicionada: '{name}' - CPU > 25% por mais de 60 s", zh: "已添加规则：「{name}」——CPU 超过 25% 持续 60 秒以上")
-                    }
+                let (msg, dot) = if self.d.rules.iter().any(|r| r.proc == name && r.act == act) {
+                    (t!("Такое правило уже есть (страница «Правила»)", "This rule already exists ('Rules' page)", ja: "このルールはすでに存在します (「ルール」ページ)", pt: "Esta regra já existe (página 'Regras')", zh: "该规则已存在（「规则」页面）").to_string(), crate::look::DOT_WARN)
+                } else {
+                    self.d.rules.push(store::Rule { proc: name.clone(), cpu: 25.0, secs: 60, act, hits: 0 });
+                    (tf!("Правило добавлено: «{name}» — ЦП > 25% дольше 60 с", "Rule added: '{name}' - CPU > 25% for over 60 s", ja: "ルールを追加しました: '{name}' - CPU が 60 秒を超えて 25% 超", pt: "Regra adicionada: '{name}' - CPU > 25% por mais de 60 s", zh: "已添加规则：「{name}」——CPU 超过 25% 持续 60 秒以上"), crate::look::DOT_OK)
                 };
                 self.save_settings();
-                self.toast(&msg);
+                self.say(&msg, dot);
             }
             _ => {}
         }
     }
 
-    fn act_service(&self, row: &Row, act: Act) {
+    fn act_service(&mut self, row: &Row, act: Act) {
         let start = match act {
             Act::SvcStart => true,
             Act::SvcStop => false,
             _ => return,
         };
         let n = row.aux.clone();
-        self.toast(&match sys::service_ctl(&n, start) {
-            Ok(()) => tf!("Служба {n}: команда отправлена", "Service {n}: command sent", ja: "サービス {n}: コマンドを送信しました", pt: "Serviço {n}: comando enviado", zh: "服务 {n}：命令已发送"),
-            Err(5) => tf!("Служба {n}: отказано в доступе — запустите от администратора", "Service {n}: access denied - run as administrator", ja: "サービス {n}: アクセスが拒否されました。管理者として実行してください", pt: "Serviço {n}: acesso negado - execute como administrador", zh: "服务 {n}：拒绝访问——请以管理员身份运行"),
-            Err(e) => tf!("Служба {n}: ошибка Win32 {e}", "Service {n}: Win32 error {e}", ja: "サービス {n}: Win32 エラー {e}", pt: "Serviço {n}: erro Win32 {e}", zh: "服务 {n}：Win32 错误 {e}"),
-        });
+        let (text, dot) = match self.m.service_ctl(&n, start) {
+            Ok(()) => (tf!("Служба {n}: команда отправлена", "Service {n}: command sent", ja: "サービス {n}: コマンドを送信しました", pt: "Serviço {n}: comando enviado", zh: "服务 {n}：命令已发送"), if start { crate::look::DOT_OK } else { crate::look::DOT_BAD }),
+            Err(5) => (tf!("Служба {n}: отказано в доступе — запустите от администратора", "Service {n}: access denied - run as administrator", ja: "サービス {n}: アクセスが拒否されました。管理者として実行してください", pt: "Serviço {n}: acesso negado - execute como administrador", zh: "服务 {n}：拒绝访问——请以管理员身份运行"), crate::look::DOT_WARN),
+            Err(e) => (tf!("Служба {n}: ошибка Win32 {e}", "Service {n}: Win32 error {e}", ja: "サービス {n}: Win32 エラー {e}", pt: "Serviço {n}: erro Win32 {e}", zh: "服务 {n}：Win32 错误 {e}"), crate::look::DOT_WARN),
+        };
+        self.say(&text, dot);
     }
 
-    fn act_startup(&self, row: &Row, act: Act) {
+    fn act_startup(&mut self, row: &Row, act: Act) {
         let on = match act {
             Act::StartEnable => true,
             Act::StartDisable => false,
             Act::OpenDir => {
-                if let Some(p) = &row.icon_path { winrust_common::reveal(p); }
+                if let Some(p) = &row.icon_path {
+                    self.m.reveal(p);
+                }
                 return;
             }
             _ => return,
         };
-        let msg = {
-            let d = self.data.borrow();
-            match d.startup.iter().find(|s| s.key() == row.key) {
-                Some(it) => match startup::set_enabled(it, on) {
-                    Ok(()) => format!("«{}»: {}", it.name, if on { t!("включено", "enabled", ja: "有効", pt: "ativado", zh: "已启用") } else { t!("отключено — не будет запускаться при входе в Windows", "disabled - will not start with Windows", ja: "無効 - Windows と同時に起動しません", pt: "desativado - não vai iniciar com o Windows", zh: "已禁用——不会随 Windows 启动") }),
-                    Err(5) => tf!("«{}»: нужны права администратора", "'{}': administrator rights needed", ja: "'{}': 管理者権限が必要です", pt: "'{}': direitos de administrador necessários", zh: "「{}」：需要管理员权限", it.name),
-                    Err(e) => tf!("«{}»: ошибка Win32 {e}", "'{}': Win32 error {e}", ja: "'{}': Win32 エラー {e}", pt: "'{}': erro Win32 {e}", zh: "「{}」：Win32 错误 {e}", it.name),
-                },
-                None => return,
-            }
+        let (msg, dot) = match self.d.startup.iter().find(|s| s.key() == row.key) {
+            Some(it) => match self.m.startup_set(it, on) {
+                Ok(()) => (format!("«{}»: {}", it.name, if on { t!("включено", "enabled", ja: "有効", pt: "ativado", zh: "已启用") } else { t!("отключено — не будет запускаться при входе в Windows", "disabled - will not start with Windows", ja: "無効 - Windows と同時に起動しません", pt: "desativado - não vai iniciar com o Windows", zh: "已禁用——不会随 Windows 启动") }), crate::look::DOT_OK),
+                Err(5) => (tf!("«{}»: нужны права администратора", "'{}': administrator rights needed", ja: "'{}': 管理者権限が必要です", pt: "'{}': direitos de administrador necessários", zh: "「{}」：需要管理员权限", it.name), crate::look::DOT_WARN),
+                Err(e) => (tf!("«{}»: ошибка Win32 {e}", "'{}': Win32 error {e}", ja: "'{}': Win32 エラー {e}", pt: "'{}': erro Win32 {e}", zh: "「{}」：Win32 错误 {e}", it.name), crate::look::DOT_WARN),
+            },
+            None => return,
         };
-        self.data.borrow_mut().load_startup();
+        self.m.load_startup(&mut self.d);
         self.rebuild();
-        self.toast(&msg);
+        self.say(&msg, dot);
     }
 
-    fn act_boost(&self, row: &Row, act: Act) {
-        let on = match act {
-            Act::BoostOn => true,
-            Act::BoostOff => false,
-            _ => return,
-        };
-        let Some(id) = crate::boost::Id::from_key(&row.key) else { return };
-        if on && id == crate::boost::Id::Defender && !self.confirm(t!("Defender перестанет проверять кэши сборки и библиотеки игр (cargo, npm, pip, Steam, Epic…). Вредоносный файл в этих папках не будет найден при открытии. Включить?", "Defender will stop scanning build caches and game libraries (cargo, npm, pip, Steam, Epic…). A malicious file in those folders will not be caught when opened. Enable?", ja: "Defender はビルド キャッシュとゲーム ライブラリ (cargo、npm、pip、Steam、Epic…) のスキャンを停止します。これらのフォルダー内の悪意のあるファイルは、開いても検出されません。有効にしますか?", pt: "O Defender vai deixar de verificar caches de compilação e bibliotecas de jogos (cargo, npm, pip, Steam, Epic…). Um arquivo malicioso nessas pastas não será detectado ao ser aberto. Ativar?", zh: "Defender 将不再扫描编译缓存和游戏库（cargo、npm、pip、Steam、Epic…）。这些文件夹中的恶意文件在被打开时不会被拦截。要启用吗？")) {
+    /// Switches a thing of the Speed page (a profile, the cache, a tweak); the Defender one asks first.
+    pub fn boost_set(&mut self, id: boost::Id, on: bool, cx: &mut Cx) {
+        if on && id == boost::Id::Defender {
+            self.ask = Some(Ask::Boost(id));
+            cx.dialog(
+                TAG_BOOST,
+                Dialog::new(
+                    t!("Исключения Defender", "Defender exclusions", ja: "Defender の除外", pt: "Exclusões do Defender", zh: "Defender 排除项"),
+                    t!("Defender перестанет проверять кэши сборки и библиотеки игр (cargo, npm, pip, Steam, Epic…). Вредоносный файл в этих папках не будет найден при открытии. Включить?", "Defender will stop scanning build caches and game libraries (cargo, npm, pip, Steam, Epic…). A malicious file in those folders will not be caught when opened. Enable?", ja: "Defender はビルド キャッシュとゲーム ライブラリ (cargo、npm、pip、Steam、Epic…) のスキャンを停止します。これらのフォルダー内の悪意のあるファイルは、開いても検出されません。有効にしますか?", pt: "O Defender vai deixar de verificar caches de compilação e bibliotecas de jogos (cargo, npm, pip, Steam, Epic…). Um arquivo malicioso nessas pastas não será detectado ao ser aberto. Ativar?", zh: "Defender 将不再扫描编译缓存和游戏库（cargo、npm、pip、Steam、Epic…）。这些文件夹中的恶意文件在被打开时不会被拦截。要启用吗？"),
+                    &[t!("Отмена", "Cancel", ja: "キャンセル", pt: "Cancelar", zh: "取消"), t!("Включить", "Enable", ja: "有効にする", pt: "Ativar", zh: "启用")],
+                )
+                .icon(crate::look::I_SHIELD, true),
+            );
             return;
         }
-        // донор токена для программ, которые профиль запустит обратно: sihost.exe работает в каждом сеансе без повышения
-        let donors: Vec<u32> = self.data.borrow().procs.iter().filter(|p| p.name.eq_ignore_ascii_case("sihost.exe")).map(|p| p.pid).collect();
-        match crate::boost::start(id, on, donors) {
-            Ok(()) => self.toast(&tf!("{}: выполняется…", "{}: running…", ja: "{}: 実行中…", pt: "{}: executando…", zh: "{}：正在运行…", id.title())),
-            Err(e) => self.toast(&format!("{}: {e}", id.title())),
+        self.run_boost(id, on);
+    }
+
+    fn run_boost(&mut self, id: boost::Id, on: bool) {
+        // the donor of the token for programs the profile starts back: sihost.exe runs in every session, not elevated
+        let donors: Vec<u32> = self.d.procs.iter().filter(|p| p.name.eq_ignore_ascii_case("sihost.exe")).map(|p| p.pid).collect();
+        match self.m.boost_start(id, on, donors) {
+            Ok(()) => self.say(&tf!("{}: выполняется…", "{}: running…", ja: "{}: 実行中…", pt: "{}: executando…", zh: "{}：正在运行…", id.title()), crate::look::DOT_OK),
+            Err(e) => self.say(&format!("{}: {e}", id.title()), crate::look::DOT_WARN),
         }
         self.rebuild();
     }
 
-    fn confirm(&self, text: &str) -> bool {
-        let p = nwg::MessageParams { title: t!("Подтверждение", "Confirmation", ja: "確認", pt: "Confirmação", zh: "确认"), content: text, buttons: nwg::MessageButtons::YesNo, icons: nwg::MessageIcons::Warning };
-        nwg::modal_message(&self.win, &p) == nwg::MessageChoice::Yes
+    pub fn boost_on(&self, id: boost::Id) -> bool {
+        self.speed.iter().find(|s| s.id == id).is_some_and(|s| s.state == boost::State::On)
     }
 
-    fn export(&self) {
-        let ui = self.ui.borrow();
-        if !ui.has_table() {
-            drop(ui);
-            return self.toast(t!("На этой странице нечего экспортировать", "Nothing to export on this page", ja: "このページにはエクスポートするものがありません", pt: "Nada para exportar nesta página", zh: "此页面没有可导出的内容"));
+    fn export(&mut self) {
+        if !self.page_has_search() {
+            return self.say(t!("На этой странице нечего экспортировать", "Nothing to export on this page", ja: "このページにはエクスポートするものがありません", pt: "Nada para exportar nesta página", zh: "此页面没有可导出的内容"), crate::look::DOT_WARN);
         }
         let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
         let mut out = String::from("\u{feff}");
-        out += &columns(ui.page).iter().map(|c| esc(c.title)).collect::<Vec<_>>().join(";");
-        for r in &ui.rows {
+        out += &columns(self.page).iter().map(|c| esc(c.title)).collect::<Vec<_>>().join(";");
+        for r in &self.rows {
             out += "\r\n";
             out += &r.cells.iter().map(|c| esc(c)).collect::<Vec<_>>().join(";");
         }
         let (y, mo, d, h, mi, s) = sys::local_time();
-        let dir = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from).unwrap_or_default().join("Desktop");
-        let path = dir.join(format!("rtaskmgr-{}-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}.csv", page_title(ui.page)));
-        drop(ui);
-        match std::fs::write(&path, out) {
-            Ok(()) => self.toast(&tf!("Сохранено: {}", "Saved: {}", ja: "保存しました: {}", pt: "Salvo: {}", zh: "已保存：{}", path.display())),
-            Err(e) => self.toast(&tf!("Не удалось сохранить CSV: {e}", "Could not save CSV: {e}", ja: "CSV を保存できませんでした: {e}", pt: "Não foi possível salvar o CSV: {e}", zh: "无法保存 CSV：{e}")),
+        let file = format!("rtaskmgr-{}-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}.csv", page_file(self.page));
+        match self.m.export(&file, &out) {
+            Ok(path) => self.say(&tf!("Сохранено: {}", "Saved: {}", ja: "保存しました: {}", pt: "Salvo: {}", zh: "已保存：{}", path), crate::look::DOT_OK),
+            Err(e) => self.say(&tf!("Не удалось сохранить CSV: {e}", "Could not save CSV: {e}", ja: "CSV を保存できませんでした: {e}", pt: "Não foi possível salvar o CSV: {e}", zh: "无法保存 CSV：{e}"), crate::look::DOT_WARN),
         }
     }
 
-    // ================= окно, тема, настройки =================
-    pub fn apply_theme(&self) {
-        let dark = {
-            let d = self.data.borrow();
-            match d.cfg.theme {
-                0 => false,
-                1 => true,
-                _ => sys::system_dark(),
-            }
+    // ---------------------------------------------------------------------------------------------------------------
+    // selection and keys of the tables
+
+    /// Selects row `i` and asks for it to be brought into view.
+    pub fn select_at(&mut self, i: usize) {
+        if let Some(r) = self.rows.get(i) {
+            self.sel = Some(r.key.clone());
+            self.list.cursor = Some(i);
+            self.reveal = Some(i);
+        }
+    }
+
+    fn move_sel(&mut self, vk: u32) -> bool {
+        let n = self.rows.len();
+        if n == 0 || !self.page_has_search() {
+            return false;
+        }
+        let cur = self.sel.as_deref().and_then(|k| self.row_index(k));
+        let step = (((self.size.1 - 200.0) / ROW_H) as usize).max(1);
+        let to = match vk {
+            0x28 => cur.map_or(0, |c| (c + 1).min(n - 1)),
+            0x26 => cur.map_or(0, |c| c.saturating_sub(1)),
+            0x22 => cur.map_or(0, |c| (c + step).min(n - 1)),
+            0x21 => cur.map_or(0, |c| c.saturating_sub(step)),
+            0x24 => 0,
+            0x23 => n - 1,
+            _ => return false,
         };
-        let th = theme(dark);
-        self.ui.borrow_mut().th = th;
-        if let Some(h) = self.win.handle.hwnd() {
-            sys::set_dark_titlebar(h, dark);
+        self.select_at(to);
+        true
+    }
+
+    fn on_search_edited(&mut self) {
+        self.proc_sc = Scroll::default();
+        self.list.scroll = Scroll::default();
+        self.rebuild();
+    }
+
+    /// What `Delete` means on this page.
+    fn delete_key(&mut self, cx: &mut Cx) -> bool {
+        match self.page {
+            Page::Processes | Page::Details => self.do_act(Act::EndTask, cx),
+            Page::Rules => self.do_act(Act::RuleDelete, cx),
+            _ => return false,
         }
-        unsafe {
-            let old = self.edit_brush.replace(winapi::um::wingdi::CreateSolidBrush(th.panel.c()) as isize);
-            if old != 0 {
-                winapi::um::wingdi::DeleteObject(old as _);
+        true
+    }
+
+    /// The buttons of the head of this page: what each does, its label, its icon, whether it can be pressed.
+    pub fn head_actions(&self) -> Vec<(HeadAct, &'static str, &'static str, bool)> {
+        let has = self.sel.is_some();
+        let run = (HeadAct::Do(Act::RunTask), t!("Запустить новую задачу", "Run new task", ja: "新しいタスクの実行", pt: "Executar nova tarefa", zh: "运行新任务"), crate::look::I_PLUS, true);
+        let end = (HeadAct::Do(Act::EndTask), t!("Снять задачу", "End task", ja: "タスクの終了", pt: "Finalizar tarefa", zh: "结束任务"), crate::look::I_END, has);
+        let more = (HeadAct::More, "", crate::look::I_MORE, true);
+        let running = t!("Выполняется", "Running", ja: "実行中", pt: "Em execução", zh: "正在运行");
+        let svc_running = self.selected_row().is_some_and(|r| r.cells.get(3).is_some_and(|c| c == running));
+        match self.page {
+            Page::Processes => vec![run, end, (HeadAct::Do(Act::Efficiency), t!("Режим эффективности", "Efficiency mode", ja: "効率モード", pt: "Modo de eficiência", zh: "能效模式"), crate::look::I_LEAF, has), more],
+            Page::Details => vec![run, end, more],
+            Page::Services => vec![
+                (HeadAct::Do(Act::SvcStart), t!("Запустить", "Start", ja: "開始", pt: "Iniciar", zh: "启动"), crate::look::I_START, has && !svc_running),
+                (HeadAct::Do(Act::SvcStop), t!("Остановить", "Stop", ja: "停止", pt: "Parar", zh: "停止"), crate::look::I_STOP, has && svc_running),
+                more,
+            ],
+            Page::Startup | Page::Users => vec![more],
+            Page::History => vec![(HeadAct::Do(Act::ClearHistory), t!("Удалить историю использования", "Delete usage history", ja: "使用履歴を削除", pt: "Excluir histórico de uso", zh: "删除使用历史记录"), crate::look::I_TRASH, !self.d.hist.is_empty()), more],
+            Page::Rules => vec![(HeadAct::Do(Act::RuleDelete), t!("Удалить правило", "Delete rule", ja: "ルールを削除", pt: "Excluir regra", zh: "删除规则"), crate::look::I_TRASH, has), more],
+            _ => vec![],
+        }
+    }
+
+    fn head_button(&mut self, k: usize, cx: &mut Cx) {
+        let acts = self.head_actions();
+        let Some(&(a, _, _, enabled)) = acts.get(k) else { return };
+        match a {
+            HeadAct::Do(act) if !enabled => {
+                let _ = act;
+                self.say(t!("Сначала выберите строку в списке", "Select a row in the list first", ja: "先にリストで行を選択してください", pt: "Selecione primeiro uma linha na lista", zh: "请先在列表中选择一行"), crate::look::DOT_WARN);
+            }
+            HeadAct::Do(act) => self.do_act(act, cx),
+            HeadAct::More => {
+                let items = self.more_menu();
+                let b = self.head_rects.get(k).copied().unwrap_or(Rect::new(self.size.0 - 200.0, 15.0, 34.0, 34.0));
+                // the menu's right edge is the button's (the mockup: `x = right - 268`)
+                cx.menu(TAG_MORE_MENU, items, Rect::new(b.x + b.w - 232.0, b.y, 1.0, b.h + 2.0));
             }
         }
-        set_menu_theme(dark);
-        self.invalidate();
-        if let Some(h) = self.search.handle.hwnd() {
-            unsafe { InvalidateRect(h, null(), 1) };
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // what a click on an item is
+
+    fn on_click(&mut self, id: Id, b: Button, x: f32, y: f32, cx: &mut Cx) {
+        if (ID_NAV..ID_NAV + NAV_PAGES.len() as Id).contains(&id) {
+            return self.go_page(NAV_PAGES[(id - ID_NAV) as usize]);
+        }
+        match id {
+            ID_DEMO => {
+                match self.demo.as_ref().map(|d| d.hook) {
+                    Some(crate::demo::Hook::ProcessMenu) => {
+                        // where the design puts it: (520, 300) of its stage, the window standing 40 in from its edge
+                        let items = self.row_menu();
+                        cx.menu(TAG_ROW_MENU, items, Rect::new(480.0, 260.0, 1.0, 0.0));
+                    }
+                    Some(crate::demo::Hook::EndTree) => self.do_act(Act::EndTree, cx),
+                    Some(crate::demo::Hook::CloseAsk) => {
+                        self.close(cx);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            ID_SEARCH => return,
+            ID_ALERT_SHOW => {
+                let pid = self.alert_key();
+                self.sorts.insert(Page::Processes, (7, true));
+                self.rebuild();
+                if let Some(i) = pid.and_then(|p| self.rows.iter().position(|r| r.pids.contains(&p))) {
+                    self.select_at(i);
+                }
+                return;
+            }
+            ID_ALERT_END => {
+                if let Some(pid) = self.alert_key() {
+                    if let Some(i) = self.rows.iter().position(|r| r.pids.contains(&pid)) {
+                        self.select_at(i);
+                    }
+                    self.do_act(Act::EndTask, cx);
+                }
+                return;
+            }
+            ID_ALERT_HIDE => {
+                if let Some(pid) = self.alert_key() {
+                    let name = self.alert_name(pid);
+                    self.alert_off.insert(name);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if (ID_ACT..ID_ACT + 8).contains(&id) {
+            return self.head_button((id - ID_ACT) as usize, cx);
+        }
+        match self.page {
+            Page::Processes => self.click_processes(id, b, x, y, cx),
+            Page::Performance => {
+                if (ID_PERF..ID_PERF + 32).contains(&id) {
+                    let kinds: Vec<PerfKind> = self.perf_list().iter().map(|i| i.kind).collect();
+                    if let Some(&k) = kinds.get((id - ID_PERF) as usize) {
+                        self.perf_sel = k;
+                        self.d.want_gpu_temp = matches!(k, PerfKind::Gpu(_)); // the temperature at once, not at the next tick
+                    }
+                }
+            }
+            Page::Users => self.click_users(id, cx),
+            Page::Boost => self.click_speed(id, cx),
+            Page::Settings => self.click_settings(id, cx),
+            Page::Insights => {}
+            _ => self.click_table(id, b, x, y, cx),
         }
     }
 
-    pub fn save_settings(&self) {
-        let ui = self.ui.borrow();
-        let mut d = self.data.borrow_mut();
-        d.cfg.view = NAV.iter().position(|n| n.0 == ui.page).unwrap_or(0);
-        let (sc, sd) = ui.sort_of(Page::Processes);
-        d.cfg.sort = sc;
-        d.cfg.desc = sd;
-        d.cfg.rules = d.rules.clone();
-        d.cfg.etw = d.etw.is_some();
-        let (p, s) = (self.win.position(), self.win.size());
-        if p.0 > -10000 && s.0 > 100 {
-            d.cfg.pos = p;
-            d.cfg.size = s;
+    fn click_table(&mut self, id: Id, b: Button, x: f32, y: f32, cx: &mut Cx) {
+        if let Some(ColItem::Title(k)) = col_of(ID_COLS, id) {
+            let model = table_spec(self.page).get(k).map_or(0, |s| s.0);
+            if model == SWITCH_COL {
+                return;
+            }
+            let cur = self.sort_of(self.page);
+            let numeric = columns(self.page).get(model).is_some_and(|c| c.align == Align::Right);
+            let ns = if cur.0 == model { (model, !cur.1) } else { (model, numeric) };
+            self.sorts.insert(self.page, ns);
+            self.cols_page = None;
+            self.rebuild();
+            return;
         }
-        store::save(&d.cfg);
-    }
-
-    pub fn show_window(&self) {
-        self.win.set_visible(true);
-        if let Some(h) = self.win.handle.hwnd() {
-            unsafe {
-                ShowWindow(h, SW_RESTORE);
-                SetForegroundWindow(h);
+        if (ID_SWITCH..ID_SWITCH + 10_000).contains(&id) {
+            let i = (id - ID_SWITCH) as usize;
+            self.select_at(i);
+            let on = self.rows.get(i).is_some_and(|r| self.d.startup.iter().find(|s| s.key() == r.key).is_some_and(|s| s.enabled));
+            return self.do_act(if on { Act::StartDisable } else { Act::StartEnable }, cx);
+        }
+        if let Some(i) = row_of(ID_TABLE, id).filter(|&i| i < self.rows.len()) {
+            self.select_at(i);
+            if b == Button::Right {
+                let items = self.row_menu();
+                cx.menu(TAG_ROW_MENU, items, Rect::new(x, y, 1.0, 0.0));
             }
         }
-        // up to 5 s old from the tray: fresh numbers right away
-        self.last_tick.set(Instant::now());
-        self.tick();
     }
 
-    /// The first close: keep running in the tray, or quit? `None` = cancelled, the window stays.
-    pub fn ask_tray(&self) -> Option<bool> {
-        let text = t!(
-            "Оставить диспетчер задач работать в трее при закрытии окна?\n\nВ трее он продолжает собирать историю и применять правила. Изменить это можно в настройках или в меню значка в трее.",
-            "Keep Task Manager running in the tray when you close the window?\n\nIn the tray it keeps collecting history and applying rules. You can change this later in Settings or in the tray icon's menu.",
-            ja: "ウィンドウを閉じたときにタスク マネージャーをトレイで動作させたままにしますか?\n\nトレイでは履歴の収集とルールの適用を続けます。この設定は後で [設定] またはトレイ アイコンのメニューで変更できます。",
-            pt: "Manter o Gerenciador de Tarefas em execução na bandeja ao fechar a janela?\n\nNa bandeja ele continua coletando o histórico e aplicando as regras. Você pode mudar isso depois em Configurações ou no menu do ícone da bandeja.",
-            zh: "关闭窗口时让任务管理器继续在托盘中运行吗？\n\n在托盘中它会继续收集历史记录并执行规则。以后可以在设置或托盘图标的菜单中更改。"
-        );
-        let title = t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器");
-        let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-        let h = self.win.handle.hwnd().unwrap_or(std::ptr::null_mut());
-        let to_tray = match unsafe { MessageBoxW(h, w(text).as_ptr(), w(title).as_ptr(), MB_YESNOCANCEL | MB_ICONQUESTION) } {
-            IDYES => true,
-            IDNO => false,
-            _ => return None,
+    fn click_processes(&mut self, id: Id, b: Button, x: f32, y: f32, cx: &mut Cx) {
+        if (ID_PHEAD..ID_PHEAD + 8).contains(&id) {
+            let col = (id - ID_PHEAD) as usize;
+            if col == 1 || col == 5 {
+                return; // the status is not a measure, and the network one needs rights the page cannot give itself
+            }
+            let cur = self.sort_of(Page::Processes);
+            let ns = if cur.0 == col { (col, !cur.1) } else { (col, col != 0) };
+            self.sorts.insert(Page::Processes, ns);
+            self.rebuild();
+            return self.save_settings();
+        }
+        if (ID_CHEV..ID_CHEV + 100_000).contains(&id) {
+            if let Some(k) = self.rows.get((id - ID_CHEV) as usize).map(|r| r.key.clone()) {
+                self.toggle_expand(&k);
+            }
+            return;
+        }
+        // a row, or the pill of what is wrong with it (named on top of the row so that its hint shows)
+        let row = if (ID_PROW..ID_PROW + 20_000).contains(&id) {
+            Some((id - ID_PROW) as usize)
+        } else {
+            (ID_PROW + 20_000..ID_PROW + 40_000).contains(&id).then(|| (id - ID_PROW - 20_000) as usize)
         };
-        {
-            let mut d = self.data.borrow_mut();
-            d.cfg.to_tray = to_tray;
-            d.cfg.tray_asked = true;
+        if let Some(i) = row {
+            if i >= self.rows.len() {
+                return;
+            }
+            self.select_at(i);
+            if b == Button::Right {
+                let items = self.row_menu();
+                cx.menu(TAG_ROW_MENU, items, Rect::new(x, y, 1.0, 0.0));
+            } else if let Some(r) = self.selected_row().filter(|r| r.sev > 0) {
+                // the mockup says what is wrong with a process the moment it is picked
+                let text = format!("{}: {}", r.cells.first().cloned().unwrap_or_default(), crate::draw::tip_line(&r.tip));
+                let dot = if r.sev >= 3 { crate::look::DOT_BAD } else { crate::look::DOT_WARN };
+                self.say(&text, dot);
+            }
         }
-        Some(to_tray)
     }
 
-    pub fn quit(&self) {
-        self.save_settings();
-        if let Some(s) = self.data.borrow_mut().etw.take() {
-            crate::net::stop(s);
+    fn click_users(&mut self, id: Id, cx: &mut Cx) {
+        if (ID_UMET..ID_UMET + 3).contains(&id) {
+            self.u_metric = [UMetric::Mem, UMetric::Cpu, UMetric::Disk][(id - ID_UMET) as usize];
+            return;
         }
-        self.tray.set_visibility(false);
-        nwg::stop_thread_dispatch();
+        let users = self.users();
+        if (ID_USER..ID_USER + 20).contains(&id) {
+            if let Some(u) = users.get((id - ID_USER) as usize)
+                && !self.u_open.remove(&u.key)
+            {
+                self.u_open.insert(u.key.clone());
+            }
+            return;
+        }
+        if (ID_UBTN..ID_UBTN + 40).contains(&id) {
+            // signing someone out or messaging them is not something this program does (yet)
+            return self.say(t!("Это пока недоступно", "This is not available yet", ja: "この機能はまだ利用できません", pt: "Isso ainda não está disponível", zh: "此功能暂不可用"), crate::look::DOT_WARN);
+        }
+        if (ID_UEND..ID_UEND + 60).contains(&id) {
+            let k = (id - ID_UEND) as usize;
+            let pids: Vec<u32> = users.iter().filter(|u| self.u_open.contains(&u.key)).flat_map(|u| u.apps.iter()).nth(k).map(|a| a.pids.clone()).unwrap_or_default();
+            if pids.is_empty() {
+                return;
+            }
+            let name = self.d.procs.iter().find(|p| pids.contains(&p.pid)).map(|p| p.name.clone()).unwrap_or_default();
+            let row = Row { pids, cells: vec![name], ..Row::default() };
+            self.act_process(&row, Act::EndTask, cx);
+        }
+    }
+
+    fn click_speed(&mut self, id: Id, cx: &mut Cx) {
+        use boost::Id as B;
+        if (ID_PROF..ID_PROF + 3).contains(&id) {
+            let pick = (id - ID_PROF) as usize;
+            let (game, work) = (self.boost_on(B::Game), self.boost_on(B::Work));
+            let cur = if game { 1 } else if work { 2 } else { 0 };
+            if pick == cur {
+                return;
+            }
+            match pick {
+                0 => {
+                    if game {
+                        self.run_boost(B::Game, false);
+                    }
+                    if work {
+                        self.run_boost(B::Work, false);
+                    }
+                    self.say(t!("Профиль выключен · всё запущено снова", "Profile off · everything was started again", ja: "プロファイルをオフにしました · すべて再開しました", pt: "Perfil desligado · tudo foi iniciado de novo", zh: "配置已关闭 · 一切已重新启动"), crate::look::DOT_OK);
+                }
+                1 => self.boost_set(B::Game, true, cx),
+                _ => self.boost_set(B::Work, true, cx),
+            }
+            return;
+        }
+        match id {
+            ID_MEM_CLEAR => self.boost_set(B::MemNow, true, cx),
+            ID_MEM_AUTO => {
+                let on = !self.boost_on(B::MemAuto);
+                self.boost_set(B::MemAuto, on, cx);
+            }
+            _ if (ID_TWEAK..ID_TWEAK + 20).contains(&id) => {
+                let k = (id - ID_TWEAK) as usize;
+                if k.is_multiple_of(2) {
+                    let i = k / 2;
+                    if !self.tw_open.remove(&i) {
+                        self.tw_open.insert(i);
+                    }
+                } else if let Some(t) = crate::draw::TWEAKS.get(k / 2) {
+                    let (id, on) = (t.id, !self.boost_on(t.id));
+                    self.boost_set(id, on, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click_settings(&mut self, id: Id, cx: &mut Cx) {
+        if (ID_SETSEG..ID_SETSEG + 3).contains(&id) {
+            return self.do_act(Act::SetTheme([0, 1, 2][(id - ID_SETSEG) as usize]), cx);
+        }
+        match id {
+            i if i == ID_SETSW + 1 => self.do_act(Act::ToggleTray, cx),
+            i if i == ID_SETSW + 2 => self.do_act(Act::ToggleAutostart, cx),
+            i if i == ID_SETSW + 3 => self.do_act(Act::ToggleEtw, cx),
+            i if i == ID_SETSW + 4 => self.do_act(Act::ToggleGpuTemp, cx),
+            ID_SETBTN => self.do_act(Act::RelaunchAdmin, cx),
+            _ => {}
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // the alert of a high-risk process
+
+    /// The pid of the process the banner is about: the first one rated High that was not dismissed.
+    pub fn alert_key(&self) -> Option<u32> {
+        if self.page != Page::Processes {
+            return None;
+        }
+        self.d.procs.iter().filter(|p| p.reasons.iter().map(|r| r.sev).max().unwrap_or(0) >= 3).find(|p| !self.alert_off.contains(&p.name.to_lowercase())).map(|p| p.pid)
+    }
+
+    pub fn alert_name(&self, pid: u32) -> String {
+        self.d.procs.iter().find(|p| p.pid == pid).map(|p| p.name.to_lowercase()).unwrap_or_default()
+    }
+
+    pub fn perf_list(&self) -> Vec<PerfItem<'_>> {
+        match &self.demo {
+            Some(_) => crate::demo::perf_items(&self.d),
+            None => perf_items(&self.d),
+        }
+    }
+
+    pub fn users(&self) -> Vec<crate::draw::UserM> {
+        match &self.demo {
+            Some(dm) => dm.users.clone(),
+            None => crate::draw::users_of(&self.d),
+        }
     }
 }
 
-/// pid + все его потомки (по таблице pid -> родитель).
+/// pid + all of its descendants (by the table pid -> parent).
 pub fn descendants(parent_of: &HashMap<u32, u32>, roots: &[u32]) -> Vec<u32> {
     let mut out: Vec<u32> = roots.to_vec();
     let mut i = 0;
@@ -1298,63 +1246,324 @@ pub fn descendants(parent_of: &HashMap<u32, u32>, roots: &[u32]) -> Vec<u32> {
     out
 }
 
-fn build_menu(items: &[MI], acts: &mut Vec<Act>) -> HMENU {
-    unsafe {
-        let m = CreatePopupMenu();
-        for it in items {
-            match it {
-                MI::Item(t, a) => {
-                    acts.push(*a);
-                    AppendMenuW(m, MF_STRING, acts.len(), wide(t).as_ptr());
+impl App for Tm {
+    fn title(&self) -> String {
+        t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器").into()
+    }
+
+    fn min_size(&self) -> (f32, f32) {
+        (860.0, 560.0)
+    }
+
+    fn caption_height(&self) -> f32 {
+        crate::draw::HEAD_H
+    }
+
+    fn start(&mut self, hwnd: isize) {
+        self.hwnd = hwnd;
+        self.apply_theme();
+        if !self.is_demo() {
+            self.tick(); // the first numbers, so that the first frame has a table
+            self.m.tray_add(hwnd);
+        }
+        self.refresh_tray_menu();
+        // the timer needs a `Cx`: the first message gives it one
+        winrust_ui::window::post(hwnd, MSG_START, 0, 0);
+    }
+
+    fn start_hidden(&self) -> bool {
+        self.hidden_start
+    }
+
+    fn demo_clicks(&self) -> Vec<Id> {
+        self.demo_click_ids()
+    }
+
+    fn draw(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
+        self.paint(c, f);
+    }
+
+    fn click(&mut self, id: Id, b: Button, x: f32, y: f32, cx: &mut Cx) {
+        self.on_click(id, b, x, y, cx);
+        cx.invalidate();
+    }
+
+    fn down(&mut self, id: Id, _b: Button, x: f32, y: f32, cx: &mut Cx) {
+        let now = now_ms();
+        if id == ID_SEARCH {
+            self.search.mouse_down(x, cx.mods.shift, now);
+        } else if id == scroll::bar_id(ID_PROC) {
+            scroll::bar_down(&mut self.proc_sc, y, now);
+        } else if id == scroll::bar_id(ID_TABLE) {
+            scroll::bar_down(&mut self.list.scroll, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_USERS) {
+            scroll::bar_down(&mut self.u_sc, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_SPEED) {
+            scroll::bar_down(&mut self.speed_sc, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_SET) {
+            scroll::bar_down(&mut self.set_sc, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_INS) {
+            scroll::bar_down(&mut self.ins_sc, y, now);
+        } else if let Some(ColItem::Grip(k)) = col_of(ID_COLS, id) {
+            self.cols.grip_down(k, x);
+        }
+        cx.invalidate();
+    }
+
+    fn drag(&mut self, id: Id, x: f32, y: f32, cx: &mut Cx) {
+        let now = now_ms();
+        if id == ID_SEARCH {
+            self.search.mouse_drag(x, now);
+        } else if id == scroll::bar_id(ID_PROC) {
+            scroll::bar_drag(&mut self.proc_sc, y, now);
+        } else if id == scroll::bar_id(ID_TABLE) {
+            scroll::bar_drag(&mut self.list.scroll, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_USERS) {
+            scroll::bar_drag(&mut self.u_sc, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_SPEED) {
+            scroll::bar_drag(&mut self.speed_sc, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_SET) {
+            scroll::bar_drag(&mut self.set_sc, y, now);
+        } else if id == scroll::bar_id(ID_SCROLL_INS) {
+            scroll::bar_drag(&mut self.ins_sc, y, now);
+        } else if matches!(col_of(ID_COLS, id), Some(ColItem::Grip(_))) {
+            self.cols.grip_drag(x);
+        }
+        cx.invalidate();
+    }
+
+    fn release(&mut self, id: Id, cx: &mut Cx) {
+        if id == ID_SEARCH {
+            self.search.mouse_up();
+        } else if id == scroll::bar_id(ID_PROC) {
+            scroll::bar_up(&mut self.proc_sc);
+        } else if id == scroll::bar_id(ID_TABLE) {
+            scroll::bar_up(&mut self.list.scroll);
+        } else if id == scroll::bar_id(ID_SCROLL_USERS) {
+            scroll::bar_up(&mut self.u_sc);
+        } else if id == scroll::bar_id(ID_SCROLL_SPEED) {
+            scroll::bar_up(&mut self.speed_sc);
+        } else if id == scroll::bar_id(ID_SCROLL_SET) {
+            scroll::bar_up(&mut self.set_sc);
+        } else if id == scroll::bar_id(ID_SCROLL_INS) {
+            scroll::bar_up(&mut self.ins_sc);
+        } else if matches!(col_of(ID_COLS, id), Some(ColItem::Grip(_))) {
+            self.cols.grip_up();
+        }
+        cx.invalidate();
+    }
+
+    fn double(&mut self, id: Id, _cx: &mut Cx) {
+        if self.page == Page::Processes
+            && (ID_PROW..ID_PROW + 20_000).contains(&id)
+            && let Some(k) = self.rows.get((id - ID_PROW) as usize).filter(|r| r.expandable).map(|r| r.key.clone())
+        {
+            self.toggle_expand(&k);
+        }
+    }
+
+    fn wheel(&mut self, _id: Option<Id>, _dx: f32, dy: f32, _m: Mods, cx: &mut Cx) {
+        let now = now_ms();
+        let p = cx.pointer;
+        match self.page {
+            Page::Processes => scroll::wheel(&mut self.proc_sc, p, dy, ROW_H, now),
+            Page::Users => scroll::wheel(&mut self.u_sc, p, dy, 56.0, now),
+            Page::Boost => scroll::wheel(&mut self.speed_sc, p, dy, 60.0, now),
+            Page::Settings => scroll::wheel(&mut self.set_sc, p, dy, 68.0, now),
+            Page::Insights => scroll::wheel(&mut self.ins_sc, p, dy, 60.0, now),
+            Page::Performance => false,
+            _ => scroll::wheel(&mut self.list.scroll, p, dy, ROW_H, now),
+        };
+        cx.invalidate();
+    }
+
+    fn key(&mut self, vk: u32, m: Mods, cx: &mut Cx) -> bool {
+        const ESC: u32 = 0x1B;
+        const DEL: u32 = 0x2E;
+        const F5: u32 = 0x74;
+        const F: u32 = 0x46;
+        const LEFT: u32 = 0x25;
+        const RIGHT: u32 = 0x27;
+        let now = now_ms();
+        if cx.focus == Some(ID_SEARCH) && self.page_has_search() {
+            match field::key(&mut self.search, cx, vk, m, now) {
+                Ev::Edited => {
+                    self.on_search_edited();
+                    cx.invalidate();
+                    return true;
                 }
-                MI::Check(t, a, on) => {
-                    acts.push(*a);
-                    AppendMenuW(m, MF_STRING | if *on { MF_CHECKED } else { 0 }, acts.len(), wide(t).as_ptr());
+                Ev::Esc => {
+                    if !self.search.text.is_empty() {
+                        self.search.set_text("");
+                        self.on_search_edited();
+                    }
+                    cx.invalidate();
+                    return true;
                 }
-                MI::Sep => {
-                    AppendMenuW(m, MF_SEPARATOR, 0, null());
-                }
-                MI::Sub(t, sub) => {
-                    let h = build_menu(sub, acts);
-                    AppendMenuW(m, MF_POPUP, h as usize, wide(t).as_ptr());
+                Ev::Ignored => {}
+                _ => {
+                    cx.invalidate();
+                    return true;
                 }
             }
         }
-        m
+        if m.ctrl && vk == F && self.page_has_search() {
+            cx.focus(ID_SEARCH);
+            cx.invalidate();
+            return true;
+        }
+        let used = match vk {
+            ESC => self.sel.take().is_some(),
+            DEL => self.delete_key(cx),
+            F5 => {
+                self.tick();
+                true
+            }
+            LEFT | RIGHT if self.page == Page::Processes => {
+                if let Some((open, expandable, key)) = self.selected_row().map(|r| (r.expanded, r.expandable, r.key.clone()))
+                    && expandable
+                    && (vk == RIGHT) != open
+                {
+                    self.toggle_expand(&key);
+                    true
+                } else {
+                    self.selected_row().is_some()
+                }
+            }
+            _ => self.move_sel(vk),
+        };
+        if used {
+            cx.invalidate();
+        }
+        used
+    }
+
+    fn text(&mut self, s: &str, cx: &mut Cx) {
+        if cx.focus == Some(ID_SEARCH) && self.page_has_search() {
+            field::text(&mut self.search, s, now_ms());
+            self.on_search_edited();
+            cx.invalidate();
+        }
+    }
+
+    fn command(&mut self, tag: u32, choice: usize, cx: &mut Cx) {
+        match tag {
+            TAG_ROW_MENU | TAG_MORE_MENU => {
+                if let Some(&a) = self.menu_acts.get(choice) {
+                    self.do_act(a, cx);
+                }
+            }
+            TAG_END => {
+                if choice == 1
+                    && let Some(Ask::End(act, pids)) = self.ask.take()
+                {
+                    self.run_process_act(act, &pids, cx);
+                }
+                self.ask = None;
+            }
+            TAG_BOOST => {
+                if choice == 1
+                    && let Some(Ask::Boost(id)) = self.ask.take()
+                {
+                    self.run_boost(id, true);
+                }
+                self.ask = None;
+            }
+            TAG_TRAY => {
+                // "keep it in the tray when the window is closed?": 0 cancel, 1 quit, 2 keep
+                if choice >= 1 {
+                    self.d.cfg.to_tray = choice == 2;
+                    self.d.cfg.tray_asked = true;
+                    self.refresh_tray_menu();
+                    if choice == 2 {
+                        self.hide_to_tray();
+                    } else {
+                        self.quitting = true;
+                        cx.close_window();
+                    }
+                }
+            }
+            _ => {}
+        }
+        cx.invalidate();
+    }
+
+    fn message(&mut self, msg: u32, wp: usize, _lp: isize, cx: &mut Cx) {
+        match msg {
+            MSG_START => {
+                if !self.hidden_start {
+                    cx.invalidate();
+                }
+                cx.wake_in(if self.hidden_start { 5000 } else { 1000 });
+            }
+            MSG_TRAY_SHOW | MSG_HOTKEY => self.show_window(cx),
+            MSG_TRAY_CMD => {
+                let act = match wp {
+                    1 => Act::ShowWindow,
+                    2 => Act::ToggleTray,
+                    3 => Act::ToggleAutostart,
+                    4 => Act::ToggleEtw,
+                    5 => Act::RelaunchAdmin,
+                    6 => Act::Exit,
+                    _ => return,
+                };
+                self.do_act(act, cx);
+                cx.invalidate();
+            }
+            _ => {}
+        }
+    }
+
+    fn wake(&mut self, cx: &mut Cx) {
+        // a window shown from outside (not by us) is not "away" any more; one that was hidden or minimized is
+        self.away = self.hidden();
+        self.tick();
+        if !self.away {
+            cx.invalidate();
+        }
+        cx.wake_in(if self.away { 5000 } else { 1000 });
+    }
+
+    fn close(&mut self, cx: &mut Cx) -> bool {
+        if self.quitting {
+            return self.finish();
+        }
+        let (asked, to_tray) = (self.d.cfg.tray_asked, self.d.cfg.to_tray);
+        if !asked {
+            // the first close asks: keep it in the tray, or quit?
+            cx.dialog(
+                TAG_TRAY,
+                Dialog::new(
+                    t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器"),
+                    t!(
+                        "Оставить диспетчер задач работать в трее при закрытии окна?\n\nВ трее он продолжает собирать историю и применять правила. Изменить это можно в настройках или в меню значка в трее.",
+                        "Keep Task Manager running in the tray when you close the window?\n\nIn the tray it keeps collecting history and applying rules. You can change this later in Settings or in the tray icon's menu.",
+                        ja: "ウィンドウを閉じたときにタスク マネージャーをトレイで動作させたままにしますか?\n\nトレイでは履歴の収集とルールの適用を続けます。この設定は後で [設定] またはトレイ アイコンのメニューで変更できます。",
+                        pt: "Manter o Gerenciador de Tarefas em execução na bandeja ao fechar a janela?\n\nNa bandeja ele continua coletando o histórico e aplicando as regras. Você pode mudar isso depois em Configurações ou no menu do ícone da bandeja.",
+                        zh: "关闭窗口时让任务管理器继续在托盘中运行吗？\n\n在托盘中它会继续收集历史记录并执行规则。以后可以在设置或托盘图标的菜单中更改。"
+                    ),
+                    &[t!("Отмена", "Cancel", ja: "キャンセル", pt: "Cancelar", zh: "取消"), t!("Выйти", "Quit", ja: "終了", pt: "Sair", zh: "退出"), t!("Оставить в трее", "Keep in tray", ja: "トレイに残す", pt: "Manter na bandeja", zh: "留在托盘")],
+                ),
+            );
+            cx.invalidate();
+            return false;
+        }
+        if to_tray {
+            self.hide_to_tray();
+            return false;
+        }
+        self.finish()
     }
 }
 
-/// Тёмные/светлые системные меню (недокументированные функции uxtheme: 135 — SetPreferredAppMode, 136 — FlushMenuThemes).
-pub fn set_menu_theme(dark: bool) {
-    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
-    unsafe {
-        let lib = LoadLibraryW(wide("uxtheme.dll").as_ptr());
-        if lib.is_null() {
-            return;
+impl Tm {
+    /// The window really closes: the settings are written, the ETW session stopped, the icon taken away.
+    fn finish(&mut self) -> bool {
+        self.save_settings();
+        if let Some(s) = self.d.etw.take() {
+            self.m.etw_stop(s);
         }
-        let set = GetProcAddress(lib, 135 as *const i8);
-        let flush = GetProcAddress(lib, 136 as *const i8);
-        if !set.is_null() {
-            let f: extern "system" fn(i32) -> i32 = std::mem::transmute(set);
-            f(if dark { 2 } else { 3 }); // ForceDark / ForceLight
-        }
-        if !flush.is_null() {
-            let f: extern "system" fn() = std::mem::transmute(flush);
-            f();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn descendants_collects_all_once() {
-        let parents = HashMap::from([(2, 1), (3, 2), (4, 1), (9, 8)]);
-        let mut got = descendants(&parents, &[1]);
-        got.sort();
-        assert_eq!(got, vec![1, 2, 3, 4]);
-        assert_eq!(descendants(&parents, &[9]), vec![9]);
+        self.m.tray_remove();
+        true
     }
 }
