@@ -47,8 +47,40 @@ pub(crate) fn id_of(d: &IMMDevice) -> Option<String> {
     }
 }
 
-/// Where the device hangs: Bluetooth, USB, or the machine's own audio chip, from the device it is connected to.
-fn link_of(d: &IMMDevice) -> &'static str {
+/// The Class of Device the Bluetooth stack keeps for a paired device (`BTHPORT\Parameters\Devices\<address>\COD`, readable with
+/// normal rights): the endpoint's connector id carries the address as a run of 12 hex digits.
+fn bt_class(connector: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    hex12_runs(connector).find_map(|mac| {
+        let key = wide(&format!(r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\{mac}"));
+        let (mut v, mut n) = (0u32, 4u32);
+        // SAFETY: a DWORD read into a local of that size.
+        let ok = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), wide("COD").as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), (&raw mut v).cast(), &mut n) } == 0;
+        ok.then_some(v)
+    })
+}
+
+/// The runs of exactly 12 hex digits in `s` (Bluetooth addresses in a device id).
+fn hex12_runs(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_ascii_hexdigit()).filter(|r| r.len() == 12)
+}
+
+/// A Bluetooth audio device by its class: a speaker (loudspeaker, portable or car audio, hi-fi) or something worn (headset,
+/// hands-free, headphones). None for what the class does not say (the device is then taken for headphones, as before).
+fn bt_kind(cod: u32) -> Option<Kind> {
+    if (cod >> 8) & 0x1f != 4 {
+        return None; // not Audio/Video
+    }
+    match (cod >> 2) & 0x3f {
+        5 | 7 | 8 | 10 => Some(Kind::Speakers),
+        1 | 2 | 6 => Some(Kind::Headphones),
+        _ => None,
+    }
+}
+
+/// Where the device hangs: Bluetooth, USB, or the machine's own audio chip, from the device it is connected to; and that device's id.
+fn link_of(d: &IMMDevice) -> (&'static str, String) {
     // SAFETY: the topology of an endpoint has one connector; the id it names is freed.
     let id = unsafe {
         (|| {
@@ -60,7 +92,7 @@ fn link_of(d: &IMMDevice) -> &'static str {
         })()
     };
     let id = id.unwrap_or_default().to_lowercase();
-    if id.contains("bth") {
+    let link = if id.contains("bth") {
         "bluetooth"
     } else if id.contains("usb") {
         "usb"
@@ -68,7 +100,8 @@ fn link_of(d: &IMMDevice) -> &'static str {
         "builtin"
     } else {
         ""
-    }
+    };
+    (link, id)
 }
 
 fn device(d: &IMMDevice, capture: bool, current: Option<&str>) -> Option<Device> {
@@ -86,15 +119,19 @@ fn device(d: &IMMDevice, capture: bool, current: Option<&str>) -> Option<Device>
         let form = store.GetValue(&FORM_FACTOR).ok().map_or(10, |v| PropVariantToUInt32WithDefault(&v, 10));
         (text(&DEVICE_DESC).or_else(|| text(&DEVICE_FRIENDLY_NAME)).unwrap_or_else(|| id.clone()), text(&ADAPTER_NAME).unwrap_or_default().replace("(R)", "").replace("(TM)", ""), form)
     };
-    let link = link_of(d);
+    let (link, connector) = link_of(d);
+    let bt = if link == "bluetooth" { bt_class(&connector).and_then(bt_kind) } else { None };
     let kind = match (capture, form, link) {
         (true, 5 | 6, _) | (true, _, "bluetooth") => Kind::Headphones,
         (true, ..) => Kind::Microphone,
-        (false, 3 | 5, _) | (false, _, "bluetooth") => Kind::Headphones,
+        (false, _, "bluetooth") => bt.unwrap_or(Kind::Headphones),
+        (false, 3 | 5, _) => Kind::Headphones,
         (false, 9, _) => Kind::Monitor,
         _ => Kind::Speakers,
     };
     let adapter = adapter.trim().to_string();
+    // a Bluetooth device goes by its own name ("Yandex Station", "AirPods Pro"), not by "Speakers" / "Headphones" (the design's list)
+    let name = if link == "bluetooth" && !adapter.is_empty() { adapter.clone() } else { name };
     let sub = match (link, kind) {
         ("bluetooth", Kind::Headphones) if capture => t!("Bluetooth-гарнитура", "Bluetooth headset", ja: "Bluetooth ヘッドセット", pt: "Headset Bluetooth", zh: "蓝牙耳机").to_string(),
         ("bluetooth", _) => "Bluetooth".to_string(),
@@ -180,5 +217,17 @@ mod tests {
         for d in a.outputs.iter().chain(&a.inputs) {
             eprintln!("{:?} | {} | {} | current={}", d.kind, d.name, d.sub, d.current);
         }
+    }
+
+    /// The Yandex Station (Audio/Video, loudspeaker) showed as "Speakers" with a headphones icon.
+    #[test]
+    fn a_bluetooth_device_is_a_speaker_or_headphones_by_its_class() {
+        use crate::ui::quick_popup::Kind;
+        assert_eq!(super::bt_kind(0x4C0414), Some(Kind::Speakers)); // Yandex Station
+        assert_eq!(super::bt_kind(0x240418), Some(Kind::Headphones)); // AirPods Pro
+        assert_eq!(super::bt_kind(0x200404), Some(Kind::Headphones)); // a wearable headset
+        assert_eq!(super::bt_kind(0x5A020C), None); // a phone: not Audio/Video
+        let id = r"{2}.\\?\bthenum#{0000110b-0000-1000-8000-00805f9b34fb}_vid&00021d6b_pid&0246#7&2bd3f4c&0&3c0b4f89b9ff_c00000000#{6994ad04}";
+        assert!(super::hex12_runs(id).any(|r| r == "3c0b4f89b9ff"));
     }
 }
