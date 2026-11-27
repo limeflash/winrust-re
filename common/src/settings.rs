@@ -247,7 +247,11 @@ fn run(uri: &str) {
         kill_stale();
         proc::kill_shell_explorers();
         let rx = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default()).join(r"rust-explorer\rust-explorer.exe");
-        if rx.is_file() && !proc::pids("rust-explorer.exe").into_iter().any(has_desktop) {
+        // an elevated host (the bar runs elevated) would give the desktop its admin rights, and every app opened from it, and
+        // Windows blocks drag and drop between those and normal windows: rs-shell brings it back with normal rights within
+        // seconds once the lend is over (overlay_watch)
+        let rs_shell = !proc::pids("rs-shell.exe").is_empty();
+        if rx.is_file() && !(proc::elevated() && rs_shell) && !proc::pids("rust-explorer.exe").into_iter().any(has_desktop) {
             let _ = Command::new(rx).arg("--desktop").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         }
         unsafe { windows_sys::Win32::Foundation::CloseHandle(st.1 as _) };
