@@ -8,7 +8,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::{
     audio, bt, display, ext,
-    more::{Cap, Consent, Flag, Gauge, Layout, NotifyApp, Opt, Security},
+    more::{Assoc, Cap, Consent, DefApp, DefKind, Flag, Gauge, Layout, NotifyApp, Opt, Security},
     net, power, sys, sysx, wifi, wu,
 };
 use windows_sys::Win32::Foundation::HWND;
@@ -30,10 +30,17 @@ pub struct Battery {
 }
 
 /// What the Windows Update row shows beyond `wu::State`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WuExtra {
-    pub progress: Option<u8>,
+    /// Windows needs a restart to finish updates.
     pub restart: bool,
+    /// When Windows (or this window) last looked for updates, and when it last installed some.
+    pub last_check: Option<crate::more::When>,
+    pub last_install: Option<crate::more::When>,
+    /// The latest of the update history.
+    pub history: Vec<wu::Hist>,
+    /// The hours Windows will not restart in.
+    pub active: Option<(u32, u32)>,
 }
 
 pub trait Os {
@@ -123,8 +130,22 @@ pub trait Os {
     fn uninstall(&self, cmd: &str) -> bool;
     fn wu_state(&self) -> wu::State;
     fn wu_extra(&self) -> WuExtra;
+    /// Restarts the PC now (the user confirmed); false when Windows refused.
+    fn restart_now(&self) -> bool;
     fn wu_check(&self, done: Ping);
-    fn wu_install(&self, done: Ping);
+    /// Downloads and installs the updates with these ids.
+    fn wu_install(&self, ids: Vec<String>, done: Ping);
+    /// Stops a search or a download that is going on.
+    fn wu_cancel(&self);
+    /// Sets a restart for later (`shutdown /r /t`); false when Windows refused.
+    fn wu_schedule(&self, s: wu::Sched) -> bool;
+    fn wu_unschedule(&self);
+    /// This window runs with administrator rights.
+    fn wu_admin(&self) -> bool;
+    /// The apps with a window open now: what a restart would close.
+    fn restart_apps(&self) -> Vec<String>;
+    /// Opens an address (a web page, a shell location, an ms-settings: page) the way the shell does.
+    fn open_link(&self, target: &str);
 
     // ---- personalization, about
     fn night_kelvin(&self) -> u32;
@@ -141,10 +162,27 @@ pub trait Os {
     fn windows_value(&self, name: &str) -> String;
     fn ram_text(&self) -> String;
     fn computer_name(&self) -> String;
+    /// Processor, memory, graphics, system type, build revision, WinRust version, a rename waiting for a restart.
+    fn about_info(&self) -> crate::more::AboutInfo;
+    /// The apps Windows has registered for a kind of file or link and the index of the default (None: nothing is linked).
+    fn assoc_apps(&self, a: &Assoc) -> (Vec<DefApp>, Option<usize>);
+    /// The user chose app `i` of `assoc_apps`: Windows' own chooser opens so they confirm it (the real one never sets the default itself);
+    /// `done` says the dialog closed.
+    fn assoc_pick(&self, a: &Assoc, i: usize, owner: isize, done: Ping);
+    /// What WinRust's own file manager or terminal is here (not a Windows setting).
+    fn own_default(&self, k: DefKind) -> String;
+    /// Sets the computer's name (applies after a restart); the error is a line for the user.
+    fn rename_pc(&self, name: &str) -> Result<(), String>;
     fn user_name(&self) -> String;
     fn set_lang(&self, l: winrust_common::Lang) -> bool;
     /// Picks the demo's picture `k` of the Personalization page (nothing in the real one: it has only the picker).
-    fn wallpaper_select(&self, k: usize);
+    /// Picks tile `k` of `wallpapers()`; a preset is drawn and set off the window's thread and `done` says what came of it.
+    fn wallpaper_select(&self, k: usize, done: Note);
+    /// Decodes the thumbnail of the picture that is the wallpaper (off the window's thread); `done` says it is ready.
+    fn wall_prepare(&self, done: Ping);
+    /// The WinRust accent now (an index of `style::Accent::ALL`) and setting it (the bar and every program follow).
+    fn accent(&self) -> usize;
+    fn accent_set(&self, i: usize);
 
     // ---- Notifications, Privacy & security, Keyboard & mouse, Date & time (more.rs)
     /// The entries of a list and the current one.
@@ -429,13 +467,38 @@ impl Os for Live {
         wu::state()
     }
     fn wu_extra(&self) -> WuExtra {
-        WuExtra::default()
+        let i = wu::info();
+        // our own search of this session may be newer than what Windows wrote down
+        let last = i.checked.into_iter().chain(i.search).max();
+        let history = i.history.iter().map(|(group, title, kb, t, ok, code)| wu::Hist { group: *group, title: title.clone(), kb: kb.clone(), when: sysx::when_unix(*t).map_or_else(String::new, crate::more::when_text), ok: *ok, code: code.clone() }).collect();
+        WuExtra { restart: i.restart, last_check: last.and_then(sysx::when_unix), last_install: i.install.and_then(sysx::when_unix), history, active: i.active }
+    }
+    fn wu_cancel(&self) {
+        wu::cancel();
+    }
+    fn wu_schedule(&self, s: wu::Sched) -> bool {
+        wu::schedule(s)
+    }
+    fn wu_unschedule(&self) {
+        wu::cancel_restart();
+    }
+    fn wu_admin(&self) -> bool {
+        winrust_common::proc::elevated()
+    }
+    fn restart_apps(&self) -> Vec<String> {
+        wu::open_apps()
+    }
+    fn open_link(&self, target: &str) {
+        sysx::open_link(target);
+    }
+    fn restart_now(&self) -> bool {
+        wu::restart()
     }
     fn wu_check(&self, done: Ping) {
         wu::check(done);
     }
-    fn wu_install(&self, done: Ping) {
-        wu::install(done);
+    fn wu_install(&self, ids: Vec<String>, done: Ping) {
+        wu::install(ids, done);
     }
 
     fn night_kelvin(&self) -> u32 {
@@ -457,13 +520,13 @@ impl Os for Live {
         sys::announce_theme();
     }
     fn wallpaper_name(&self) -> String {
-        sys::wallpaper_name()
+        crate::wall::name()
     }
     fn wallpaper_pick(&self, owner: isize) -> Result<(), ()> {
         sys::pick_wallpaper(hw(owner))
     }
     fn wallpapers(&self) -> Vec<crate::Wall> {
-        Vec::new()
+        crate::wall::walls()
     }
     fn windows_value(&self, name: &str) -> String {
         sys::string(HKEY_LOCAL_MACHINE, crate::NT, name).unwrap_or_default()
@@ -478,13 +541,41 @@ impl Os for Live {
     fn computer_name(&self) -> String {
         std::env::var("COMPUTERNAME").unwrap_or_default()
     }
+    fn about_info(&self) -> crate::more::AboutInfo {
+        sysx::about_info()
+    }
+    fn assoc_apps(&self, a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
+        sysx::assoc_apps(a)
+    }
+    fn assoc_pick(&self, a: &Assoc, _i: usize, owner: isize, done: Ping) {
+        sysx::assoc_pick(a, owner, done);
+    }
+    fn own_default(&self, k: DefKind) -> String {
+        sysx::own_default(k)
+    }
+    fn rename_pc(&self, name: &str) -> Result<(), String> {
+        sysx::rename_pc(name)
+    }
     fn user_name(&self) -> String {
         std::env::var("USERNAME").unwrap_or_default()
     }
     fn set_lang(&self, l: winrust_common::Lang) -> bool {
         winrust_common::set_lang(l)
     }
-    fn wallpaper_select(&self, _k: usize) {}
+    fn wallpaper_select(&self, k: usize, done: Note) {
+        crate::wall::select(k, done);
+    }
+    fn wall_prepare(&self, done: Ping) {
+        crate::wall::prepare(done);
+    }
+    fn accent(&self) -> usize {
+        winrust_common::style::accent() as usize
+    }
+    fn accent_set(&self, i: usize) {
+        if let Some(&a) = winrust_common::style::Accent::ALL.get(i) {
+            winrust_common::style::set_accent(a);
+        }
+    }
     fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>) {
         sysx::opt_list(o)
     }

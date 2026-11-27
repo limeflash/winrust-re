@@ -79,11 +79,6 @@ pub fn subkeys(root: HKEY, key: &str) -> Vec<String> {
     out
 }
 
-/// The current wallpaper's file name ("" when none or a solid colour).
-pub fn wallpaper_name() -> String {
-    let p = string_long(HKEY_CURRENT_USER, r"Control Panel\Desktop", "WallPaper").unwrap_or_default();
-    p.rsplit('\\').next().unwrap_or_default().to_string()
-}
 
 /// Lets the user pick a picture and sets it as the wallpaper. Err(()) when cancelled or refused.
 pub fn pick_wallpaper(owner: HWND) -> Result<(), ()> {

@@ -358,6 +358,20 @@ pub struct App {
     pub version: String,
     pub publisher: String,
     pub uninstall: String,
+    /// What the installer says the program takes (`EstimatedSize`, KB; 0: it does not say).
+    pub size_kb: u64,
+    /// When it was installed (`InstallDate`, "YYYYMMDD"): year, month, day.
+    pub date: Option<(u32, u32, u32)>,
+}
+
+/// An `InstallDate` ("20260721") as year, month, day.
+pub fn install_date(s: &str) -> Option<(u32, u32, u32)> {
+    let s = s.trim();
+    if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (y, m, d) = (s[..4].parse().ok()?, s[4..6].parse().ok()?, s[6..].parse().ok()?);
+    ((1..=12).contains(&m) && (1..=31).contains(&d) && y > 1980).then_some((y, m, d))
 }
 
 /// The programs of the classic list (HKLM 64/32-bit and HKCU), by name; components and updates are left out.
@@ -374,7 +388,14 @@ pub fn programs() -> Vec<App> {
                 continue;
             }
             if !out.iter().any(|a| a.name == name) {
-                out.push(App { version: sys::string_long(root, &key, "DisplayVersion").unwrap_or_default(), publisher: sys::string_long(root, &key, "Publisher").unwrap_or_default(), name, uninstall: cmd });
+                out.push(App {
+                    version: sys::string_long(root, &key, "DisplayVersion").unwrap_or_default(),
+                    publisher: sys::string_long(root, &key, "Publisher").unwrap_or_default(),
+                    name,
+                    uninstall: cmd,
+                    size_kb: u64::from(sys::dword(root, &key, "EstimatedSize").unwrap_or(0)),
+                    date: sys::string_long(root, &key, "InstallDate").and_then(|d| install_date(&d)),
+                });
             }
         }
     }

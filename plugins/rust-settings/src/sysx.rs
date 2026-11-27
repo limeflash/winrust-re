@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
+    more::{AboutInfo, Assoc, CApp, Cap, Consent, DefApp, DefKind, RawDesk, group_desktop, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
     os::{Note, Ping},
     sys::{self, wide},
 };
@@ -119,6 +119,11 @@ fn when(ft: u64) -> Option<When> {
         let d = |s: &SYSTEMTIME| days(i64::from(s.wYear), i64::from(s.wMonth), i64::from(s.wDay));
         Some(When { days_ago: (d(&now) - d(&local)).max(0) as u32, hour: local.wHour as u8, min: local.wMinute as u8, day: local.wDay as u8, month: local.wMonth as u8 })
     }
+}
+
+/// Unix seconds (UTC) as a moment of the user's day.
+pub fn when_unix(secs: i64) -> Option<When> {
+    u64::try_from(secs + 11_644_473_600).ok().and_then(|s| when(s * 10_000_000))
 }
 
 fn today() -> (u32, u32, u32) {
@@ -385,15 +390,56 @@ pub fn notify_set(id: &str, mode: usize) -> bool {
 // ---------------------------------------------------------------------------------------------------------------------
 // privacy
 
+/// The exe's own name for itself (version info `FileDescription`: "Microsoft Edge WebView2"); None when the file is gone or says nothing.
+fn file_description(path: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+    let w = wide(path);
+    let mut h = 0u32;
+    // SAFETY: the buffer is as long as Windows said; what VerQueryValueW points at stays inside it while `buf` lives.
+    unsafe {
+        let n = GetFileVersionInfoSizeW(w.as_ptr(), &mut h);
+        if n == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize];
+        if GetFileVersionInfoW(w.as_ptr(), 0, n, buf.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let (mut p, mut len): (*mut std::ffi::c_void, u32) = (null_mut(), 0);
+        if VerQueryValueW(buf.as_ptr().cast(), wide(r"\VarFileInfo\Translation").as_ptr(), &mut p, &mut len) == 0 || len < 4 {
+            return None;
+        }
+        let t = std::slice::from_raw_parts(p.cast::<u16>(), 2);
+        let sub = wide(&format!(r"\StringFileInfo\{:04x}{:04x}\FileDescription", t[0], t[1]));
+        if VerQueryValueW(buf.as_ptr().cast(), sub.as_ptr(), &mut p, &mut len) == 0 || len == 0 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p.cast::<u16>(), len as usize)).trim_end_matches('\0').trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+}
+
 pub fn consent(cap: Cap) -> Consent {
     let base = format!(r"{CONSENT}\{}", cap.key());
-    let read_app = |key: String, id: String, desktop: bool| {
-        let (start, stop) = (qword(HKEY_CURRENT_USER, &key, "LastUsedTimeStart").unwrap_or(0), qword(HKEY_CURRENT_USER, &key, "LastUsedTimeStop").unwrap_or(0));
-        let live = start != 0 && stop == 0;
-        CApp { name: app_name(&id), id, desktop, last: when(if live { start } else { stop }), live }
-    };
-    let mut apps: Vec<CApp> = sys::subkeys(HKEY_CURRENT_USER, &base).into_iter().filter(|k| k != "NonPackaged").map(|k| read_app(format!(r"{base}\{k}"), k, false)).collect();
-    apps.extend(sys::subkeys(HKEY_CURRENT_USER, &format!(r"{base}\NonPackaged")).into_iter().map(|k| read_app(format!(r"{base}\NonPackaged\{k}"), k, true)));
+    let times = |key: &str| (qword(HKEY_CURRENT_USER, key, "LastUsedTimeStart").unwrap_or(0), qword(HKEY_CURRENT_USER, key, "LastUsedTimeStop").unwrap_or(0));
+    let mut apps: Vec<CApp> = sys::subkeys(HKEY_CURRENT_USER, &base)
+        .into_iter()
+        .filter(|k| k != "NonPackaged")
+        .map(|k| {
+            let (start, stop) = times(&format!(r"{base}\{k}"));
+            let live = start != 0 && stop == 0; // (a Store app's process cannot be named from here)
+            CApp { name: app_name(&k), id: k, desktop: false, last: when(if live { start } else { stop }), live }
+        })
+        .collect();
+    let raw = sys::subkeys(HKEY_CURRENT_USER, &format!(r"{base}\NonPackaged"))
+        .into_iter()
+        .map(|key| {
+            let (start, stop) = times(&format!(r"{base}\NonPackaged\{key}"));
+            RawDesk { key, start, stop, start_when: when(start), stop_when: when(stop) }
+        })
+        .collect();
+    let running: std::collections::HashSet<String> = winrust_common::proc::list().into_iter().map(|(_, n)| n.to_lowercase()).collect();
+    apps.extend(group_desktop(raw, &|exe| running.contains(exe), &file_description));
     // Store apps by name, then desktop apps, the one using it now first, then the latest (a PC holds hundreds of old ones: 30 are shown)
     let recent = |a: &CApp| a.last.map_or((u32::MAX, 0), |w| (w.days_ago, u32::MAX - (u32::from(w.hour) * 60 + u32::from(w.min))));
     apps.sort_by_key(|a| (a.desktop, !a.live, if a.desktop { recent(a) } else { (0, 0) }, a.name.to_lowercase()));
@@ -506,6 +552,249 @@ pub fn time_sync(done: Note) {
     });
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// About
+
+/// The graphics adapters DXGI lists, the software one (Microsoft Basic Render Driver) left out; read once.
+fn gpus() -> Vec<String> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
+    static G: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let mut v = Vec::new();
+        // SAFETY: a factory made and used here; the description is copied out.
+        unsafe {
+            if let Ok(f) = CreateDXGIFactory1::<IDXGIFactory1>() {
+                let mut i = 0;
+                while let Ok(a) = f.EnumAdapters1(i) {
+                    i += 1;
+                    if let Ok(d) = a.GetDesc1() {
+                        let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                        let name = String::from_utf16_lossy(&d.Description[..n]).trim().to_string();
+                        if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && d.VendorId != 0x1414 && !name.is_empty() && !v.contains(&name) {
+                            v.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        v
+    })
+    .clone()
+}
+
+fn computer_name_ex(kind: i32) -> String {
+    use windows_sys::Win32::System::SystemInformation::GetComputerNameExW;
+    let mut buf = [0u16; 260];
+    let mut n = buf.len() as u32;
+    // SAFETY: the name goes into a local buffer.
+    if unsafe { GetComputerNameExW(kind, buf.as_mut_ptr(), &mut n) } == 0 { String::new() } else { String::from_utf16_lossy(&buf[..n as usize]) }
+}
+
+/// WinRust's version as the bar's panel says it: the one the updater wrote when it last swapped files, else this release's.
+fn winrust_version() -> String {
+    let file = std::env::var_os("ProgramFiles").map(|p| std::path::PathBuf::from(p).join(r"WinRust\version.txt"));
+    let release = include_str!("../../../Cargo.toml").lines().find_map(|l| l.strip_prefix("version = \"")?.split('"').next()).unwrap_or("0").to_string();
+    file.and_then(|f| std::fs::read_to_string(f).ok()).map(|s| s.trim().trim_start_matches('v').to_string()).filter(|s| !s.is_empty()).unwrap_or(release)
+}
+
+pub fn about_info() -> AboutInfo {
+    use windows_sys::Win32::System::SystemInformation::{GetNativeSystemInfo, GetPhysicallyInstalledSystemMemory, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO};
+    let hklm = HKEY_LOCAL_MACHINE;
+    let cpu_key = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+    let name = sys::string(hklm, cpu_key, "ProcessorNameString").map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let cpu = match sys::dword(hklm, cpu_key, "~MHz") {
+        Some(mhz) if !name.is_empty() => format!("{name} \u{b7} {:.1} GHz", f64::from(mhz) / 1000.0),
+        _ => name,
+    };
+    // SAFETY: plain queries into locals.
+    let (ram, arch) = unsafe {
+        let mut kb = 0u64;
+        let installed = GetPhysicallyInstalledSystemMemory(&mut kb) != 0 && kb > 0;
+        let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
+        mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        let usable = (GlobalMemoryStatusEx(&mut mem) != 0).then(|| crate::gb(mem.ullTotalPhys));
+        let ram = match (installed, usable) {
+            (true, Some(u)) => format!("{} GB ({u} usable)", (kb as f64 / (1024.0 * 1024.0)).round()),
+            (true, None) => format!("{} GB", (kb as f64 / (1024.0 * 1024.0)).round()),
+            (false, u) => u.unwrap_or_default(),
+        };
+        let mut si: SYSTEM_INFO = std::mem::zeroed();
+        GetNativeSystemInfo(&mut si);
+        (ram, si.Anonymous.Anonymous.wProcessorArchitecture)
+    };
+    let sys_type = match arch {
+        9 => t!("64-разрядная, процессор x64", "64-bit, x64 processor"),
+        12 => t!("64-разрядная, процессор ARM64", "64-bit, ARM64 processor"),
+        0 => t!("32-разрядная, процессор x86", "32-bit, x86 processor"),
+        _ => "",
+    };
+    let build = sys::string(hklm, crate::NT, "CurrentBuild").map(|b| match sys::dword(hklm, crate::NT, "UBR") {
+        Some(u) => format!("{b}.{u}"),
+        None => b,
+    });
+    let active = computer_name_ex(0);
+    let physical = computer_name_ex(4);
+    AboutInfo { cpu, ram, gpus: gpus(), sys_type: sys_type.into(), build: build.unwrap_or_default(), winrust: winrust_version(), pc_pending: (!physical.is_empty() && !physical.eq_ignore_ascii_case(&active)).then_some(physical) }
+}
+
+/// Sets the computer's name (it applies after a restart); needs administrator rights, which the error says.
+pub fn rename_pc(name: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::SystemInformation::SetComputerNameExW;
+    if !crate::more::valid_pc_name(name) {
+        return Err(t!("Недопустимое имя", "That is not a valid name").into());
+    }
+    // SAFETY: a documented call with a name that was just checked.
+    if unsafe { SetComputerNameExW(5, wide(name).as_ptr()) } != 0 {
+        return Ok(());
+    }
+    // SAFETY: a plain read of the thread's last error.
+    Err(if unsafe { GetLastError() } == ERROR_ACCESS_DENIED { t!("Нужны права администратора: запустите «Параметры» от имени администратора", "Administrator rights are needed: run Settings as administrator").into() } else { t!("Windows не приняла имя", "Windows did not take the name").into() })
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Default apps: what Windows has registered for a kind of file or link, and its own dialog for choosing (nothing here writes UserChoice)
+
+type Handlers = (std::time::Instant, Vec<DefApp>, Option<usize>);
+
+fn handlers_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Handlers>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Handlers>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// One string Windows keeps for an association (`what`: ASSOCSTR_EXECUTABLE 2, ASSOCSTR_FRIENDLYAPPNAME 4); None when nothing is linked.
+fn assoc_string(a: &Assoc, what: i32) -> Option<String> {
+    use windows_sys::Win32::UI::Shell::AssocQueryStringW;
+    const NOTRUNCATE: u32 = 0x20;
+    const IS_PROTOCOL: u32 = 0x1000;
+    let mut buf = [0u16; 520];
+    let mut n = buf.len() as u32;
+    // SAFETY: the text goes into a local buffer of the size given.
+    let rc = unsafe { AssocQueryStringW(NOTRUNCATE | if a.protocol { IS_PROTOCOL } else { 0 }, what, wide(&a.name).as_ptr(), null(), buf.as_mut_ptr(), &mut n) };
+    (rc == 0 && n > 1).then(|| String::from_utf16_lossy(&buf[..(n as usize - 1).min(buf.len())]))
+}
+
+fn exe_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
+}
+
+/// The apps Windows offers for `a` (its recommended handlers) and which one is the default now. An unknown type has none.
+pub fn assoc_apps(a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
+    use windows::Win32::{
+        System::Com::{CoTaskMemFree, CoInitializeEx, COINIT_APARTMENTTHREADED},
+        UI::Shell::{ASSOC_FILTER_RECOMMENDED, IAssocHandler, IEnumAssocHandlers, SHAssocEnumHandlers, SHAssocEnumHandlersForProtocolByApplication},
+    };
+    use windows::core::{HSTRING, PWSTR};
+    let key = format!("{}|{}", a.name, a.protocol);
+    if let Some(h) = handlers_cache().lock().ok().and_then(|c| c.get(&key).filter(|h| h.0.elapsed().as_secs() < 30).cloned()) {
+        return (h.1, h.2);
+    }
+    let text = |p: windows::core::Result<PWSTR>| {
+        let p = p.ok()?;
+        // SAFETY: Windows allocated the text with CoTaskMemAlloc; it is copied and freed.
+        let s = unsafe { p.to_string().ok() };
+        unsafe { CoTaskMemFree(Some(p.0.cast())) };
+        s
+    };
+    let mut apps: Vec<DefApp> = Vec::new();
+    // SAFETY: shell COM objects made and used here.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let en: Option<IEnumAssocHandlers> = if a.protocol { SHAssocEnumHandlersForProtocolByApplication(&HSTRING::from(a.name.as_str())).ok() } else { SHAssocEnumHandlers(&HSTRING::from(a.name.as_str()), ASSOC_FILTER_RECOMMENDED).ok() };
+        if let Some(en) = en {
+            loop {
+                let mut one: [Option<IAssocHandler>; 1] = [None];
+                let mut got = 0u32;
+                if en.Next(&mut one, Some(&mut got)).is_err() || got == 0 {
+                    break;
+                }
+                let Some(h) = one[0].take() else { break };
+                let (name, exe) = (text(h.GetUIName()), text(h.GetName()));
+                if let (Some(name), Some(exe)) = (name, exe) {
+                    let d = DefApp { name, exe: exe_name(&exe) };
+                    // "Pick an app" (openwith.exe) is Windows' own way of saying nothing is linked
+                    if d.exe != "openwith.exe" && !apps.iter().any(|x| x.exe == d.exe) {
+                        apps.push(d);
+                    }
+                }
+            }
+        }
+    }
+    let cur_exe = assoc_string(a, 2).map(|p| exe_name(&p)).filter(|e| e != "openwith.exe");
+    let mut cur = cur_exe.as_ref().and_then(|e| apps.iter().position(|x| x.exe == *e));
+    if cur.is_none()
+        && let (Some(exe), Some(name)) = (cur_exe, assoc_string(a, 4))
+    {
+        apps.insert(0, DefApp { name, exe }); // the default is not among the recommended: it is still the default
+        cur = Some(0);
+    }
+    if let Ok(mut c) = handlers_cache().lock() {
+        c.insert(key, (std::time::Instant::now(), apps.clone(), cur));
+    }
+    (apps, cur)
+}
+
+/// Opens Windows' own chooser for `a` so the user confirms it ("Always use this app"); never sets the default itself. A file type gets the
+/// open-with dialog (registering the choice for the extension, nothing is run); a link scheme goes to Windows' default-apps page.
+pub fn assoc_pick(a: &Assoc, owner: isize, done: Ping) {
+    if a.protocol {
+        winrust_common::settings::open("ms-settings:defaultapps");
+        return;
+    }
+    if !valid_ext(&a.name) {
+        return;
+    }
+    let file = format!("file{}", a.name);
+    std::thread::spawn(move || {
+        use windows::Win32::{
+            Foundation::HWND,
+            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+            UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_FORCE_REGISTRATION, OAIF_REGISTER_EXT, OPENASINFO, SHOpenWithDialog},
+        };
+        use windows::core::HSTRING;
+        let name = HSTRING::from(file.as_str());
+        let info = OPENASINFO { pcszFile: windows::core::PCWSTR(name.as_ptr()), pcszClass: windows::core::PCWSTR::null(), oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_FORCE_REGISTRATION };
+        // SAFETY: a modal shell dialog on this thread, over our window; the file name is a placeholder that is never opened (no OAIF_EXEC).
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let _ = SHOpenWithDialog(Some(HWND(owner as *mut _)), &info);
+        }
+        if let Ok(mut c) = handlers_cache().lock() {
+            c.clear(); // what it was is read again
+        }
+        done();
+    });
+}
+
+fn valid_ext(e: &str) -> bool {
+    e.len() > 1 && e.len() <= 21 && e.starts_with('.') && e[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')
+}
+
+/// What WinRust's own file manager and terminal are on this PC: not a Windows setting, what is installed.
+pub fn own_default(k: DefKind) -> String {
+    let pf = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default());
+    match k {
+        DefKind::Files => if pf.join(r"rust-explorer\rust-explorer.exe").is_file() { "WinRust Explorer" } else { "Windows Explorer" }.into(),
+        _ => {
+            let wt = std::env::var_os("LOCALAPPDATA").map(|b| std::path::PathBuf::from(b).join(r"Microsoft\WindowsApps\wt.exe")).is_some_and(|p| p.is_file());
+            if pf.join(r"rust-term\rust-term.exe").is_file() { "WinRust Terminal" } else if wt { "Windows Terminal" } else { "PowerShell" }.into()
+        }
+    }
+}
+
+/// Opens a page of Windows or Microsoft the way the shell does; anything else is refused (the addresses are built from numbers and fixed words).
+pub fn open_link(target: &str) {
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    if target.starts_with("ms-settings:") {
+        return winrust_common::settings::open(target);
+    }
+    let ok = target.starts_with("https://support.microsoft.com/") || target.starts_with("shell:::{");
+    if !ok || target.chars().any(|c| c.is_control() || c == '"' || c == ' ') {
+        return;
+    }
+    // SAFETY: a documented call with an address that was just checked.
+    unsafe { ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(target).as_ptr(), null(), null(), SW_SHOWNORMAL) };
+}
+
 #[cfg(test)]
 mod live {
     use super::*;
@@ -527,11 +816,17 @@ mod live {
         for cap in Cap::ALL {
             let c = consent(cap);
             println!("{cap:?}: pc {:?} user {:?} desktop {:?}, {} apps", flag(&Flag::Access(cap, Who::Pc)), flag(&Flag::Access(cap, Who::User)), flag(&Flag::Access(cap, Who::Desktop)), c.apps.len());
-            for a in c.apps.iter().take(4) {
+            for a in c.apps.iter().filter(|a| a.desktop).take(6) {
                 println!("   {} ({}) desktop={} last={:?} live={}", a.name, a.id, a.desktop, a.last, a.live);
             }
         }
         println!("{:?}", security());
+        println!("about {:?}", about_info());
+        for a in [(".pdf", false), (".jpg", false), (".mp4", false), (".txt", false), ("http", true), ("mailto", true), (".xyz", false)] {
+            let (l, c) = assoc_apps(&Assoc { name: a.0.into(), protocol: a.1 });
+            println!("assoc {}: {} handlers, current {:?}: {:?}", a.0, l.len(), c, l.iter().map(|x| format!("{}={}", x.name, x.exe)).collect::<Vec<_>>());
+        }
+        println!("own {} / {}", own_default(DefKind::Files), own_default(DefKind::Term));
         println!("layouts {:?}", layouts());
         println!("clock {:?} | region {:?} | numbers {:?} | server {:?}", clock_text(), region_text(), numbers_text(), time_server());
         let n = notify_apps();

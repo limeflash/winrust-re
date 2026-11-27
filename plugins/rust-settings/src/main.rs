@@ -46,8 +46,10 @@ mod power;
 mod search;
 mod sys;
 mod sysx;
+mod wall;
 mod wifi;
 mod wu;
+mod wupage;
 #[cfg(test)]
 mod tests;
 
@@ -76,6 +78,8 @@ pub enum Row {
     Switch(String, fn() -> Option<bool>, Op),
     /// A visible Wi-Fi network and its status text: a click opens it (the password goes there), Connect connects.
     Wifi(wifi::Net, String),
+    /// One update of the Windows Update page (a checkbox, its words, a state).
+    Upd(Box<wupage::UpdRow>),
     /// A slider of a number the system keeps as a step of a scale (key repeat, pointer speed); the line's `vol` is 0..=1.
     Gauge(String, more::Gauge),
     /// A switch of a yes/no that is not one DWORD of `HKCU` (Do not disturb, a permission, pointer precision); a click flips it.
@@ -87,6 +91,7 @@ impl Row {
     pub fn label(&self) -> &str {
         match self {
             Row::Toggle { label, .. } | Row::Info(label, _) | Row::Cycle(label, ..) | Row::Slider(label, _) | Row::Item(label, ..) | Row::Switch(label, ..) | Row::Gauge(label, _) | Row::Flag(label, _) => label,
+            Row::Upd(u) => &u.upd.title,
             Row::Adapter(a, _) => &a.name,
             Row::Wifi(n, _) => &n.ssid,
         }
@@ -122,6 +127,16 @@ pub enum Op {
     Opt(more::Opt),
     /// The tab of the Privacy page's App access list.
     PvTab,
+    /// The default app of a kind of file or link (the Default apps page).
+    Def(more::DefKind),
+    /// The default app of the file type typed in that page's box.
+    DefExt,
+    /// The time of a restart picked from the list of the chips.
+    WuTime,
+    /// The accent colour of every WinRust program (the swatches of Personalization).
+    Accent,
+    /// How the Apps page orders its programs (name, size, install date).
+    AppSort,
     /// The Keyboard page's "Try it" field: nothing to do, the field is only there to hold keys down in.
     Try,
 }
@@ -142,8 +157,6 @@ pub enum Cmd {
     BtPair(String),
     BtUnpair(String),
     BtScan,
-    Check,
-    Install,
     Wallpaper,
     /// A notifying app of the Notifications page: a click unfolds its three ways.
     NotifyApp(String),
@@ -154,6 +167,11 @@ pub enum Cmd {
     QuickScan,
     OpenSecurity,
     SyncTime,
+    /// The About page's Computer name: a click unfolds the name field.
+    Rename,
+    /// Windows Update: the list of installed updates (Windows' own uninstaller), and the advanced options of Windows' settings.
+    WuUninstall,
+    WuAdvanced,
 }
 
 pub const CONFIRM_SECS: u32 = 15;
@@ -212,10 +230,6 @@ pub struct Line {
     /// The values of a segmented row (`Topology`, `Plan`) and the current one.
     pub opts: Vec<String>,
     pub cur: Option<usize>,
-    /// A taller row (the Windows Update status).
-    pub big: bool,
-    /// The buttons of the Windows Update "restart" state (the real one never has them).
-    pub restart: bool,
     /// Drawn dim and not clickable (a switch whose master switch is off).
     pub dis: bool,
     /// A height of its own, DIPs.
@@ -243,8 +257,6 @@ impl Line {
             mute: None,
             opts: Vec::new(),
             cur: None,
-            big: false,
-            restart: false,
             dis: false,
             h: None,
         };
@@ -253,10 +265,11 @@ impl Line {
                 l.val = value();
                 if is_seg(*op) {
                     (l.opts, l.cur) = choices(*op).unwrap_or_default();
-                } else if matches!(op, Op::Opt(_)) {
+                } else if matches!(op, Op::Opt(_) | Op::Def(_) | Op::DefExt | Op::AppSort) {
                     l.val = choices(*op).and_then(|(v, c)| c.and_then(|c| v.get(c).cloned())).unwrap_or_else(|| "?".into());
                 }
             }
+            Row::Upd(_) => {}
             Row::Gauge(_, g) => {
                 l.vol = os().gauge(*g);
                 l.sub = more::gauge_text(*g, l.vol);
@@ -327,6 +340,8 @@ pub enum Extra {
     Walls(Vec<Wall>),
     /// The search box of a page's own list (the Apps page): what it says of the result ("3 of 12"), empty while nothing is typed.
     Search(String),
+    /// The Windows Update page's status card.
+    WuCard(Box<wupage::WuCard>),
 }
 
 /// A big status card (the Network page).
@@ -359,13 +374,15 @@ pub struct Wall {
     pub label: String,
     pub fill: Fill,
     pub on: bool,
+    /// The picture itself (the real wallpaper's thumbnail), when it has been decoded; else `fill` is drawn.
+    pub pic: Option<std::sync::Arc<wall::Thumb>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Fill {
     Solid(u32),
-    /// 160 degrees: top, middle (at 60 %), bottom.
-    Gradient(u32, u32, u32),
+    /// 160 degrees: top, middle (at the given position, 0..1), bottom.
+    Gradient(u32, u32, u32, f32),
 }
 
 /// The button at the right of a group's title.
@@ -382,6 +399,10 @@ pub enum GAct {
     Cmd(Cmd),
     /// Puts the device details on the clipboard.
     Copy,
+    /// Windows Update: tick every required update (true) or none; show or hide the optional ones; the whole history or the latest.
+    WuSel(bool),
+    WuOpt,
+    WuHist,
 }
 
 pub struct Group {
@@ -458,13 +479,14 @@ pub fn gb(bytes: u64) -> String {
 }
 
 /// Words that select each page, in the order of `pages()`.
-const PAGE_KEYS: [&[&str]; 13] = [
+const PAGE_KEYS: [&[&str]; 14] = [
     &["display"],
     &["sound"],
     &["power", "battery", "storage"],
     &["network", "wifi", "ethernet"],
     &["bluetooth", "airplane"],
     &["apps"],
+    &["defaultapps"],
     &["notification"],
     &["personal", "color", "theme"],
     &["privacy", "webcam", "microphone", "location", "windowsdefender"],
@@ -477,7 +499,16 @@ const PAGE_KEYS: [&[&str]; 13] = [
 /// The page a name or an ms-settings: address points at; the first page when nothing matches.
 pub fn page_for(arg: &str) -> usize {
     let a = arg.to_ascii_lowercase();
-    PAGE_KEYS.iter().position(|ks| ks.iter().any(|k| a.contains(k))).unwrap_or(0)
+    // the longest key that matches wins ("defaultapps" is not the Apps page)
+    let mut best: Option<(usize, usize)> = None;
+    for (i, ks) in PAGE_KEYS.iter().enumerate() {
+        if let Some(len) = ks.iter().filter(|k| a.contains(**k)).map(|k| k.len()).max()
+            && best.is_none_or(|b| len > b.1)
+        {
+            best = Some((i, len));
+        }
+    }
+    best.map_or(0, |b| b.0)
 }
 
 fn res_text() -> String {
@@ -543,13 +574,23 @@ fn orient_names() -> [&'static str; 4] {
 
 /// Rows whose value is picked from a list (the others act on a click). Screen modes need a second screen.
 pub fn listed(op: Op) -> bool {
-    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab)
+    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab | Op::Def(_) | Op::DefExt | Op::AppSort | Op::WuTime)
         || (matches!(op, Op::Topology) && os().display_connected() > 1)
+}
+
+/// What Windows is asked about for a Default apps row.
+#[must_use]
+pub fn def_assoc(op: Op) -> Option<more::Assoc> {
+    match op {
+        Op::Def(k) => k.assoc(),
+        Op::DefExt => more::clean_ext(&more::ext_query()).map(|name| more::Assoc { name, protocol: false }),
+        _ => None,
+    }
 }
 
 /// Rows drawn as a segmented control whenever they have a list (a click on a segment picks it).
 pub fn is_seg(op: Op) -> bool {
-    matches!(op, Op::Topology | Op::Plan | Op::PvTab) || matches!(op, Op::Opt(o) if o.segmented())
+    matches!(op, Op::Topology | Op::Plan | Op::PvTab | Op::Accent) || matches!(op, Op::Opt(o) if o.segmented())
 }
 
 /// The values a list offers and the index of the current one. None when there is nothing to choose.
@@ -583,6 +624,13 @@ pub fn choices(op: Op) -> Option<(Vec<String>, Option<usize>)> {
         }
         Op::Night => (night_labels(), ext::NIGHT_STEPS.iter().position(|&k| k == o.night_kelvin())),
         Op::Opt(x) => o.opt_list(x),
+        Op::Def(_) | Op::DefExt => {
+            let (apps, cur) = o.assoc_apps(&def_assoc(op)?);
+            (apps.into_iter().map(|a| a.name).collect(), cur)
+        }
+        Op::WuTime => (WU_TIMES.iter().map(|s| (*s).to_string()).collect(), None),
+        Op::AppSort => (APP_SORTS.iter().map(|s| s().to_string()).collect(), Some(APP_SORT.get())),
+        Op::Accent => (winrust_common::style::Accent::ALL.iter().map(|a| a.name().to_string()).collect(), Some(o.accent())),
         Op::PvTab => (more::Cap::ALL.iter().map(|c| c.name().to_string()).collect(), more::Cap::ALL.iter().position(|&c| c == more::pv_tab())),
         Op::Plan => o.power_plans(),
         Op::Screen => o.power_timeouts(power::Timeout::Screen),
@@ -652,6 +700,14 @@ pub fn choose(op: Op, i: usize) -> Done {
                 done = Done::Denied;
             }
         }
+        (Op::Accent, _) => o.accent_set(i),
+        (Op::WuTime, _) => {
+            if let Some((h, m)) = WU_TIMES.get(i).and_then(|t| t.split_once(':')).and_then(|(h, m)| Some((h.parse().ok()?, m.parse().ok()?))) {
+                o.wu_schedule(wu::Sched::At(h, m));
+                wupage::set_chips(false);
+            }
+        }
+        (Op::AppSort, _) => APP_SORT.set(i.min(APP_SORTS.len() - 1)),
         (Op::PvTab, _) => {
             if let Some(&c) = more::Cap::ALL.get(i) {
                 more::set_pv_tab(c);
@@ -748,18 +804,36 @@ fn pac_text() -> String {
 pub const NET_PAGE: usize = 3;
 pub const BT_PAGE: usize = 4;
 pub const APPS_PAGE: usize = 5;
-pub const NOTIFY_PAGE: usize = 6;
-pub const PERSONAL_PAGE: usize = 7;
-pub const PRIVACY_PAGE: usize = 8;
-pub const KEYBOARD_PAGE: usize = 9;
-pub const TIME_PAGE: usize = 10;
-pub const WU_PAGE: usize = 11;
-pub const ABOUT_PAGE: usize = 12;
+pub const DEFAULTS_PAGE: usize = 6;
+pub const NOTIFY_PAGE: usize = 7;
+pub const PERSONAL_PAGE: usize = 8;
+pub const PRIVACY_PAGE: usize = 9;
+pub const KEYBOARD_PAGE: usize = 10;
+pub const TIME_PAGE: usize = 11;
+pub const WU_PAGE: usize = 12;
+pub const ABOUT_PAGE: usize = 13;
 pub const POWER_PAGE: usize = 2;
 
 thread_local! { static EXPANDED: RefCell<Option<String>> = const { RefCell::new(None) } } // the adapter whose details show
 thread_local! { static RADIO: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) } }
 thread_local! { static PROGRAMS: RefCell<Option<Vec<ext::App>>> = const { RefCell::new(None) } } // read when the Apps page opens
+/// The times the "Pick a time" list of a scheduled restart offers.
+pub const WU_TIMES: [&str; 6] = ["18:00", "20:00", "22:00", "23:30", "01:00", "04:00"];
+
+thread_local! { static APP_SORT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) } } // 0 name, 1 size, 2 install date
+
+/// The ways the Apps page orders its list.
+const APP_SORTS: [fn() -> &'static str; 3] = [|| t!("Названию", "Name"), || t!("Размеру", "Size"), || t!("Дате установки", "Install date")];
+
+/// "612 MB", "1.2 GB" (KB in); empty when the installer did not say.
+fn size_text(kb: u64) -> String {
+    match kb {
+        0 => String::new(),
+        k if k >= 1 << 20 => format!("{:.1} GB", k as f64 / f64::from(1 << 20)),
+        k => format!("{} MB", (k / 1024).max(1)),
+    }
+}
+
 thread_local! { static APP_QUERY: RefCell<String> = const { RefCell::new(String::new()) } } // what the Apps page's own search box holds
 
 /// The Apps page's own search box now holds `q` (the page shows the programs whose name or publisher has it).
@@ -1093,66 +1167,33 @@ fn apps_rows(q: &str) -> Vec<Group> {
     let list = PROGRAMS.with_borrow_mut(|p| p.get_or_insert_with(|| os().programs()).clone());
     let q = q.trim().to_lowercase();
     let shown: Vec<&ext::App> = list.iter().filter(|a| q.is_empty() || format!("{} {}", a.name, a.publisher).to_lowercase().contains(&q)).collect();
+    let mut shown = shown;
+    match APP_SORT.get() {
+        1 => shown.sort_by_key(|a| std::cmp::Reverse(a.size_kb)),
+        2 => shown.sort_by_key(|a| std::cmp::Reverse(a.date)),
+        _ => {}
+    }
     let rows = shown
         .iter()
         .take(400)
         .map(|a| {
             let sub = if a.publisher.is_empty() { a.version.clone() } else { format!("{} · {}", a.publisher, a.version) };
-            Line::new(Row::Item(a.name.clone(), a.version.clone(), Cmd::Uninstall(a.uninstall.clone()))).subtitle(sub).tile(Tile::Solid(look::APP_GRID, 0x6b7187))
+            // "612 MB · 21 Jul" at the right, as the design has it
+            let val = [Some(size_text(a.size_kb)).filter(|s| !s.is_empty()), a.date.map(|(_, m, d)| format!("{d} {}", more::month_name(m as u8)))].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ");
+            Line::new(Row::Item(a.name.clone(), val, Cmd::Uninstall(a.uninstall.clone()))).subtitle(sub).tile(Tile::Solid(look::APP_GRID, 0x6b7187))
         })
         .collect();
     let count = if q.is_empty() { String::new() } else { tf!("{} из {}", "{} of {}", ja: "{} / {}", pt: "{} de {}", zh: "{} / {}", shown.len(), list.len()) };
-    let head = Group::new(tf!("Приложений: {}", "{} apps", list.len())).extra(Extra::Search(count));
+    let total: u64 = list.iter().map(|a| a.size_kb).sum();
+    let mut head = Group::new(tf!("Приложений: {}", "{} apps", list.len())).extra(Extra::Search(count)).rows(vec![Line::new(Row::Cycle(t!("Сортировать по", "Sort by", ja: "並べ替え", pt: "Ordenar por", zh: "排序方式").into(), String::new, Op::AppSort)).key("app-sort")]);
+    if total > 0 {
+        head = head.note(tf!("{} всего", "{} in total", size_text(total)));
+    }
     let mut g = Group::new("").rows(rows);
     if shown.is_empty() && !list.is_empty() {
         g = g.empty(tf!("Нет приложений по запросу «{}». Попробуйте часть названия или издателя.", "No apps match “{}”. Try part of the name or the publisher.", ja: "「{}」に一致するアプリはありません。名前または発行元の一部をお試しください。", pt: "Nenhum app corresponde a “{}”. Tente parte do nome ou do editor.", zh: "没有与“{}”匹配的应用。请尝试名称或发布者的一部分。", q));
     }
     vec![head, g]
-}
-
-fn wu_rows() -> Vec<Group> {
-    let o = os();
-    let (s, extra) = (o.wu_state(), o.wu_extra());
-    let n = s.found.as_ref().map_or(0, Vec::len);
-    let (title, sub, tile) = match (&s.busy, &s.found) {
-        (Some(b), _) => (b.clone(), extra.progress.map_or_else(|| t!("Это займёт некоторое время · можно работать", "This takes a while \u{b7} you can keep working").to_string(), |p| tf!("{}% · можно работать", "{}% \u{b7} you can keep working", p)), Tile::Lit(look::REFRESH)),
-        (_, _) if extra.restart => (t!("Установлено. Перезагрузите, чтобы завершить", "Installed. Restart to finish").to_string(), t!("Windows завершит обновление при перезагрузке", "Windows finishes the updates while it restarts").to_string(), Tile::Soft(look::WARN, Tone::Warn)),
-        (_, None) => (t!("Ещё не проверялось", "Not checked yet", ja: "まだ確認していません", pt: "Ainda não verificado", zh: "尚未检查").to_string(), s.note.clone(), Tile::Quiet(look::REFRESH)),
-        (_, Some(f)) if f.is_empty() => (t!("Всё установлено", "You\u{2019}re up to date", ja: "最新の状態です", pt: "Atualizado", zh: "已是最新").to_string(), s.note.clone(), Tile::Soft(look::CHECK, Tone::Good)),
-        (_, Some(_)) => (tf!("Доступно обновлений: {}", "{} updates are available", ja: "利用可能な更新プログラム: {}", pt: "Atualizações disponíveis: {}", zh: "可用更新：{}", n), t!("Для установки нужны права администратора", "Installing needs administrator rights").to_string(), Tile::Soft(look::WARN, Tone::Warn)),
-    };
-    let cmd = if s.found.as_ref().is_some_and(|f| !f.is_empty()) && s.busy.is_none() { Cmd::Install } else { Cmd::Check };
-    let mut status = Line::new(Row::Item(title, String::new(), cmd)).key("wu-status").subtitle(sub).tile(tile).weight(600).busy(s.busy.is_some());
-    (status.big, status.restart) = (true, extra.restart && s.busy.is_none());
-    // what the disabled button says while something runs: installing what was found, or looking
-    status.val = if s.found.as_ref().is_some_and(|f| !f.is_empty()) { t!("Установка", "Installing") } else { t!("Проверка", "Checking") }.into();
-    let mut gs = vec![Group::new("").rows(vec![status])];
-    if s.busy.is_some() || n > 0 {
-        let rows = s
-            .found
-            .iter()
-            .flatten()
-            .take(30)
-            .enumerate()
-            .map(|(i, t)| {
-                // what each update is doing: the first takes the progress of the run, the next waits for it (the mockup's reading)
-                let state = if extra.restart {
-                    t!("Установлено · ждёт перезагрузки", "Installed \u{b7} waiting for restart").to_string()
-                } else {
-                    match (s.busy.is_some(), extra.progress) {
-                        (true, Some(p)) if i == 0 || p > 85 => tf!("Установка · {}%", "Installing \u{b7} {}%", if i == 0 { (u32::from(p) * 115 / 100).min(100) } else { ((u32::from(p) - 85) * 66 / 10).min(100) }),
-                        (true, Some(_)) => t!("Ждёт", "Waiting").to_string(),
-                        (true, None) => String::new(),
-                        (false, _) => t!("Готово к загрузке", "Ready to download").to_string(),
-                    }
-                };
-                Line::new(Row::Info(t.clone(), String::new())).subtitle(state).tile(Tile::Quiet(look::DOWNLOAD))
-            })
-            .collect();
-        gs.push(Group::new(t!("Обновления", "Updates")).rows(rows));
-    }
-    gs.push(Group::new("").foot(t!("Сам WinRust обновляется отдельно: настройки панели → Обновления.", "WinRust itself updates separately: Bar settings \u{2192} Updates.")));
-    gs
 }
 
 /// The walls the window offers: only the demo has any.
@@ -1168,7 +1209,12 @@ fn personal_rows() -> Vec<Group> {
             Line::new(toggle_row(t!("Тёмная тема для приложений", "Dark theme for apps", ja: "アプリのダーク テーマ", pt: "Tema escuro para apps", zh: "应用深色主题"), PERSONALIZE, "AppsUseLightTheme", 0, 1)).subtitle(t!("Это окно, файловый менеджер, диспетчер задач", "This window, the file manager, Task Manager")),
             Line::new(toggle_row(t!("Тёмная тема для системы", "Dark theme for the system", ja: "システムのダーク テーマ", pt: "Tema escuro para o sistema", zh: "系统深色主题"), PERSONALIZE, "SystemUsesLightTheme", 0, 1)).subtitle(t!("Панель, Пуск и уведомления", "The bar, Start and notifications")),
             Line::new(toggle_row(t!("Эффекты прозрачности", "Transparency effects", ja: "透明効果", pt: "Efeitos de transparência", zh: "透明效果"), PERSONALIZE, "EnableTransparency", 1, 1)),
-            Line::new(toggle_row(t!("Акцентный цвет на заголовках окон", "Accent color on title bars", ja: "タイトル バーにアクセント カラーを表示", pt: "Cor de destaque nas barras de título", zh: "标题栏上的强调色"), r"Software\Microsoft\Windows\DWM", "ColorPrevalence", 1, 0)),
+            Line::new(toggle_row(t!("Акцентный цвет на заголовках окон", "Accent colour on title bars", ja: "タイトル バーにアクセント カラーを表示", pt: "Cor de destaque nas barras de título", zh: "标题栏上的强调色"), r"Software\Microsoft\Windows\DWM", "ColorPrevalence", 1, 0)),
+            {
+                let mut l = Line::new(Row::Cycle(t!("Акцентный цвет", "Accent colour", ja: "アクセント カラー", pt: "Cor de destaque", zh: "强调色").into(), String::new, Op::Accent)).key("accent");
+                l.h = Some(48.0);
+                l
+            },
         ]),
         Group::new(t!("Язык", "Language", ja: "言語", pt: "Idioma", zh: "语言")).rows(vec![Line::new(Row::Cycle(t!("Язык интерфейса", "Interface language", ja: "表示言語", pt: "Idioma da interface", zh: "界面语言").into(), lang_text, Op::UiLang))]),
     ]
@@ -1178,18 +1224,39 @@ fn about_rows() -> Vec<Group> {
     let o = os();
     let reg = |n: &str| o.windows_value(n);
     let build: u32 = reg("CurrentBuild").parse().unwrap_or(0);
+    let a = o.about_info();
     let info = |l: &str, v: String| Line::new(Row::Info(l.into(), v));
-    vec![
-        Group::new(t!("Устройство", "Device", ja: "デバイス", pt: "Dispositivo", zh: "设备")).act(t!("Копировать", "Copy"), false, GAct::Copy).rows(vec![
-            info(t!("Имя компьютера", "Computer name", ja: "コンピューター名", pt: "Nome do computador", zh: "计算机名"), o.computer_name()),
-            info(t!("Оперативная память", "Memory", ja: "メモリ", pt: "Memória", zh: "内存"), o.ram_text()),
-        ]),
-        Group::new("Windows").rows(vec![
-            info(t!("Выпуск", "Edition", ja: "エディション", pt: "Edição", zh: "发行版"), os_name(&reg("ProductName"), build)),
-            info(t!("Версия", "Version", ja: "バージョン", pt: "Versão", zh: "版本"), reg("DisplayVersion")),
-            info(t!("Сборка", "Build", ja: "ビルド", pt: "Compilação", zh: "内部版本"), reg("CurrentBuild")),
-        ]),
-    ]
+    let name = o.computer_name();
+    let mut pc = Line::new(Row::Item(t!("Имя компьютера", "Computer name", ja: "コンピューター名", pt: "Nome do computador", zh: "计算机名").into(), t!("Переименовать", "Rename").into(), Cmd::Rename)).key("pcname");
+    pc.sub = match &a.pc_pending {
+        Some(n) => tf!("{} · после перезагрузки: {}", "{} \u{b7} after a restart: {}", name, n),
+        None => name,
+    };
+    if a.pc_pending.is_some() {
+        pc.tone = Tone::Warn;
+    }
+    let mut device = vec![pc];
+    let mut push = |label: &str, v: String| {
+        if !v.is_empty() {
+            device.push(info(label, v));
+        }
+    };
+    push(t!("Процессор", "Processor", ja: "プロセッサ", pt: "Processador", zh: "处理器"), a.cpu.clone());
+    push(t!("Установленная память", "Installed memory", ja: "実装メモリ", pt: "Memória instalada", zh: "已安装的内存"), if a.ram.is_empty() { o.ram_text() } else { a.ram.clone() });
+    for (i, g) in a.gpus.iter().enumerate() {
+        let label = t!("Графика", "Graphics", ja: "グラフィックス", pt: "Gráficos", zh: "显卡");
+        push(&if i == 0 { label.to_string() } else { format!("{label} {}", i + 1) }, g.clone());
+    }
+    push(t!("Тип системы", "System type", ja: "システムの種類", pt: "Tipo de sistema", zh: "系统类型"), a.sys_type.clone());
+    let mut windows = vec![
+        info(t!("Выпуск", "Edition", ja: "エディション", pt: "Edição", zh: "发行版"), os_name(&reg("ProductName"), build)),
+        info(t!("Версия", "Version", ja: "バージョン", pt: "Versão", zh: "版本"), reg("DisplayVersion")),
+        info(t!("Сборка", "Build", ja: "ビルド", pt: "Compilação", zh: "内部版本"), if a.build.is_empty() { reg("CurrentBuild") } else { a.build.clone() }),
+    ];
+    if !a.winrust.is_empty() {
+        windows.push(info("WinRust", a.winrust.clone()));
+    }
+    vec![Group::new(t!("Устройство", "Device", ja: "デバイス", pt: "Dispositivo", zh: "设备")).act(t!("Копировать", "Copy"), false, GAct::Copy).rows(device), Group::new("Windows").rows(windows)]
 }
 
 /// The titles of the pages, in the order of the sidebar.
@@ -1202,6 +1269,7 @@ pub fn page_title(i: usize) -> String {
         3 => t!("Сеть", "Network", ja: "ネットワーク", pt: "Rede", zh: "网络"),
         4 => "Bluetooth",
         5 => t!("Приложения", "Apps", ja: "アプリ", pt: "Apps", zh: "应用"),
+        DEFAULTS_PAGE => t!("Приложения по умолчанию", "Default apps", ja: "既定のアプリ", pt: "Apps padrão", zh: "默认应用"),
         NOTIFY_PAGE => t!("Уведомления", "Notifications", ja: "通知", pt: "Notificações", zh: "通知"),
         PERSONAL_PAGE => t!("Персонализация", "Personalization", ja: "個人用設定", pt: "Personalização", zh: "个性化"),
         PRIVACY_PAGE => t!("Конфиденциальность и защита", "Privacy & security", ja: "プライバシーとセキュリティ", pt: "Privacidade e segurança", zh: "隐私和安全"),
@@ -1230,12 +1298,13 @@ fn page_with(i: usize, apps: &str) -> Page {
         NET_PAGE => network_rows(),
         BT_PAGE => bt_rows(),
         APPS_PAGE => apps_rows(apps),
+        DEFAULTS_PAGE => more::defaults_rows(),
         NOTIFY_PAGE => more::notify_rows(),
         PERSONAL_PAGE => personal_rows(),
         PRIVACY_PAGE => more::privacy_rows(),
         KEYBOARD_PAGE => more::keyboard_rows(),
         TIME_PAGE => more::time_rows(),
-        WU_PAGE => wu_rows(),
+        WU_PAGE => wupage::wu_rows(),
         _ => about_rows(),
     };
     Page { title: page_title(i), groups }

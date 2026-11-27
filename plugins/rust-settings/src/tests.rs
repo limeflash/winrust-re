@@ -4,6 +4,7 @@
 use super::*;
 use crate::{
     more::{Cap, Flag, Gauge, Opt, Who},
+    wupage,
     app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
     demo::{self, Demo},
 };
@@ -113,7 +114,7 @@ fn names_and_pages() {
     assert_eq!(gb(16 << 30), "16.0 GB");
     assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (ABOUT_PAGE, 0, 0, 0));
     assert_eq!((page_for("ms-settings:notifications"), page_for("ms-settings:privacy-microphone"), page_for("ms-settings:keyboard"), page_for("ms-settings:dateandtime")), (NOTIFY_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE));
-    assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 7));
+    assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, PERSONAL_PAGE));
     assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
     assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (2, 2));
 }
@@ -201,9 +202,9 @@ fn a_page_whose_title_matches_and_has_no_line_hits_shows_itself_as_a_page() {
     let own = f.iter().find(|f| f.page == WU_PAGE);
     assert!(own.is_some(), "{word}: {f:?}");
     // a page that matches by title only: Personalization (no line says it)
-    let t = pgs[7].title.to_lowercase();
+    let t = pgs[PERSONAL_PAGE].title.to_lowercase();
     let f = search::search(&pgs, &t);
-    let hit = f.iter().find(|f| f.page == 7).and_then(|f| f.hits.first()).expect("the page itself");
+    let hit = f.iter().find(|f| f.page == PERSONAL_PAGE).and_then(|f| f.hits.first()).expect("the page itself");
     assert_eq!((hit.key.as_deref(), hit.sub.as_str()), (None, search::page_word()));
     assert!(search::search(&pgs, "zzzq").is_empty(), "nothing matches: no groups");
 }
@@ -452,14 +453,11 @@ fn the_night_light_strength_is_four_steps_that_reach_choose() {
 #[test]
 fn the_buttons_of_item_rows_run_the_same_commands() {
     type Pred = fn(&Line) -> bool;
-    let cases: [(&str, Pred, &str); 7] = [
+    let cases: [(&str, Pred, &str); 4] = [
         ("network", |l| matches!(&l.row, Row::Item(_, _, Cmd::Vpn(_))), "vpn_dial Work VPN"),
         ("power", |l| matches!(&l.row, Row::Item(_, _, Cmd::CleanTemp)), "temp_clean"),
         ("power", |l| matches!(&l.row, Row::Item(_, _, Cmd::EmptyBin)), "bin_empty"),
         ("bt-searching", |l| matches!(&l.row, Row::Item(_, _, Cmd::BtPair(_))), "bt_pair px"),
-        ("wu-up-to-date", |l| matches!(&l.row, Row::Item(_, _, Cmd::Check)), "wu_check"),
-        ("wu-available", |l| matches!(&l.row, Row::Item(_, _, Cmd::Install)), "wu_install"),
-        ("update", |l| matches!(&l.row, Row::Item(_, _, Cmd::Check)), "wu_check"),
     ];
     for (state, pred, expect) in cases {
         let (mut s, d) = win(state);
@@ -557,7 +555,7 @@ fn a_destructive_row_needs_a_second_click_on_the_same_row() {
 #[test]
 fn the_apps_page_has_a_search_box_of_its_own() {
     let (mut s, d) = win("apps");
-    let names = |s: &Settings| s.pg.groups.iter().flat_map(|g| g.rows.iter().map(|l| l.row.label().to_string())).collect::<Vec<_>>();
+    let names = |s: &Settings| s.pg.groups.iter().flat_map(|g| g.rows.iter().filter(|l| l.key != "app-sort").map(|l| l.row.label().to_string())).collect::<Vec<_>>();
     assert_eq!(names(&s).len(), 12);
     let count = |s: &Settings| s.pg.groups.iter().find_map(|g| if let Extra::Search(c) = &g.extra { Some(c.clone()) } else { None }).expect("the box is on the page");
     assert_eq!(count(&s), "", "nothing typed: no count");
@@ -570,7 +568,7 @@ fn the_apps_page_has_a_search_box_of_its_own() {
     assert!(invalidated(&cx));
     // the title still says how many there are in all, and the sidebar's search does not see the filter
     assert!(s.pg.groups[0].title.contains("12"));
-    assert_eq!(pages()[APPS_PAGE].groups.iter().map(|g| g.rows.len()).sum::<usize>(), 12);
+    assert_eq!(pages()[APPS_PAGE].groups.iter().flat_map(|g| &g.rows).filter(|l| l.key != "app-sort").count(), 12);
     // a click on Uninstall arms the row; typing disarms it, and the second click does not uninstall what was armed before
     let edge = id(&s, |l| l.row.label() == "Microsoft Edge", P_CTL);
     click(&mut s, edge);
@@ -987,8 +985,8 @@ fn light_and_dark_draw_every_state_of_the_design() {
 
 #[test]
 fn the_new_pages_are_in_the_sidebars_order_and_the_search_finds_their_lines() {
-    assert_eq!(PAGES, 13);
-    assert_eq!((NOTIFY_PAGE, PERSONAL_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE, WU_PAGE, ABOUT_PAGE), (6, 7, 8, 9, 10, 11, 12));
+    assert_eq!(PAGES, 14);
+    assert_eq!((NOTIFY_PAGE, PERSONAL_PAGE, PRIVACY_PAGE, KEYBOARD_PAGE, TIME_PAGE, WU_PAGE, ABOUT_PAGE), (7, 8, 9, 10, 11, 12, 13));
     assert_eq!(look::NAV.len(), PAGES);
     let pgs = pages();
     assert!(pgs.iter().all(|p| !p.groups.is_empty()));
@@ -1187,4 +1185,355 @@ fn names_dates_and_times_of_the_new_pages_read_well() {
     let w = |ago| more::When { days_ago: ago, hour: 8, min: 5, day: 20, month: 11 };
     assert!(more::when_text(w(0)).ends_with("08:05") && more::when_text(w(1)).ends_with("08:05"));
     assert!(more::when_text(w(5)).starts_with("20 "));
+}
+
+#[test]
+fn an_app_that_installs_into_a_new_folder_each_update_is_one_row_and_a_crash_is_not_in_use() {
+    use crate::more::{CApp, RawDesk, When, group_desktop};
+    let w = |ago: u32| When { days_ago: ago, hour: 9, min: 0, day: 1, month: 1 };
+    let k = |key: &str, start: u64, stop: u64, ago: u32| RawDesk { key: key.into(), start, stop, start_when: Some(w(ago)), stop_when: (stop != 0).then(|| w(ago)) };
+    let raw = || vec![k("C:#x#Discord#app-1.0.9248#DISCORD.EXE", 100, 0, 130), k("C:#x#Discord#app-1.0.9251#Discord.exe", 200, 0, 100), k("C:#x#Edge#1#msedgewebview2.exe", 10, 20, 9), k("C:#x#Edge#2#msedgewebview2.exe", 30, 40, 7)];
+    let named = |_: &str| None;
+    // not running: two crashed keys, none of them "in use"; one row per exe, the latest start speaks for it
+    let apps: Vec<CApp> = group_desktop(raw(), &|_| false, &named);
+    assert_eq!(apps.len(), 2, "{apps:?}");
+    let d = apps.iter().find(|a| a.id.contains("9251")).expect("the latest Discord key");
+    assert!(!d.live && d.last == Some(w(100)), "a crash left it open: it was last used at its start: {d:?}");
+    let e = apps.iter().find(|a| a.id.contains("#2#")).unwrap();
+    assert_eq!(e.last, Some(w(7)), "the closed one: its stop time");
+    // running: the newest key was never closed and Discord runs: in use now
+    assert!(group_desktop(raw(), &|exe| exe == "discord.exe", &named).iter().any(|a| a.id.contains("9251") && a.live));
+    // the name comes from the exe's own description when it is there, else the prettified file name
+    let apps = group_desktop(raw(), &|_| false, &|p| p.ends_with("msedgewebview2.exe").then(|| "Microsoft Edge WebView2".to_string()));
+    assert!(apps.iter().any(|a| a.name == "Microsoft Edge WebView2") && apps.iter().any(|a| a.name == "Discord"), "{apps:?}");
+}
+
+#[test]
+fn the_microphone_list_shows_discord_once_and_names_the_webview_properly() {
+    let (s, _d) = win("privacy");
+    let rows = &s.pg.groups[2].rows;
+    assert_eq!(rows.iter().filter(|l| l.row.label() == "Discord").count(), 1, "one Discord row");
+    assert!(rows.iter().any(|l| l.row.label() == "Microsoft Edge WebView2"));
+    assert!(rows.iter().filter(|l| l.badge.is_some()).count() >= 2, "the PC's Admin badge and Discord's In use now");
+    let mic = s.pg.groups[0].rows.iter().find(|l| l.key == "now:microphone").unwrap();
+    assert!(mic.sub.contains("Discord"), "{}", mic.sub);
+}
+
+#[test]
+fn the_accent_swatches_reach_the_accent_and_show_the_current_one() {
+    let (mut s, d) = win("personal");
+    let line = |s: &Settings| s.pg.groups[1].rows.iter().find(|l| l.key == "accent").map(|l| (l.opts.len(), l.cur)).unwrap();
+    assert_eq!(line(&s), (winrust_common::style::Accent::ALL.len(), Some(0)), "the demo's accent is the first");
+    press(&mut s, |l| matches!(&l.row, Row::Cycle(_, _, Op::Accent)), P_SEG + 3);
+    assert_eq!(d.log(), vec!["accent_set 3"]);
+    assert_eq!(line(&s), (5, Some(3)), "the page was read again");
+    Rig::new("personal").frame();
+}
+
+#[test]
+fn a_wallpaper_tile_reaches_the_system_and_the_current_one_is_marked() {
+    let (mut s, d) = win("personal");
+    let on = |s: &Settings| match &s.pg.groups[0].extra {
+        Extra::Walls(w) => w.iter().position(|w| w.on),
+        _ => None,
+    };
+    assert_eq!(on(&s), Some(0));
+    click(&mut s, ID_WALL + 2);
+    assert_eq!(d.log(), vec!["wallpaper_select 2"]);
+    assert_eq!(on(&s), Some(2), "the picked preset is the selected one");
+    // the "Choose..." tile is the last one
+    d.clear_log();
+    click(&mut s, ID_WALL + 5);
+    assert_eq!(d.log(), vec!["wallpaper_pick"]);
+}
+
+fn card(s: &Settings) -> &wupage::WuCard {
+    match &s.pg.groups[0].extra {
+        Extra::WuCard(w) => w,
+        _ => panic!("the status card is first"),
+    }
+}
+
+fn acts(s: &Settings) -> Vec<wupage::WuAct> {
+    card(s).btns.iter().map(|b| b.act).collect()
+}
+
+#[test]
+fn every_state_of_the_update_page_has_the_card_the_design_draws() {
+    use wupage::WuAct::*;
+    let (s, _d) = win("wu-stale");
+    assert_eq!(acts(&s), [Check]);
+    let (s, _d) = win("update-checking");
+    assert!(card(&s).spin);
+    assert_eq!(acts(&s), [Cancel]);
+    let (s, _d) = win("wu-up-to-date");
+    assert_eq!((acts(&s), card(&s).tone), (vec![Check], Tone::Good));
+    assert!(!card(&s).sub.is_empty() && !card(&s).sub2.is_empty(), "when it last looked, and what it last installed");
+    let (s, _d) = win("wu-available");
+    let c = card(&s);
+    assert_eq!(acts(&s), [Install]);
+    assert!(c.btns[0].shield && !c.btns[0].dis && !c.sub2.is_empty(), "not an administrator: the shield, and the line that Windows asks");
+    assert_eq!(s.pg.groups[1].rows.len(), 3, "the required ones are ticked and listed");
+    assert!(&s.pg.groups[1].rows.iter().all(|l| matches!(&l.row, Row::Upd(u) if matches!(u.mode, wupage::UMode::Pick(true)))));
+    assert!(&s.pg.groups[2].rows.is_empty(), "the optional ones are folded");
+    let (s, _d) = win("wu-available-optional");
+    assert_eq!(s.pg.groups[2].rows.len(), 3);
+    assert!(&s.pg.groups[2].rows.iter().all(|l| matches!(&l.row, Row::Upd(u) if matches!(u.mode, wupage::UMode::Pick(false)))), "optional updates start unticked");
+    let (s, _d) = win("wu-downloading");
+    assert_eq!((acts(&s), card(&s).prog.as_ref().map(|p| p.0.round() as u32)), (vec![Cancel], Some(38)));
+    assert_eq!(s.pg.groups[1].rows.len(), 3);
+    let (s, _d) = win("wu-installing");
+    assert!(card(&s).btns[0].busy && card(&s).btns[0].dis, "installing cannot be cancelled");
+    let (s, _d) = win("wu-restart");
+    assert_eq!((acts(&s), card(&s).chips.is_none()), (vec![Sched, RestartDlg], true));
+    assert_eq!(s.pg.groups.iter().flat_map(|g| &g.rows).filter(|l| matches!(&l.row, Row::Upd(_))).count(), 2, "the two that wait for the restart");
+    let (s, _d) = win("wu-restart-schedule");
+    assert_eq!(card(&s).chips.as_ref().map(|c| c.0.len()), Some(3));
+    let (s, _d) = win("wu-scheduled");
+    assert_eq!(acts(&s), [Unsched, Sched]);
+    assert!(card(&s).title.contains("03:00"));
+    let (s, _d) = win("wu-failed");
+    assert_eq!(acts(&s), [Details, Install]);
+    assert!(card(&s).err.as_ref().is_some_and(|e| e.2.contains("0x800f0922")));
+    let bad = s.pg.groups.iter().flat_map(|g| &g.rows).filter(|l| matches!(&l.row, Row::Upd(u) if matches!(&u.mode, wupage::UMode::Icon { tone: Tone::Bad, .. }))).count();
+    assert_eq!(bad, 1, "one update failed, the others installed");
+    let (s, _d) = win("wu-history");
+    assert!(s.pg.groups.iter().filter(|g| g.title.contains('\u{b7}') || g.rows.iter().any(|l| l.key.starts_with("h:"))).count() >= 3, "grouped by kind");
+}
+
+#[test]
+fn the_ticks_the_buttons_and_the_links_of_the_update_page_reach_the_system() {
+    let (mut s, d) = win("wu-available");
+    let upd = |id: &str| { let k = format!("upd:{id}"); move |l: &Line| l.key == k };
+    // Download and install: the ticked ones (the required three, not the optional)
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_install cu,net,def"]);
+    // a tick: the row toggles, the card counts and the button says how many
+    let (mut s, d) = win("wu-available");
+    let sub = card(&s).sub.clone();
+    press(&mut s, upd("net"), P_BODY);
+    assert_ne!(card(&s).sub, sub, "the size to download follows the ticks");
+    assert!(card(&s).btns[0].label.contains("(2)"), "{}", card(&s).btns[0].label);
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_install cu,def"]);
+    // Clear all, then nothing can be installed
+    let (mut s, d) = win("wu-available");
+    let at = ID_GACT + 1;
+    click(&mut s, at);
+    assert!(card(&s).btns[0].dis && s.pg.groups[1].rows.iter().all(|l| matches!(&l.row, Row::Upd(u) if matches!(u.mode, wupage::UMode::Pick(false)))));
+    click(&mut s, crate::draw::ID_WU);
+    assert!(d.log().is_empty(), "nothing is ticked: nothing is asked of Windows");
+    // the optional ones: Show, then a tick makes the update part of the run
+    let (mut s, d) = win("wu-available");
+    let at = ID_GACT + 2;
+    click(&mut s, at);
+    s.number_lines(); // what a frame does: the rows that just appeared get their numbers
+    press(&mut s, upd("rt"), P_BODY);
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_install cu,net,def,rt"]);
+    // the KB link opens Microsoft's page for the number
+    d.clear_log();
+    let (mut s, d) = win("wu-available");
+    press(&mut s, upd("cu"), P_CTL);
+    assert_eq!(d.log(), vec!["open_link https://support.microsoft.com/help/5046617"]);
+    // an update without a KB has no link
+    let (mut s, d) = win("wu-available-optional");
+    press(&mut s, upd("nv"), P_CTL);
+    assert!(d.log().is_empty());
+    // the rows at the bottom
+    press(&mut s, |l| l.key == "wu-uninstall", P_BODY);
+    press(&mut s, |l| l.key == "wu-advanced", P_BODY);
+    assert_eq!(d.log(), vec!["open_link shell:::{d450a8a1-9568-45c7-9c0e-b4f9fb4537bd}", "open_link ms-settings:windowsupdate-options"]);
+    // Check, Cancel
+    let (mut s, d) = win("wu-stale");
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_check"]);
+    let (mut s, d) = win("wu-downloading");
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_cancel"]);
+}
+
+#[test]
+fn a_restart_asks_first_and_can_be_scheduled_cancelled_and_retried() {
+    let (mut s, d) = win("wu-restart");
+    // Restart now opens the dialog that names the apps; nothing restarts yet
+    click(&mut s, crate::draw::ID_WU + 1);
+    assert_eq!(s.rd.as_ref().map(Vec::len), Some(6));
+    assert!(d.log().is_empty());
+    click(&mut s, app::ID_RD_NO);
+    assert!(s.rd.is_none() && d.log().is_empty());
+    click(&mut s, crate::draw::ID_WU + 1);
+    assert!(s.key(0x1B, Mods::default(), &mut Cx::default()), "Esc closes it");
+    assert!(s.rd.is_none() && d.log().is_empty());
+    click(&mut s, crate::draw::ID_WU + 1);
+    let cx = click(&mut s, app::ID_RD_OK);
+    assert_eq!(d.log(), vec!["restart_now"]);
+    assert_eq!(toasts(&cx).len(), 1);
+    // Schedule... shows the chips; a chip sets the restart, the card says when; Cancel restart takes it back
+    let (mut s, d) = win("wu-restart");
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(card(&s).chips.as_ref().map(|c| c.0.len()), Some(3));
+    click(&mut s, crate::draw::ID_WUCHIP);
+    assert_eq!(d.log(), vec!["wu_schedule At(3, 0)"]);
+    assert!(card(&s).title.contains("03:00"), "{}", card(&s).title);
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log().last().map(String::as_str), Some("wu_unschedule"));
+    assert!(card(&s).chips.is_none(), "back to the restart card, chips folded");
+    // "In 1 hour" and the list of times
+    click(&mut s, crate::draw::ID_WU);
+    click(&mut s, crate::draw::ID_WUCHIP + 1);
+    assert_eq!(d.log().last().map(String::as_str), Some("wu_schedule In(60)"));
+    let (mut s, d) = win("wu-restart-schedule");
+    let cx = click(&mut s, crate::draw::ID_WUCHIP + 2);
+    let (tag, items) = menu(&cx).expect("a list of times");
+    assert_eq!((tag, items.len()), (TAG_PICK, WU_TIMES.len()));
+    s.command(TAG_PICK, 2, &mut Cx::default());
+    assert_eq!(d.log(), vec!["wu_schedule At(22, 0)"]);
+    // a failed run: Details unfolds the error, Try again tries the same updates
+    let (mut s, d) = win("wu-failed");
+    click(&mut s, crate::draw::ID_WU);
+    assert!(card(&s).err.is_none(), "Details folds it");
+    click(&mut s, crate::draw::ID_WU + 1);
+    assert_eq!(d.log(), vec!["wu_install cu,net,def"]);
+    // the history: Show all groups it, Show less folds it
+    let (mut s, _d) = win("wu-up-to-date");
+    let g = 1;
+    assert_eq!(s.pg.groups[g].rows.len(), 3);
+    click(&mut s, ID_GACT + g as Id);
+    assert!(s.pg.groups.iter().filter(|g| g.rows.iter().any(|l| l.key.starts_with("h:"))).count() >= 3);
+    click(&mut s, ID_GACT + g as Id);
+    assert_eq!(s.pg.groups[g].rows.len(), 3);
+}
+
+#[test]
+fn the_about_page_has_every_fact_of_the_design_and_copy_takes_them_all() {
+    let (mut s, _d) = win("about");
+    let labels: Vec<String> = s.pg.groups.iter().flat_map(|g| g.rows.iter().map(|l| l.row.label().to_string())).collect();
+    assert_eq!(labels.len(), 9, "name, processor, memory, graphics, system type, edition, version, build, WinRust: {labels:?}");
+    let cx = {
+        let mut cx = Cx::default();
+        s.click(ID_GACT, Button::Left, 0.0, 0.0, &mut cx);
+        cx
+    };
+    let copied = cx.reqs.iter().find_map(|r| if let Req::Clipboard(t) = r { Some(t.clone()) } else { None });
+    let copied = copied.expect("the details are on the clipboard");
+    for want in ["DANIIAR-PC", "Ryzen", "32 GB", "Radeon 780M", "x64", "26100.2314", "0.5.9"] {
+        assert!(copied.contains(want), "{want} in {copied}");
+    }
+}
+
+#[test]
+fn a_computer_name_is_checked_before_windows_sees_it_and_a_refusal_is_told() {
+    assert!(more::valid_pc_name("DANIIAR-PC") && more::valid_pc_name("A"));
+    for bad in ["", "-A", "A-", "MY PC", "ABCDEFGHIJKLMNOP", "123", "A_B", "\u{43f}\u{43a}"] {
+        assert!(!more::valid_pc_name(bad), "{bad:?}");
+    }
+    let (mut s, d) = win("about");
+    let at = |l: &Line| l.key == "pcname";
+    press(&mut s, at, P_CTL);
+    assert_eq!(s.open.as_deref(), Some("pcname"));
+    assert_eq!(s.fields.pc.text, "DANIIAR-PC", "the field starts with the current name");
+    let flat = s.flat_of(at).unwrap();
+    // a bad name: an error under the field, nothing reaches Windows
+    s.fields.pc.set_text("my pc");
+    press(&mut s, at, P_ACT);
+    assert!(!s.field_err.is_empty() && d.log().is_empty(), "{:?}", d.log());
+    // an administrator is needed: the error is said and nothing changes
+    d.deny_admin();
+    s.fields.pc.set_text("new-pc");
+    press(&mut s, at, P_ACT);
+    assert_eq!(d.log(), vec!["rename_pc NEW-PC"]);
+    assert!(s.field_err.contains("dmin") || s.field_err.contains("дминистр"), "{}", s.field_err);
+    assert_eq!(s.open.as_deref(), Some("pcname"), "it stays open to try again");
+    // Enter in the field saves too; the name waits for a restart
+    let (mut s, d) = win("about");
+    press(&mut s, at, P_CTL);
+    s.fields.pc.set_text("new-pc");
+    let mut cx = Cx { focus: Some(row_id(flat, P_FIELD)), ..Cx::default() };
+    s.key(0x0D, Mods::default(), &mut cx);
+    assert_eq!(d.log(), vec!["rename_pc NEW-PC"]);
+    assert_eq!(toasts(&cx).len(), 1);
+    assert!(s.open.is_none());
+    assert!(s.line(flat).unwrap().sub.contains("NEW-PC"), "{}", s.line(flat).unwrap().sub);
+    // Cancel folds it without a call
+    let (mut s, d) = win("about");
+    press(&mut s, at, P_CTL);
+    press(&mut s, at, P_ACT + 1);
+    assert!(s.open.is_none() && d.log().is_empty());
+}
+
+#[test]
+fn default_apps_list_what_windows_has_and_a_pick_opens_windows_own_chooser() {
+    assert_eq!((page_for("ms-settings:defaultapps"), page_for("ms-settings:appsfeatures")), (DEFAULTS_PAGE, APPS_PAGE));
+    assert_eq!((more::clean_ext("*.WebP"), more::clean_ext(".mkv"), more::clean_ext("a b"), more::clean_ext("C:/x"), more::clean_ext(" ")), (Some(".webp".into()), Some(".mkv".into()), None, None, None));
+    let (mut s, d) = win("defaults");
+    let rows = &s.pg.groups[0].rows;
+    assert_eq!(rows.len(), 8, "the design's eight rows");
+    assert!(matches!(&rows[1].row, Row::Info(..)) && matches!(&rows[6].row, Row::Info(..)), "the file manager and the terminal are WinRust's own: shown, not offered");
+    let photos = |s: &Settings| s.pg.groups[0].rows.iter().find(|l| l.key == "def:Photos").map(|l| l.val.clone()).unwrap();
+    assert_eq!(photos(&s), "WinRust Photos");
+    // the list is the one Windows gave, the default is ticked; a pick asks Windows, which asks the user
+    let at = id(&s, |l| l.key == "def:Photos", P_CTL);
+    let cx = click(&mut s, at);
+    let (tag, items) = menu(&cx).expect("a list of the registered apps");
+    assert_eq!((tag, items.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()), (TAG_PICK, vec!["WinRust Photos", "Windows Photos", "Paint"]));
+    assert_eq!(items.iter().position(|m| m.radio == Some(true)), Some(0));
+    let mut cx = Cx::default();
+    s.command(TAG_PICK, 2, &mut cx);
+    assert_eq!(d.log(), vec!["assoc_pick .jpg 2"]);
+    assert_eq!(toasts(&cx).len(), 1, "the toast says Windows asks to confirm");
+    assert_eq!(photos(&s), "Paint", "read again after the dialog");
+    // the rows that are WinRust's own do nothing
+    d.clear_log();
+    press(&mut s, |l| l.key == "def:Files", P_CTL);
+    assert!(d.log().is_empty());
+    // a link scheme goes to the same call (Live sends it to Windows' settings page)
+    let at = id(&s, |l| l.key == "def:Web", P_CTL);
+    click(&mut s, at);
+    s.command(TAG_PICK, 1, &mut Cx::default());
+    assert_eq!(d.log(), vec!["assoc_pick http 1"]);
+}
+
+#[test]
+fn a_typed_file_type_shows_its_own_row_and_an_unknown_one_says_so() {
+    let (mut s, d) = win("defaults-lookup");
+    let g = &s.pg.groups[0];
+    assert_eq!(g.rows.len(), 1);
+    assert_eq!(g.rows[0].row.label(), ".webp");
+    assert!(matches!(&g.extra, Extra::Search(c) if !c.is_empty()), "the box says how many matched");
+    assert_eq!(choices(Op::DefExt).unwrap().0, vec!["WinRust Photos", "Windows Photos", "Paint"]);
+    let at = id(&s, |l| l.key == "def:.webp", P_CTL);
+    click(&mut s, at);
+    s.command(TAG_PICK, 1, &mut Cx::default());
+    assert_eq!(d.log(), vec!["assoc_pick .webp 1"]);
+    // nothing is linked to .xyz: no row, a line that says Windows will ask
+    let (s, _d) = win("defaults-none");
+    assert!(s.pg.groups[0].rows.is_empty() && !s.pg.groups[0].empty.is_empty());
+    // typing in the page's box searches; leaving the page empties it
+    let (mut s, _d) = win("defaults");
+    let mut cx = Cx { focus: Some(app::ID_AQ), ..Cx::default() };
+    s.text(".mkv", &mut cx);
+    assert_eq!(s.pg.groups[0].rows.len(), 1);
+    click(&mut s, ID_NAV);
+    click(&mut s, ID_NAV + DEFAULTS_PAGE as Id);
+    assert!(s.aq.text.is_empty() && s.pg.groups[0].rows.len() == 8);
+}
+
+#[test]
+fn the_apps_page_shows_size_and_date_and_sorts_by_them() {
+    let (mut s, _d) = win("apps");
+    let first = |s: &Settings| s.pg.groups[1].rows[0].row.label().to_string();
+    let first_line = s.pg.groups[1].rows[0].val.clone();
+    assert!(first_line.contains("MB") && first_line.contains('\u{b7}'), "size and day at the right: {first_line}");
+    assert!(s.pg.groups[0].note.contains("GB"), "the title's note says what they take in all: {}", s.pg.groups[0].note);
+    assert_eq!(first(&s), "7-Zip", "by name");
+    press(&mut s, |l| l.key == "app-sort", P_CTL);
+    s.command(TAG_PICK, 1, &mut Cx::default());
+    let biggest = os().programs().into_iter().max_by_key(|a| a.size_kb).unwrap();
+    assert_eq!(first(&s), biggest.name, "by size, the biggest first");
+    press(&mut s, |l| l.key == "app-sort", P_CTL);
+    s.command(TAG_PICK, 0, &mut Cx::default());
+    assert_eq!(first(&s), "7-Zip");
+    assert_eq!(ext::install_date("20260721"), Some((2026, 7, 21)));
+    assert_eq!((ext::install_date("2026-07-21"), ext::install_date("")), (None, None));
 }

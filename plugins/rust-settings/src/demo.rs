@@ -12,7 +12,7 @@ use crate::{
     Fill, Wall, audio, bt,
     display::{Mode, Mon, Topo},
     ext,
-    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NotifyApp, Opt, Security, When, Who, fmt_date},
+    more::{Assoc, CApp, Cap, Consent, DATE_PATS, DefApp, DefKind, Flag, Gauge, Layout, NotifyApp, Opt, RawDesk, Security, When, Who, fmt_date, group_desktop},
     net,
     os::{Battery, Note, Os, Ping, WuExtra, set_os},
     power, wifi, wu,
@@ -20,12 +20,12 @@ use crate::{
 use windows_sys::core::GUID;
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, the pages, and a few more.
-pub const STATES: [&str; 59] = [
+pub const STATES: [&str; 70] = [
     "display", "sound", "power", "network", "bluetooth", "apps", "update", "personal", "about", "battery-charging", "battery-on-battery", "battery-low", "battery-none", "net-wifi", "net-ethernet", "net-no-wifi-adapter",
     "net-offline", "net-airplane", "identify", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
     "appearance-light", "appearance-night-light", "wifi-password", "wifi-connected-open", "adapter-open", "dropdown", "search", "search-page", "search-none", "display-single", "sound-muted", "power-plans-many", "update-checking",
     "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many", "apps-search", "apps-none", "notify", "notify-open", "notify-off", "keyboard", "time", "privacy", "privacy-camera-off", "privacy-scanning",
-    "privacy-location",
+    "privacy-location", "defaults", "defaults-lookup", "defaults-none", "wu-stale", "wu-available-optional", "wu-downloading", "wu-restart-schedule", "wu-scheduled", "wu-failed", "wu-history", "wu-restart-dialog",
 ];
 
 fn guid() -> GUID {
@@ -88,6 +88,12 @@ struct State {
     security: Security,
     /// Changes that need administrator rights are refused.
     deny_admin: bool,
+    /// The WinRust accent (an index of `style::Accent::ALL`).
+    accent: usize,
+    /// A rename waits for a restart.
+    pc_pending: Option<String>,
+    /// The default app of each group of types (by `demo_assoc`'s group name): the index in its list.
+    assoc: std::collections::HashMap<&'static str, usize>,
 }
 
 /// The demo source. `log` says what a test or a render asked it to change.
@@ -128,6 +134,27 @@ fn when(ago: u32, h: u8, m: u8) -> When {
 }
 
 /// What the design's Privacy page lists: Store apps and desktop apps for each of camera, microphone and location.
+/// The desktop apps of the microphone as the registry has them: Discord and Edge WebView2 keep one key for every version they ever installed
+/// (two of Discord's were left open by a crash); they must come out as one row each, and Discord is the one in use now.
+fn demo_desktop_mic() -> Vec<CApp> {
+    let key = |k: &str, start: u64, stop: u64, ws: When, we: Option<When>| RawDesk { key: k.into(), start, stop, start_when: Some(ws), stop_when: we };
+    let raw = vec![
+        key("C:#Users#me#AppData#Local#Discord#app-1.0.9248#Discord.exe", 100, 0, when(130, 10, 0), None),
+        key("C:#Users#me#AppData#Local#Discord#app-1.0.9251#Discord.exe", 200, 0, when(108, 21, 30), None),
+        key("C:#Users#me#AppData#Local#Discord#app-1.0.9260#Discord.exe", 300, 0, when(0, 9, 14), None),
+        key("C:#Program Files (x86)#Microsoft#EdgeWebView#Application#131.0.2903#msedgewebview2.exe", 50, 60, when(9, 18, 0), Some(when(9, 18, 2))),
+        key("C:#Program Files (x86)#Microsoft#EdgeWebView#Application#132.0.1#MSEDGEWEBVIEW2.EXE", 70, 80, when(7, 18, 0), Some(when(7, 18, 2))),
+    ];
+    group_desktop(raw, &|exe| exe == "discord.exe", &|path| {
+        let exe = path.rsplit('\\').next().unwrap_or("").to_lowercase();
+        match exe.as_str() {
+            "discord.exe" => Some("Discord".into()),
+            "msedgewebview2.exe" => Some("Microsoft Edge WebView2".into()),
+            _ => None,
+        }
+    })
+}
+
 fn demo_consent() -> Vec<(Cap, Vec<CApp>)> {
     let app = |id: &str, name: &str, desktop: bool, last: Option<When>, live: bool| CApp { id: id.into(), name: name.into(), desktop, last, live };
     vec![
@@ -137,18 +164,65 @@ fn demo_consent() -> Vec<(Cap, Vec<CApp>)> {
             vec![
                 app("vrec", "Voice Recorder", false, Some(when(15, 9, 0)), false),
                 app("plink", "Phone Link", false, None, false),
-                app("discord", "Discord", true, Some(when(0, 9, 14)), true),
                 app("telegram", "Telegram", true, Some(when(1, 21, 40)), false),
-                app("edge", "Microsoft Edge", true, Some(when(7, 18, 2)), false),
-                app("winrust", "WinRust screen recorder", true, Some(when(0, 12, 40)), false),
-            ],
+                                app("winrust", "WinRust screen recorder", true, Some(when(0, 12, 40)), false),
+            ]
+            .into_iter()
+            .chain(demo_desktop_mic())
+            .collect(),
         ),
         (Cap::Loc, vec![app("weather", "Weather", false, Some(when(0, 9, 11)), false), app("maps", "Maps", false, Some(when(9, 14, 20)), false), app("edge", "Microsoft Edge", true, None, false), app("telegram", "Telegram", true, None, false)]),
     ]
 }
 
+/// The demo's handlers for a type: the group it belongs to and the apps (the design's lists); an unknown type has none.
+fn demo_assoc(a: &Assoc) -> Option<(&'static str, &'static [&'static str])> {
+    let n = a.name.trim_start_matches('.');
+    Some(match n {
+        "http" | "html" | "htm" | "url" => ("web", &["Microsoft Edge", "Google Chrome", "Firefox"]),
+        "mailto" => ("mail", &["Microsoft Outlook", "Microsoft Edge"]),
+        "jpg" | "jpeg" | "png" | "webp" | "heic" | "gif" | "bmp" => ("photos", &["WinRust Photos", "Windows Photos", "Paint"]),
+        "mp4" | "mkv" | "mov" | "avi" => ("video", &["Media Player", "VLC media player"]),
+        "pdf" => ("pdf", &["Microsoft Edge", "Adobe Acrobat", "Google Chrome"]),
+        "txt" | "md" | "toml" | "json" | "log" | "rs" => ("text", &["Visual Studio Code", "Notepad"]),
+        _ => return None,
+    })
+}
+
+/// The design's updates: three required and three optional.
+fn demo_updates() -> Vec<wu::Upd> {
+    let u = |id: &str, title: &str, kb: &str, cat, mb, restart, optional| wu::Upd { id: id.into(), title: title.into(), kb: kb.into(), cat, mb, restart, optional };
+    use wu::Cat::*;
+    vec![
+        u("cu", "2026-11 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems", "KB5046617", Security, 612, true, false),
+        u("net", "2026-11 Cumulative Update for .NET Framework 3.5 and 4.8.1 for Windows 11, version 24H2", "KB5045934", Net, 74, true, false),
+        u("def", "Security Intelligence Update for Microsoft Defender Antivirus \u{2013} 1.421.411.0", "KB2267602", Definitions, 18, false, false),
+        u("nv", "NVIDIA \u{2013} Display \u{2013} 32.0.15.6614", "", Driver, 712, true, true),
+        u("rt", "Realtek Semiconductor Corp. \u{2013} Extension \u{2013} 10.0.26100.31337", "", Driver, 2, false, true),
+        u("pv", "2026-11 Cumulative Update Preview for Windows 11 Version 24H2 (KB5046740)", "KB5046740", Preview, 640, true, true),
+    ]
+}
+
+/// The design's update history, the latest first.
+fn demo_history() -> Vec<wu::Hist> {
+    use wu::HGroup::*;
+    let h = |group, title: &str, kb: &str, when: &str, ok: bool| wu::Hist { group, title: title.into(), kb: kb.into(), when: when.into(), ok, code: if ok { String::new() } else { "0x80070643".into() } };
+    vec![
+        h(Definition, "Security Intelligence Update for Microsoft Defender \u{2013} 1.421.316.0", "KB2267602", "Today, 15:12", true),
+        h(Driver, "Intel \u{2013} System \u{2013} 10.1.48.6", "", "20 Nov", true),
+        h(Quality, "2026-10 Cumulative Update for Windows 11 Version 24H2", "KB5044284", "16 Oct", true),
+        h(Quality, "2026-10 Cumulative Update for .NET Framework 3.5 and 4.8.1", "KB5044035", "9 Oct", true),
+        h(Quality, "2026-09 Cumulative Update for Windows 11 Version 24H2", "KB5043080", "11 Sep", false),
+        h(Driver, "NVIDIA \u{2013} Display \u{2013} 32.0.15.6094", "", "2 Oct", true),
+        h(Definition, "Security Intelligence Update for Microsoft Defender \u{2013} 1.421.288.0", "KB2267602", "Yesterday, 09:40", true),
+        h(Other, "Windows Malicious Software Removal Tool x64 \u{2013} v5.131", "KB890830", "16 Oct", true),
+    ]
+}
+
 fn app_entry(name: &str, version: &str, publisher: &str) -> ext::App {
-    ext::App { name: name.into(), version: version.into(), publisher: publisher.into(), uninstall: format!("demo-uninstall {name}") }
+    // a size and a day of the demo's own, the same for the same name
+    let h: u64 = name.bytes().map(u64::from).sum();
+    ext::App { name: name.into(), version: version.into(), publisher: publisher.into(), uninstall: format!("demo-uninstall {name}"), size_kb: 20_000 + (h % 90) * 13_000, date: Some((2026, 1 + (h % 11) as u32, 1 + (h % 27) as u32)) }
 }
 
 impl Demo {
@@ -226,13 +300,13 @@ impl Demo {
                 app_entry("Telegram Desktop", "5.8.3", "Telegram FZ-LLC"),
                 app_entry("Visual Studio Code", "1.95.3", "Microsoft Corporation"),
             ],
-            wu: wu::State { busy: None, found: Some(Vec::new()), note: "Last checked today, 17:02".into() },
-            wu_extra: WuExtra::default(),
+            wu: wu::State { found: Some(Vec::new()), ..wu::State::default() },
+            wu_extra: WuExtra { last_check: Some(when(0, 17, 2)), last_install: Some(when(7, 8, 40)), history: demo_history(), active: Some((8, 17)), ..WuExtra::default() },
             walls: vec![
-                ("Obsidian (current)".into(), Fill::Gradient(0x1a2a46, 0x14203a, 0x0a0f1a)),
-                ("Dusk".into(), Fill::Gradient(0x1e2a4a, 0x4a2a5e, 0xc2546a)),
-                ("Sea".into(), Fill::Gradient(0x0b3d4f, 0x1f7a8c, 0x9fd3c7)),
-                ("Sand".into(), Fill::Gradient(0x3b2f2a, 0x8c6a4f, 0xe7c9a0)),
+                ("Obsidian (current)".into(), Fill::Gradient(0x1a2a46, 0x14203a, 0x0a0f1a, 0.6)),
+                ("Dusk".into(), Fill::Gradient(0x1e2a4a, 0x4a2a5e, 0xc2546a, 0.6)),
+                ("Sea".into(), Fill::Gradient(0x0b3d4f, 0x1f7a8c, 0x9fd3c7, 0.55)),
+                ("Sand".into(), Fill::Gradient(0x3b2f2a, 0x8c6a4f, 0xe7c9a0, 0.55)),
                 ("Graphite".into(), Fill::Solid(0x2a2c33)),
             ],
             wall: 0,
@@ -244,6 +318,9 @@ impl Demo {
             consent: demo_consent(),
             security: Security { av: Some(true), fw: Some(true), sig: "1.421.316.0".into(), sig_when: Some(when(0, 7, 14)), smart: "Warn".into(), scanning: false, scanned: false },
             deny_admin: false,
+            accent: 0,
+            pc_pending: None,
+            assoc: std::collections::HashMap::new(),
         };
         Self { s: RefCell::new(s), log: RefCell::new(Vec::new()) }
     }
@@ -306,15 +383,35 @@ impl Demo {
             }
             "bt-needs-pin" => s.bt.nearby = vec![bt::Dev { id: "gb".into(), name: "Galaxy Buds2".into(), connected: false }],
             "bt-off" => s.bt.bt = Some(false),
-            "wu-available" => s.wu = wu::State { busy: None, found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() },
-            "wu-installing" => {
-                s.wu = wu::State { busy: Some("Downloading and installing updates\u{2026}".into()), found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() };
-                s.wu_extra = WuExtra { progress: Some(46), restart: false };
+            "wu-available" | "wu-available-optional" => s.wu = wu::State { found: Some(demo_updates()), ..wu::State::default() },
+            "wu-stale" => {
+                s.wu = wu::State::default();
+                s.wu_extra.last_check = Some(when(1, 21, 40));
             }
-            "wu-checking" | "update-checking" => s.wu = wu::State { busy: Some("Checking for updates\u{2026}".into()), found: None, note: String::new() },
+            "wu-downloading" | "wu-installing" => {
+                let installing = name == "wu-installing";
+                s.wu = wu::State { found: Some(demo_updates()), phase: if installing { wu::Phase::Installing } else { wu::Phase::Downloading }, pct: if installing { 84.0 } else { 38.0 }, run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+            }
+            "wu-restart-schedule" | "wu-restart-dialog" => {
+                s.wu = wu::State { found: Some(Vec::new()), run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+                s.wu_extra.restart = true;
+            }
+            "wu-scheduled" => {
+                s.wu = wu::State { found: Some(Vec::new()), sched: Some("03:00".into()), run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+                s.wu_extra.restart = true;
+            }
+            "wu-failed" => {
+                s.wu = wu::State {
+                    found: Some(Vec::new()),
+                    run: demo_updates().into_iter().filter(|u| !u.optional).collect(),
+                    failed: Some(wu::Failure { title: "2026-11 Cumulative Update for .NET Framework 3.5 and 4.8.1 for Windows 11, version 24H2".into(), kb: "KB5045934".into(), code: "0x800f0922".into(), text: "Windows couldn\u{2019}t finish setting it up and rolled it back. This usually fixes itself on the next try; if it keeps failing, free up space on C: or turn off a VPN while it downloads.".into() }),
+                    ..wu::State::default()
+                };
+            }
+            "wu-checking" | "update-checking" => s.wu = wu::State { phase: wu::Phase::Checking, ..wu::State::default() },
             "wu-restart" => {
-                s.wu = wu::State { busy: None, found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() };
-                s.wu_extra = WuExtra { progress: None, restart: true };
+                s.wu = wu::State { found: Some(Vec::new()), run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+                s.wu_extra.restart = true;
             }
             "appearance-night-light" => s.night = 4800,
             "display-single" => {
@@ -686,13 +783,53 @@ impl Os for Demo {
         self.with(|s| s.wu.clone())
     }
     fn wu_extra(&self) -> WuExtra {
-        self.with(|s| s.wu_extra)
+        self.with(|s| s.wu_extra.clone())
+    }
+    fn wu_cancel(&self) {
+        self.note("wu_cancel");
+        self.with(|s| {
+            s.wu.phase = wu::Phase::Idle;
+            s.wu.pct = 0.0;
+            if s.wu.found.is_none() {
+                s.wu.found = Some(Vec::new());
+            }
+        });
+    }
+    fn wu_schedule(&self, sch: wu::Sched) -> bool {
+        self.note(format!("wu_schedule {sch:?}"));
+        self.with(|s| s.wu.sched = Some(wu::plan((17, 46), sch).1));
+        true
+    }
+    fn wu_unschedule(&self) {
+        self.note("wu_unschedule");
+        self.with(|s| s.wu.sched = None);
+    }
+    fn wu_admin(&self) -> bool {
+        false
+    }
+    fn restart_apps(&self) -> Vec<String> {
+        ["File manager", "Task Manager", "Telegram", "Discord", "Spotify", "Notepad"].map(String::from).to_vec()
+    }
+    fn open_link(&self, target: &str) {
+        self.note(format!("open_link {target}"));
+    }
+    fn restart_now(&self) -> bool {
+        self.note("restart_now");
+        true
     }
     fn wu_check(&self, _done: Ping) {
         self.note("wu_check");
+        // the demo's search is over at once
+        self.with(|s| s.wu.found = Some(demo_updates()));
     }
-    fn wu_install(&self, _done: Ping) {
-        self.note("wu_install");
+    fn wu_install(&self, ids: Vec<String>, _done: Ping) {
+        self.note(format!("wu_install {}", ids.join(",")));
+        self.with(|s| {
+            let list: Vec<wu::Upd> = s.wu.found.clone().unwrap_or_default().into_iter().filter(|u| ids.contains(&u.id)).collect();
+            s.wu_extra.restart |= list.iter().any(|u| u.restart);
+            s.wu.found = s.wu.found.take().map(|f| f.into_iter().filter(|u| !ids.contains(&u.id)).collect());
+            s.wu.run = list;
+        });
     }
 
     fn night_kelvin(&self) -> u32 {
@@ -727,7 +864,7 @@ impl Os for Demo {
         Ok(())
     }
     fn wallpapers(&self) -> Vec<Wall> {
-        self.with(|s| s.walls.iter().enumerate().map(|(i, (label, fill))| Wall { label: label.clone(), fill: *fill, on: i == s.wall }).collect())
+        self.with(|s| s.walls.iter().enumerate().map(|(i, (label, fill))| Wall { label: label.clone(), fill: *fill, on: i == s.wall, pic: None }).collect())
     }
     fn windows_value(&self, name: &str) -> String {
         match name {
@@ -743,6 +880,42 @@ impl Os for Demo {
     fn computer_name(&self) -> String {
         "DANIIAR-PC".into()
     }
+    fn assoc_apps(&self, a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
+        let Some((group, list)) = demo_assoc(a) else { return (Vec::new(), None) };
+        let cur = self.with(|s| s.assoc.get(group).copied().unwrap_or(0));
+        (list.iter().map(|n| DefApp { name: (*n).into(), exe: format!("{}.exe", n.to_lowercase().replace(' ', "")) }).collect(), Some(cur))
+    }
+    fn assoc_pick(&self, a: &Assoc, i: usize, _owner: isize, _done: Ping) {
+        self.note(format!("assoc_pick {} {i}", a.name));
+        // the demo's dialog is over at once, and the user confirmed
+        if let Some((group, list)) = demo_assoc(a) {
+            self.with(|s| s.assoc.insert(group, i.min(list.len() - 1)));
+        }
+    }
+    fn own_default(&self, k: DefKind) -> String {
+        if k == DefKind::Files { "WinRust Explorer" } else { "WinRust Terminal" }.into()
+    }
+    fn about_info(&self) -> crate::more::AboutInfo {
+        crate::more::AboutInfo {
+            cpu: "AMD Ryzen 7 7840HS \u{b7} 3.8 GHz".into(),
+            ram: "32 GB (31.3 GB usable)".into(),
+            gpus: vec!["AMD Radeon 780M".into()],
+            sys_type: "64-bit, x64 processor".into(),
+            build: "26100.2314".into(),
+            winrust: "0.5.9".into(),
+            pc_pending: self.with(|s| s.pc_pending.clone()),
+        }
+    }
+    fn rename_pc(&self, name: &str) -> Result<(), String> {
+        self.note(format!("rename_pc {name}"));
+        self.with(|s| {
+            if s.deny_admin {
+                return Err("Administrator rights are needed: run Settings as administrator".to_string());
+            }
+            s.pc_pending = Some(name.to_string());
+            Ok(())
+        })
+    }
     fn user_name(&self) -> String {
         "Daniiar".into()
     }
@@ -751,9 +924,17 @@ impl Os for Demo {
         self.with(|s| s.lang = l);
         true
     }
-    fn wallpaper_select(&self, k: usize) {
+    fn wallpaper_select(&self, k: usize, _done: Note) {
         self.note(format!("wallpaper_select {k}"));
         self.with(|s| s.wall = k.min(s.walls.len() - 1));
+    }
+    fn wall_prepare(&self, _done: Ping) {}
+    fn accent(&self) -> usize {
+        self.with(|s| s.accent)
+    }
+    fn accent_set(&self, i: usize) {
+        self.note(format!("accent_set {i}"));
+        self.with(|s| s.accent = i.min(winrust_common::style::Accent::ALL.len() - 1));
     }
     fn opt_list(&self, o: Opt) -> (Vec<String>, Option<usize>) {
         let sec = |n: &[u32]| -> Vec<String> { n.iter().map(|&v| if v >= 60 { format!("{} min", v / 60) } else { format!("{v} s") }).collect() };
@@ -860,6 +1041,8 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
     let d = Rc::new(Demo::for_state(name));
     set_os(d.clone());
     crate::set_app_query(""); // the Apps page's own search box starts empty in every state
+    crate::more::set_ext_query("");
+    crate::wupage::reset();
     crate::more::set_pv_tab(Cap::Mic); // and the Privacy page's tab is the design's first one
     let page = match name {
         "sound" | "sound-muted" => 1,
@@ -867,7 +1050,8 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "network" | "net-wifi" | "net-ethernet" | "net-no-wifi-adapter" | "net-offline" | "net-airplane" | "wifi-password" | "wifi-connected-open" | "adapter-open" | "network-hidden" | "proxy-on" => 3,
         "bluetooth" | "bt-paired" | "bt-searching" | "bt-needs-pin" | "bt-off" | "bt-pairing" => 4,
         "apps" | "apps-many" | "apps-search" | "apps-none" => 5,
-        "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => crate::WU_PAGE,
+        "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" | "wu-stale" | "wu-available-optional" | "wu-downloading" | "wu-restart-schedule" | "wu-scheduled" | "wu-failed" | "wu-history" | "wu-restart-dialog" => crate::WU_PAGE,
+        "defaults" | "defaults-lookup" | "defaults-none" => crate::DEFAULTS_PAGE,
         "notify" | "notify-open" | "notify-off" => crate::NOTIFY_PAGE,
         "personal" | "appearance-dark" | "appearance-light" | "personal-light" => crate::PERSONAL_PAGE,
         "privacy" | "privacy-camera-off" | "privacy-scanning" | "privacy-location" => crate::PRIVACY_PAGE,
@@ -890,6 +1074,13 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "apps-search" => s.demo_app_search("micro"),
         "apps-none" => s.demo_app_search("photoshop"),
         "notify-open" => s.demo_open("na:telegram", None),
+        "defaults-lookup" => s.demo_app_search(".webp"),
+        "wu-available-optional" => crate::wupage::set_optional(true),
+        "wu-restart-schedule" => crate::wupage::set_chips(true),
+        "wu-failed" => crate::wupage::set_details(true),
+        "wu-history" => crate::wupage::set_history_all(true),
+        "wu-restart-dialog" => s.demo_restart_dialog(),
+        "defaults-none" => s.demo_app_search(".xyz"),
         "privacy-camera-off" => crate::more::set_pv_tab(Cap::Cam),
         "privacy-location" => crate::more::set_pv_tab(Cap::Loc),
         "search" => s.demo_search("net"),
