@@ -60,6 +60,10 @@ pub trait App {
     }
     /// The window exists (its first frame is not drawn yet): `hwnd` is what a worker thread posts to ([`crate::window::post`]).
     fn start(&mut self, _hwnd: isize) {}
+    /// The window is made and its first frame drawn, but not shown (a program that starts in the tray): the app shows it later.
+    fn start_hidden(&self) -> bool {
+        false
+    }
     /// The wheel with the pointer's place in the window (DIPs): zooming about the pointer needs it. By default it is `wheel`.
     #[allow(clippy::too_many_arguments)]
     fn wheel_at(&mut self, id: Option<Id>, _x: f32, _y: f32, dx: f32, dy: f32, mods: Mods, cx: &mut Cx) {
