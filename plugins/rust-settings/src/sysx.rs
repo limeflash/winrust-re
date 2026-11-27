@@ -737,7 +737,8 @@ pub fn assoc_apps(a: &Assoc) -> (Vec<DefApp>, Option<usize>) {
 /// open-with dialog (registering the choice for the extension, nothing is run); a link scheme goes to Windows' default-apps page.
 pub fn assoc_pick(a: &Assoc, owner: isize, done: Ping) {
     if a.protocol {
-        winrust_common::settings::open("ms-settings:defaultapps");
+        // Windows' page, not ours: "ms-settings:defaultapps" alone now opens this very page of WinRust Settings
+        winrust_common::settings::open_windows("ms-settings:defaultapps");
         return;
     }
     if !valid_ext(&a.name) {

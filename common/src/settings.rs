@@ -261,13 +261,19 @@ fn own_page(uri: &str) -> Option<&'static str> {
     match uri.trim().to_ascii_lowercase().as_str() {
         "ms-settings:" | "ms-settings:display" | "ms-settings:nightlight" => Some("display"),
         "ms-settings:sound" => Some("sound"),
-        "ms-settings:personalization" | "ms-settings:colors" | "ms-settings:personalization-colors" | "ms-settings:themes" => Some("personalization"),
+        "ms-settings:personalization" | "ms-settings:colors" | "ms-settings:personalization-colors" | "ms-settings:themes" | "ms-settings:personalization-background" => Some("personalization"),
         "ms-settings:powersleep" | "ms-settings:storagesense" | "ms-settings:batterysaver" => Some("power"),
         "ms-settings:network-status" | "ms-settings:network-wifi" | "ms-settings:network-wifisettings" | "ms-settings:network-vpn" | "ms-settings:network-proxy" => Some("network"),
         "ms-settings:bluetooth" | "ms-settings:network-airplanemode" => Some("bluetooth"),
         "ms-settings:appsfeatures" => Some("apps"),
+        "ms-settings:defaultapps" => Some("defaultapps"),
+        "ms-settings:notifications" => Some("notification"),
+        "ms-settings:privacy" | "ms-settings:privacy-webcam" | "ms-settings:privacy-microphone" | "ms-settings:privacy-location" => Some("privacy"),
+        "ms-settings:keyboard" | "ms-settings:mousetouchpad" | "ms-settings:typing" => Some("keyboard"),
+        "ms-settings:dateandtime" | "ms-settings:regionformatting" => Some("dateandtime"),
         "ms-settings:windowsupdate" => Some("update"),
-        "ms-settings:about" => Some("about"),
+        // the account page: WinRust Settings has none, About shows this PC and its name (Windows' own page needs Explorer lent)
+        "ms-settings:about" | "ms-settings:yourinfo" => Some("about"),
         _ => None,
     }
 }
@@ -285,6 +291,12 @@ pub fn open(uri: &str) {
         && Command::new(exe).arg(page).stdin(Stdio::null()).creation_flags(0x0800_0000).spawn().is_ok() {
         return;
     }
+    open_windows(uri);
+}
+
+/// Windows' own Settings page, never WinRust Settings: for a WinRust Settings page that sends the user on to Windows (Default
+/// apps for links and email, Windows Update's advanced options). Explorer is lent for as long as that page is open.
+pub fn open_windows(uri: &str) {
     let uri = uri.to_string();
     std::thread::spawn(move || run(&uri)); // shortcut: dies with the host process, which is long-lived (reshell, topbar)
 }
@@ -316,5 +328,11 @@ mod tests {
         assert_eq!(own_page("ms-settings:windowsupdate"), Some("update"));
         assert_eq!(own_page("ms-settings:easeofaccess"), None);
         assert_eq!(own_page("ms-settings:sound; calc"), None);
+        // the pages Settings gained, and the account page Start's name button opens
+        assert_eq!(own_page("ms-settings:privacy-microphone"), Some("privacy"));
+        assert_eq!(own_page("ms-settings:defaultapps"), Some("defaultapps"));
+        assert_eq!(own_page("ms-settings:dateandtime"), Some("dateandtime"));
+        assert_eq!(own_page("ms-settings:yourinfo"), Some("about"));
+        assert_eq!(own_page("ms-settings:defaultapps-browser"), None);
     }
 }
