@@ -114,7 +114,7 @@ Windows 搜索是可选项：在精简过的 Windows 上（例如去掉 Windows 
 src/            安装程序（plugin-launcher.exe）
   main.rs         插件表 PLUGINS：名字、文案、安装/卸载函数对、图标
   install/        每个插件改了什么、怎么撤销（一个插件一个文件）
-  cli.rs, ui.rs   命令行和窗口；两者调用同一批安装函数
+  cli.rs, ui/       命令行和窗口；两者调用同一批安装函数
 common/         winrust-common：语言切换（t!/tf!: 英文、俄文、日文、巴西葡萄牙文、简体中文）、UI 样式和配色、reg.exe 输出解析、NTFS MFT 读取
 plugins/        所有插件的源码，每个都是独立的 crate
 ReShell/        reshell（桌面快捷键、topbar 的安全网），随 topbar 一起装
