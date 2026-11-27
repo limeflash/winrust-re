@@ -1698,6 +1698,11 @@ unsafe fn msix_app_id(lnk: &str) -> Option<String> {
     apps::apps_folder().into_iter().map(|a| a.1).find(|id| id.to_lowercase().starts_with(&prefix))
 }
 
+/// The app id of Windows' own Settings app (ImmersiveControlPanel), whatever its letter case.
+fn is_windows_settings(aumid: &str) -> bool {
+    aumid.to_lowercase().starts_with("windows.immersivecontrolpanel_")
+}
+
 /// Starts a Store app by its app id. false = it did not start (the caller falls back to explorer).
 unsafe fn activate_app(aumid: &str) -> bool {
     use windows::Win32::UI::Shell::{ACTIVATEOPTIONS, ApplicationActivationManager, IApplicationActivationManager};
@@ -1720,7 +1725,26 @@ unsafe fn open(path: &[u16]) {
     // Store (MSIX) apps: by app id through the activation manager. A path into the protected package folder ("no app
     // associated") and shell:AppsFolder via explorer ("class not registered" when Explorer is not the shell) both fail.
     let aumid = if p.to_lowercase().starts_with(r"shell:appsfolder\") { Some(p[r"shell:appsfolder\".len()..].to_string()) } else { msix_app_id(&p) };
-    if aumid.is_some_and(|id| activate_app(&id)) {
+    if let Some(id) = aumid {
+        // Windows' Settings app does not start without Explorer as the shell: the same way as ms-settings: (WinRust
+        // Settings when installed, else Explorer lent for the time Settings is open)
+        if is_windows_settings(&id) {
+            return winrust_common::settings::open("ms-settings:");
+        }
+        // The activation manager can take seconds to give up on an app that will not start, and the explorer fallback
+        // shows its own error: never on the bar's thread (the bar froze until that dialog was closed).
+        std::thread::spawn(move || {
+            // SAFETY: COM is initialised for this thread alone and released before it ends.
+            unsafe {
+                let com = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED).is_ok();
+                if !activate_app(&id) {
+                    let _ = Command::new("explorer.exe").arg(&p).spawn();
+                }
+                if com {
+                    windows::Win32::System::Com::CoUninitialize();
+                }
+            }
+        });
         return;
     }
     // A program is a path to Explorer, and Explorer is not the shell on a WinRust machine: `explorer.exe wt.exe` only
@@ -2808,6 +2832,14 @@ fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_settings_is_told_apart_from_other_store_apps() {
+        assert!(super::is_windows_settings("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"));
+        assert!(super::is_windows_settings("Windows.ImmersiveControlPanel_cw5n1h2txyewy!Microsoft.Windows.ImmersiveControlPanel"));
+        assert!(!super::is_windows_settings("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"));
+        assert!(!super::is_windows_settings(r"{6D809377-6AF0-444B-8957-A3773F02200E}\rust-settings\rust-settings.exe"));
+    }
+
     #[test]
     fn magnet_picks_the_nearest_edge_within_reach() {
         let r = windows_sys::Win32::Foundation::RECT { left: 105, top: 50, right: 505, bottom: 350 };
