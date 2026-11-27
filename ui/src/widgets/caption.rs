@@ -82,3 +82,35 @@ pub fn caption(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, cap: &Caption<'_>
     let _ = BODY;
     tools
 }
+
+/// Only the three round window buttons (`winBtns`), for an app whose caption is its own (tabs in the bar): `r` is the caption strip, the
+/// buttons stand at its right end, 10 from the edge. Returns the x of the left edge of the first one.
+pub fn window_buttons(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect) -> f32 {
+    let btns_x = r.x + r.w - 10.0 - 94.0;
+    let max_d = if f.maximized() { RESTORE_D } else { MAX_D };
+    for (i, (id, d)) in [(WIN_MIN, MIN_D), (WIN_MAX, max_d), (WIN_CLOSE, CLOSE_D)].into_iter().enumerate() {
+        let b = Rect::new(btns_x + i as f32 * 34.0, r.cy() - 13.0, 26.0, 26.0);
+        let hot = f.item(id, b);
+        f.hand();
+        let glide = f.tween(id, 2, f32::from(f.hover == Some(id)), 280, SPRING);
+        let (bg, ink) = if id == WIN_CLOSE {
+            (Rgba::white(0.07).mix(Rgba::css(229, 72, 77, 0.22), hot.hover), look::T2.mix(look::RED, hot.hover))
+        } else {
+            (Rgba::white(0.07 + 0.09 * hot.hover), look::T2.mix(look::T1, hot.hover))
+        };
+        let k = 1.0 - 0.14 * hot.press;
+        c.transformed(b.cx(), b.cy(), k, 0.0, 0.0, |c| {
+            c.fill(b, 13.0, bg);
+            let (dy, scale, turn) = match id {
+                WIN_MIN => (2.0 * glide, 1.0, 0.0),
+                WIN_MAX => (0.0, 1.0 + 0.2 * glide, 0.0),
+                _ => (0.0, 1.0, 90.0 * glide),
+            };
+            c.icon(d, (b.cx(), b.cy() + dy), 12.0 * scale, 2.2, ink, turn);
+        });
+        if hot.focus {
+            c.ring(b.inset(-3.0), 16.0, 2.0, look::focus_ring().fade(0.9));
+        }
+    }
+    btns_x
+}

@@ -258,3 +258,110 @@ pub fn columns(c: &mut Canvas<'_>, f: &mut Frame<'_>, id: Id, r: Rect, cols: &Co
         c.fill(Rect::new(edge - 0.5, r.cy() - 8.0, 1.0, 16.0), 0.0, Rgba::white(0.12 * hot.hover.max(held)));
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// a list with headings between its groups
+
+/// A heading before a group of rows: it stands before row `before` of the list (headings are not rows: no selection, no cursor, no
+/// item of their own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heading {
+    pub before: usize,
+}
+
+/// Where row `i` starts (below the padding at the top of the content) when `heads` stand before the rows they name, ascending.
+fn grouped_y(i: usize, heads: &[Heading], pitch: f32, head_pitch: f32) -> f32 {
+    let k = heads.partition_point(|h| h.before <= i);
+    i as f32 * pitch + k as f32 * head_pitch
+}
+
+/// The height of the content of a grouped list of `n` rows.
+#[must_use]
+pub fn grouped_content(n: usize, heads: &[Heading], row_h: f32, head_h: f32, look: &ListLook) -> f32 {
+    look.top + n as f32 * (row_h + look.gap) + heads.len() as f32 * (head_h + look.gap) + look.bottom
+}
+
+/// [`list_with`] for rows in groups: `heads` (ascending by `before`) are `head_h` high and drawn by `head(c, f, k, rect)`, which gets
+/// the rectangle of heading `k`; they are no items. Rows are numbered without them, so the selection, the cursor and the keys of
+/// [`ListState`] know nothing of the headings.
+#[allow(clippy::too_many_arguments)] // the widget's own signature: what, where, which rows, how to draw them
+pub fn list_grouped(
+    c: &mut Canvas<'_>,
+    f: &mut Frame<'_>,
+    base: Id,
+    r: Rect,
+    st: &mut ListState,
+    n: usize,
+    row_h: f32,
+    head_h: f32,
+    heads: &[Heading],
+    look: &ListLook,
+    mut head: impl FnMut(&mut Canvas<'_>, &mut Frame<'_>, usize, Rect),
+    mut row: impl FnMut(&mut Canvas<'_>, &mut Frame<'_>, usize, Rect, RowState),
+) {
+    st.set_len(n);
+    st.cols = 0;
+    let (pitch, hp) = (row_h + look.gap, head_h + look.gap);
+    let content = grouped_content(n, heads, row_h, head_h, look);
+    st.scroll.set_extent(content, r.h);
+    if st.cursor != st.shown {
+        if let Some(i) = st.cursor {
+            // a row with a heading above it brings the heading into view too, the first its padding, the last the one below it
+            let lead = if heads.binary_search_by_key(&i, |h| h.before).is_ok() { hp } else { 0.0 };
+            let y = if i == 0 { 0.0 } else { look.top + grouped_y(i, heads, pitch, hp) - lead };
+            let h = row_h + lead + if i == 0 { look.top } else { 0.0 } + if i + 1 == n { look.bottom } else { 0.0 };
+            st.scroll.ensure_visible(y, h, f.now);
+        }
+        st.shown = st.cursor;
+    }
+    let ring = f.mo.hits.focus == Some(base) && f.mo.hits.focus_visible;
+    let (sel, cursor) = (&st.sel, st.cursor);
+    scroll_with(c, f, base, r, &mut st.scroll, content, true, |c, f, v| {
+        // the rows in view: the first whose bottom is below the top of the view, up to the first whose top is below its bottom
+        let start_of = |i: usize| look.top + grouped_y(i, heads, pitch, hp);
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if start_of(mid) + row_h <= v.y { lo = mid + 1 } else { hi = mid }
+        }
+        let first = lo;
+        let (mut lo, mut hi) = (first, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if start_of(mid) < v.bottom() { lo = mid + 1 } else { hi = mid }
+        }
+        let last = lo;
+        // the headings whose own box is in view (one may stand above the first row in view)
+        for (k, h) in heads.iter().enumerate() {
+            let y = look.top + h.before as f32 * pitch + k as f32 * hp;
+            if y + head_h > v.y && y < v.bottom() {
+                head(c, f, k, Rect::new(r.x + look.inset, v.at(y), r.w - 2.0 * look.inset, head_h));
+            }
+        }
+        for i in first..last {
+            let rect = Rect::new(r.x + look.inset, v.at(start_of(i)), r.w - 2.0 * look.inset, row_h);
+            draw_cell(c, f, base, i, rect, look.radius, sel.contains(&i), cursor == Some(i), ring, &mut row);
+        }
+    });
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    use super::*;
+
+    #[test]
+    fn rows_stand_below_the_headings_before_them() {
+        // rows of 36 with 1 between, headings of 32: a heading before row 0 and one before row 3
+        let heads = [Heading { before: 0 }, Heading { before: 3 }];
+        let (pitch, hp) = (37.0, 33.0);
+        assert_eq!(grouped_y(0, &heads, pitch, hp), 33.0, "the first row is under the first heading");
+        assert_eq!(grouped_y(2, &heads, pitch, hp), 2.0 * 37.0 + 33.0);
+        assert_eq!(grouped_y(3, &heads, pitch, hp), 3.0 * 37.0 + 2.0 * 33.0, "row 3 is under the second heading");
+        assert_eq!(grouped_y(5, &heads, pitch, hp), 5.0 * 37.0 + 66.0);
+        // no headings: the plain list
+        assert_eq!(grouped_y(4, &[], pitch, hp), 4.0 * 37.0);
+        let l = ListLook::ROWS;
+        assert_eq!(grouped_content(6, &heads, 36.0, 32.0, &l), l.top + 6.0 * 37.0 + 2.0 * 33.0 + l.bottom);
+        assert_eq!(grouped_content(6, &[], 36.0, 32.0, &l), l.top + 6.0 * 37.0 + l.bottom, "the same as `list`'s content");
+    }
+}

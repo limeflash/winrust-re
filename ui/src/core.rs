@@ -71,11 +71,22 @@ pub trait App {
     }
     /// What is dragged over the window left it without dropping.
     fn drag_leave(&mut self, _cx: &mut Cx) {}
+    /// What a drop of `paths` would do, for the cursor ("Copy to ..", "Move to .."): `ctrl` is held. Copy unless the app says Move.
+    fn drag_effect(&self, _paths: &[String], _ctrl: bool) -> DropFx {
+        DropFx::Copy
+    }
     /// `--render`: the items the renderer clicks, one after the other, before it takes the picture (what a state of the design needs
     /// open: a menu, a toast).
     fn demo_clicks(&self) -> Vec<Id> {
         Vec::new()
     }
+}
+
+/// What dropping files on the window does (the drag's cursor says it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropFx {
+    Copy,
+    Move,
 }
 
 /// What Windows is told about a point of the window (`WM_NCHITTEST`).

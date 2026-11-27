@@ -45,10 +45,6 @@ pub unsafe fn sep(m: HMENU) {
     insert(m, 0, "", "", false, true, std::ptr::null_mut());
 }
 
-pub unsafe fn submenu(m: HMENU, glyph: &'static str, label: &str, sub: HMENU) {
-    insert(m, 0, label, glyph, false, false, sub);
-}
-
 /// Shows the menu at the pointer and returns the picked id (0: none). Destroys the menu.
 pub unsafe fn track(h: HWND, m: HMENU) -> i32 {
     let bg = CreateSolidBrush(pal().bg);

@@ -697,7 +697,7 @@ pub(crate) fn copy_paths_text(h: *mut c_void, paths: &[PathBuf]) {
     copy_paths(HWND(h), paths);
 }
 
-fn terminal(dir: &Path) {
+pub(crate) fn terminal(dir: &Path) {
     use std::{os::windows::process::CommandExt, process::Command};
     // Windows Terminal when it is installed (its alias lives in WindowsApps), else PowerShell in a console of its own
     if Command::new("wt.exe").arg("-d").arg(dir).spawn().is_err() {
@@ -716,11 +716,59 @@ pub(crate) fn tick(hw: *mut c_void) {
     for (handle, items) in news { let _ = filemenu::send_sub(hw, &SubReply { session, handle, items }); }
 }
 
-/// One of our own rows was chosen: nothing here asks the shell for a menu.
-fn own(hw: *mut c_void, s: &Live, id: u32) {
-    match id {
+/// What the window does for the rows of the bar's menu that act on the window itself. The desktop does them through the state of its
+/// list; the file manager's window (`fm`) is told with messages.
+pub(crate) trait Win {
+    /// The folder may have changed: list it again.
+    fn reload(&self, hw: *mut c_void);
+    /// Rename the selected item (its name opens for editing).
+    fn rename(&self, hw: *mut c_void);
+    /// Open `p` (a file in its app, a folder in the window).
+    fn open(&self, hw: *mut c_void, p: PathBuf);
+    /// A folder in a new tab (the desktop starts a window of its own).
+    fn new_tab(&self, hw: *mut c_void, p: PathBuf);
+    /// The pins of Quick access changed.
+    fn toggle_pin(&self, hw: *mut c_void, p: PathBuf);
+}
+
+/// The desktop's own: its list view and its statics.
+pub(crate) struct Desk;
+
+impl Win for Desk {
+    fn reload(&self, hw: *mut c_void) {
+        crate::reload(hw);
+    }
+
+    fn rename(&self, _hw: *mut c_void) {
+        // SAFETY: plain calls on the desktop's own list view.
+        unsafe {
+            let (list, ..) = crate::selected();
+            let i = crate::put(list, windows_sys::Win32::UI::Controls::LVM_GETNEXTITEM, usize::MAX, windows_sys::Win32::UI::Controls::LVNI_SELECTED as isize);
+            if i >= 0 {
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(list);
+                crate::put(list, windows_sys::Win32::UI::Controls::LVM_EDITLABELW, i as usize, 0);
+            }
+        }
+    }
+
+    fn open(&self, hw: *mut c_void, p: PathBuf) {
         // SAFETY: the same call a double click makes.
-        syn::OPEN => for p in &s.paths { unsafe { crate::activate(hw, p.clone(), p.is_dir()) } },
+        unsafe { crate::activate(hw, p.clone(), p.is_dir()) };
+    }
+
+    fn new_tab(&self, _hw: *mut c_void, p: PathBuf) {
+        let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).arg(p).spawn();
+    }
+
+    fn toggle_pin(&self, _hw: *mut c_void, p: PathBuf) {
+        crate::ui::toggle_pin(&p);
+    }
+}
+
+/// One of our own rows was chosen: nothing here asks the shell for a menu.
+fn own(w: &dyn Win, hw: *mut c_void, s: &Live, id: u32) {
+    match id {
+        syn::OPEN => for p in &s.paths { w.open(hw, p.clone()) },
         syn::RUNAS => if let [p] = s.paths.as_slice() {
             let (verb, file, dir) = (crate::w("runas"), crate::w(&p.to_string_lossy()), p.parent().map(|d| crate::w(&d.to_string_lossy())));
             // SAFETY: NUL-terminated strings that outlive the call.
@@ -730,20 +778,25 @@ fn own(hw: *mut c_void, s: &Live, id: u32) {
         syn::DELETE => {
             // the shell's own confirmation and undo, as the Delete key has them
             let _ = crate::sh::fileop(hw, crate::sh::Op::Delete, &s.paths, &s.dir);
-            crate::reload(hw);
+            w.reload(hw);
         }
         syn::CUT | syn::COPY => _ = crate::sh::clip_set(hw, &s.paths, id == syn::CUT),
         _ => {}
     }
 }
 
-/// What the bar chose. `lp` is the menu's session: an answer for a menu that has been replaced is ignored.
+/// What the bar chose, for the desktop. `lp` is the menu's session: an answer for a menu that has been replaced is ignored.
 pub(crate) fn act(hw: *mut c_void, wp: usize, lp: isize) {
+    act_with(&Desk, hw, wp, lp);
+}
+
+/// [`act`] for a window that does the window's part its own way.
+pub(crate) fn act_with(w: &dyn Win, hw: *mut c_void, wp: usize, lp: isize) {
     let h = HWND(hw);
     let Some((a, session)) = Act::decode(wp, lp) else { return };
     // the worker has run a command: the folder may have changed (item 0 is never the bar's: a separator has no number)
     if a == Act::Item(0) {
-        crate::reload(hw);
+        w.reload(hw);
         return;
     }
     if let Act::Fill(n) = a {
@@ -759,19 +812,12 @@ pub(crate) fn act(hw: *mut c_void, wp: usize, lp: isize) {
     // Everything else ends the menu: the session is taken out first, so a modal dialog's message loop (Delete asks) cannot meet it
     let Some(s) = SESSION.with_borrow_mut(|c| if c.as_ref().is_some_and(|s| s.id == session) { c.take() } else { None }) else { return };
     match a {
-        Act::Item(id) if id >= syn::OPEN => own(hw, &s, id),
+        Act::Item(id) if id >= syn::OPEN => own(w, hw, &s, id),
         Act::Item(id) => {
             // the shell's own: run on its worker (which tells the window to reload when it is done); the menu is let go after
             if let Some(w) = &s.worker { w.send(Cmd::Run(hw as isize, id, session)); }
         }
-        Act::Rename => unsafe {
-            let (list, ..) = crate::selected();
-            let i = crate::put(list, windows_sys::Win32::UI::Controls::LVM_GETNEXTITEM, usize::MAX, windows_sys::Win32::UI::Controls::LVNI_SELECTED as isize);
-            if i >= 0 {
-                windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(list);
-                crate::put(list, windows_sys::Win32::UI::Controls::LVM_EDITLABELW, i as usize, 0);
-            }
-        },
+        Act::Rename => w.rename(hw),
         Act::Zip => {
             let base = if s.paths.len() == 1 { s.paths[0].file_stem().unwrap_or_default().to_string_lossy().into_owned() } else { s.dir.file_name().map_or("Archive".into(), |n| n.to_string_lossy().into_owned()) };
             let dest = crate::jobs::free_name(&s.dir, &format!("{base}.zip"), false);
@@ -780,15 +826,13 @@ pub(crate) fn act(hw: *mut c_void, wp: usize, lp: isize) {
         Act::Extract => _ = crate::jobs::extract(hw as isize, s.paths.clone(), s.dir.clone()),
         Act::CopyPath => copy_paths(h, &s.paths),
         Act::NewTab => {
-            if let [p] = s.paths.as_slice() {
-                if crate::desk() { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).arg(p).spawn(); } else { crate::tab_open(p.clone()); }
-            }
+            if let [p] = s.paths.as_slice() { w.new_tab(hw, p.clone()); }
         }
         Act::Terminal => {
             if let [p] = s.paths.as_slice() { terminal(p); }
         }
         Act::TogglePin => {
-            if let [p] = s.paths.as_slice() { crate::ui::toggle_pin(p); }
+            if let [p] = s.paths.as_slice() { w.toggle_pin(hw, p.clone()); }
         }
         Act::Reveal => {
             if let [p] = s.paths.as_slice() { winrust_common::reveal(&p.to_string_lossy()); }
