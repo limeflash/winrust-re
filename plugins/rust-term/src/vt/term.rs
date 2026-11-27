@@ -16,6 +16,8 @@ pub enum MarkKind {
     Input,
     Output,
     Done(Option<i32>),
+    /// ED 3 cleared the history here (not an OSC 133 mark).
+    Cleared,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mark {
@@ -113,6 +115,35 @@ impl Term {
     }
     pub fn history(&self) -> &VecDeque<Vec<Cell>> {
         &self.history
+    }
+    pub fn first_line(&self) -> u64 {
+        self.scrolled_total - self.history.len() as u64
+    }
+    pub fn end_line(&self) -> u64 {
+        self.scrolled_total + self.grid.rows() as u64
+    }
+    /// Returns a kept line. Screen lines come from the alternate screen while it is active.
+    pub fn line(&self, abs: u64) -> Option<&[Cell]> {
+        if abs < self.first_line() || abs >= self.end_line() {
+            return None;
+        }
+        if abs < self.scrolled_total {
+            self.history
+                .get((abs - self.first_line()) as usize)
+                .map(Vec::as_slice)
+        } else {
+            Some(self.grid.row((abs - self.scrolled_total) as usize))
+        }
+    }
+    pub fn line_text(&self, abs: u64) -> Option<String> {
+        self.line(abs).map(|line| {
+            let text: String = line
+                .iter()
+                .filter(|cell| cell.width != 0)
+                .map(|cell| cell.ch)
+                .collect();
+            text.trim_end_matches(' ').to_owned()
+        })
     }
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
@@ -314,13 +345,15 @@ fn decode_path(bytes: &[u8]) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
             && let Ok(s) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                && let Ok(v) = u8::from_str_radix(s, 16) {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
+            && let Ok(v) = u8::from_str_radix(s, 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
         out.push(bytes[i]);
         i += 1;
     }
@@ -414,6 +447,9 @@ impl Perform for Term {
                 if mode == 3 {
                     self.drain_history();
                     self.history.clear();
+                    // `clear` / `cls`: the blocks before this point go with the history
+                    let (row, col) = self.grid.cursor();
+                    self.marks.push(Mark { kind: MarkKind::Cleared, line: self.scrolled_total + row as u64, col });
                 }
                 self.grid.erase_display(mode as u8);
             }
@@ -462,7 +498,12 @@ impl Perform for Term {
     }
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         // vte splits an OSC at every ';': a title, a path or a URI that has one comes back in pieces
-        let rest = |from: usize| params.get(from..).filter(|p| !p.is_empty()).map(|p| p.join(&b';'));
+        let rest = |from: usize| {
+            params
+                .get(from..)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.join(&b';'))
+        };
         match params.first().copied() {
             Some(b"0" | b"2") => {
                 if let Some(value) = rest(1) {
@@ -472,9 +513,10 @@ impl Perform for Term {
             Some(b"7") => {
                 if let Some(value) = params.get(1)
                     && let Some(rest) = value.strip_prefix(b"file://")
-                        && let Some(pos) = rest.iter().position(|b| *b == b'/') {
-                            self.cwd = Some(decode_path(&rest[pos..]));
-                        }
+                    && let Some(pos) = rest.iter().position(|b| *b == b'/')
+                {
+                    self.cwd = Some(decode_path(&rest[pos..]));
+                }
             }
             Some(b"9") if params.get(1) == Some(&b"9".as_slice()) => {
                 if let Some(value) = rest(2) {
@@ -810,14 +852,21 @@ mod tests {
     fn semicolons_stay_in_titles_and_links() {
         let t = term(b"\x1b]0;a;b\x07\x1b]8;;https://x.test/?a=1;b=2\x1b\\L");
         assert_eq!(t.title(), "a;b");
-        assert_eq!(t.link(t.grid.cell(0, 0).pen.link), Some("https://x.test/?a=1;b=2"));
+        assert_eq!(
+            t.link(t.grid.cell(0, 0).pen.link),
+            Some("https://x.test/?a=1;b=2")
+        );
     }
     #[test]
     fn ris_keeps_the_history_and_line_count() {
         let mut t = Term::new(10, 2);
         t.feed(b"1\r\n2\r\n3\r\n\x1bc\x1b]133;A\x07");
         assert_eq!(t.history().len(), 2);
-        assert_eq!(t.take_marks()[0].line, 2, "the line after the two scrolled off");
+        assert_eq!(
+            t.take_marks()[0].line,
+            2,
+            "the line after the two scrolled off"
+        );
     }
     #[test]
     #[ignore]
@@ -831,5 +880,51 @@ mod tests {
         }
         let mb = iterations as f64 * chunk.len() as f64 / 1_000_000.0;
         println!("throughput: {:.2} MB/s", mb / start.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+    #[test]
+    fn history_and_screen() {
+        let mut t = Term::new(8, 2);
+        t.feed(b"one\r\ntwo\r\nthree");
+        assert_eq!((t.first_line(), t.end_line()), (0, 3));
+        assert_eq!(t.line_text(0).as_deref(), Some("one"));
+        assert_eq!(t.line_text(1).as_deref(), Some("two"));
+        assert_eq!(t.line_text(2).as_deref(), Some("three"));
+        assert_eq!(t.line(0).unwrap()[0].ch, 'o');
+    }
+    #[test]
+    fn outside_after_clear() {
+        let mut t = Term::new(8, 1);
+        t.feed(b"one\r\ntwo\x1b[3J");
+        assert_eq!(t.first_line(), 1);
+        assert!(t.line(0).is_none());
+        assert!(t.line_text(t.end_line()).is_none());
+    }
+    #[test]
+    fn alternate_screen_line() {
+        let mut t = Term::new(8, 2);
+        t.feed(b"main\x1b[?1049halt");
+        assert_eq!(t.line_text(0).as_deref(), Some("alt"));
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.line_text(0).as_deref(), Some("main"));
+    }
+    #[test]
+    fn wide_text_and_blanks() {
+        let mut t = Term::new(8, 1);
+        t.feed(" x界 ".as_bytes());
+        assert_eq!(t.line_text(0).as_deref(), Some(" x界"));
+    }
+    #[test]
+    fn cap_advances_first() {
+        let mut t = Term::new(3, 1);
+        for _ in 0..10002 {
+            t.feed(b"x\r\n");
+        }
+        assert_eq!(t.first_line(), 2);
+        assert!(t.line(1).is_none());
     }
 }

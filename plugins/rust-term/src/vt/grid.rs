@@ -126,6 +126,9 @@ impl Grid {
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
         &self.active.cells[row][col]
     }
+    pub fn row(&self, row: usize) -> &[Cell] {
+        &self.active.cells[row]
+    }
     pub fn row_text(&self, row: usize) -> String {
         let mut s = String::new();
         for cell in &self.active.cells[row] {
