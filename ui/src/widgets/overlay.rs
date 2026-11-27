@@ -85,8 +85,9 @@ impl MenuItem {
     }
 }
 
-/// A dialog: an icon, a title, a text and buttons, over a scrim. The last button is the primary one (Enter), `cancel` the one Esc
-/// presses.
+/// A dialog: an icon, a title, a text and buttons, over a scrim. The last button is the primary one, `cancel` the one Esc presses.
+/// Enter presses the focused button: the primary one, or `cancel` in a `danger` dialog (as Windows does), so a stray Enter never
+/// does what cannot be undone.
 #[derive(Clone, Debug)]
 pub struct Dialog {
     pub title: String,
@@ -286,7 +287,7 @@ impl Overlays {
     pub fn open_dialog(&mut self, tag: u32, d: Dialog, now: u64) {
         self.menu = None;
         self.tip = None;
-        let focus = d.buttons.len().saturating_sub(1);
+        let focus = if d.danger { d.cancel } else { d.buttons.len().saturating_sub(1) };
         self.dialog = Some(DialogState { tag, d, born: now, focus });
     }
 
@@ -785,6 +786,16 @@ mod tests {
         assert_eq!(o.key(0x0D, 0), OvKey::Command(3, 1));
         o.open_dialog(3, Dialog::new("Delete?", "x", &["Cancel", "Delete"]), 0);
         assert_eq!(o.click(DLG_BTN, 0), Some((3, 0)), "a click on the first button");
+    }
+
+    #[test]
+    fn enter_in_a_dangerous_dialog_cancels_until_the_primary_button_is_chosen() {
+        let mut o = Overlays::default();
+        o.open_dialog(3, Dialog::new("Delete?", "Gone for good.", &["Cancel", "Delete"]).icon("M0 0", true), 0);
+        assert_eq!(o.key(0x0D, 0), OvKey::Command(3, 0), "Enter on its own is Cancel");
+        o.open_dialog(3, Dialog::new("Delete?", "Gone for good.", &["Cancel", "Delete"]).icon("M0 0", true), 0);
+        assert_eq!(o.key(0x27, 0), OvKey::Taken, "right: the red button");
+        assert_eq!(o.key(0x0D, 0), OvKey::Command(3, 1), "chosen on purpose");
     }
 
     #[test]
