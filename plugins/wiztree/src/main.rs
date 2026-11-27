@@ -5,7 +5,10 @@
 // shortcuts: one level of the tree at a time, the 300 biggest items; a folder's own index size is not counted (see common/src/mft.rs).
 use winrust_common::{t, tf};
 use winrust_common::mft::*;
-use std::{cell::RefCell, collections::HashMap, ptr::{null, null_mut}};
+mod model;
+mod delete;
+use model::{Tree, build, squarify};
+use std::{cell::RefCell, ptr::{null, null_mut}};
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
@@ -25,26 +28,6 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
-struct Tree {
-    recs: HashMap<u32, Rec>,
-    tot: HashMap<u32, u64>,
-    kids: HashMap<u32, Vec<u32>>,
-}
-
-fn build(recs: HashMap<u32, Rec>) -> Tree {
-    let tot = totals(&recs, false);
-    let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (&id, r) in &recs {
-        if id != ROOT && tot.contains_key(&id) {
-            kids.entry(r.parent).or_default().push(id);
-        }
-    }
-    for v in kids.values_mut() {
-        v.sort_by_key(|id| std::cmp::Reverse(tot[id]));
-    }
-    Tree { recs, tot, kids }
-}
-
 #[derive(Default)]
 struct App {
     tree: Option<Tree>,
@@ -60,55 +43,6 @@ thread_local! { static APP: RefCell<App> = RefCell::new(App { drive: 'C', cur: R
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
-}
-
-/// Squarified treemap: `items` (id, size) biggest first, laid out in the rectangle (x, y, w, h).
-fn squarify(items: &[(u32, u64)], (mut x, mut y, mut w, mut h): (f64, f64, f64, f64)) -> Vec<(u32, [f64; 4])> {
-    let total: f64 = items.iter().map(|i| i.1 as f64).sum();
-    let mut out = vec![];
-    if total <= 0.0 || w <= 0.0 || h <= 0.0 {
-        return out;
-    }
-    let scale = w * h / total;
-    let area = |k: usize| items[k].1 as f64 * scale;
-    let mut i = 0;
-    while i < items.len() {
-        let side = w.min(h);
-        let worst = |s: f64, mx: f64, mn: f64| (side * side * mx / (s * s)).max(s * s / (side * side * mn));
-        let (mut j, mut s, mut mx, mut mn) = (i + 1, area(i), area(i), area(i));
-        let mut cur = worst(s, mx, mn);
-        while j < items.len() {
-            let a = area(j);
-            let next = worst(s + a, mx.max(a), mn.min(a));
-            if next > cur {
-                break;
-            }
-            (s, mx, mn, cur, j) = (s + a, mx.max(a), mn.min(a), next, j + 1);
-        }
-        if w >= h {
-            // a column on the left
-            let (cw, mut yy) = (s / h, y);
-            for k in i..j {
-                let ch = area(k) / cw;
-                out.push((items[k].0, [x, yy, x + cw, yy + ch]));
-                yy += ch;
-            }
-            x += cw;
-            w -= cw;
-        } else {
-            // a row on top
-            let (rh, mut xx) = (s / w, x);
-            for k in i..j {
-                let cw = area(k) / rh;
-                out.push((items[k].0, [xx, y, xx + cw, y + rh]));
-                xx += cw;
-            }
-            y += rh;
-            h -= rh;
-        }
-        i = j;
-    }
-    out
 }
 
 /// Stable colour per extension / folder name (folders darker than files).
@@ -328,21 +262,3 @@ fn main() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn treemap_fills_the_rect_and_keeps_size_ratios() {
-        let items = [(1, 600), (2, 300), (3, 200), (4, 100), (5, 100)];
-        let cells = squarify(&items, (0.0, 0.0, 400.0, 300.0));
-        assert_eq!(cells.len(), 5);
-        let a = |id: u32| {
-            let r = cells.iter().find(|c| c.0 == id).unwrap().1;
-            (r[2] - r[0]) * (r[3] - r[1])
-        };
-        let total: f64 = (1..=5).map(a).sum();
-        assert!((total - 120_000.0).abs() < 1.0, "area {total}");
-        assert!((a(1) / a(2) - 2.0).abs() < 1e-6);
-    }
-}

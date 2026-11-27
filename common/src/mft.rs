@@ -101,6 +101,10 @@ pub fn merge(recs: &mut HashMap<u32, Rec>, id: u32, r: Rec) {
     }
 }
 
+fn parse_slot(recs: &mut HashMap<u32, Rec>, idx: u32, slot: &mut [u8]) {
+    if let Some((base, r)) = parse(slot) { merge(recs, if base == 0 { idx } else { base as u32 }, r); }
+}
+
 /// The open volume, closed on every way out of `scan` (the error returns used to leave it open: a rescan leaked one each time).
 struct Volume(HANDLE);
 impl Drop for Volume {
@@ -110,6 +114,10 @@ impl Drop for Volume {
 }
 
 pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
+    scan_with(drive, &mut |_, _| {})
+}
+
+pub fn scan_with(drive: char, progress: &mut dyn FnMut(u64, u64)) -> Result<HashMap<u32, Rec>, String> {
     let path: Vec<u16> = format!("\\\\.\\{drive}:").encode_utf16().chain([0]).collect();
     let h = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ptr::null(), OPEN_EXISTING, 0, ptr::null_mut()) };
     if h == INVALID_HANDLE_VALUE { return Err(tf!("не удалось открыть том {0}: (нужны права администратора), код {1}", "cannot open volume {0}: (run as administrator), error {1}", ja: "ボリューム {0}: を開けません (管理者として実行してください)、エラー {1}", pt: "não foi possível abrir o volume {0}: (execute como administrador), erro {1}", zh: "无法打开卷 {0}:（请以管理员身份运行），错误 {1}", drive, unsafe { GetLastError() })); }
@@ -127,6 +135,10 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
     let rec0 = out[12..12 + rs].to_vec();
     // the ioctl already hands back a record with the fixups undone (raw reads below do not)
     let runs = data_runs(&rec0).ok_or_else(|| t!("в записи $MFT нет потоков $DATA", "no $DATA runs in the $MFT record", ja: "$MFT レコードに $DATA のランがありません", pt: "não há runs $DATA no registro $MFT", zh: "$MFT 记录里没有 $DATA 数据运行").to_string())?;
+    let total = (vd.MftValidDataLength as u64) / rs as u64;
+    let step = total.div_ceil(48).max(1);
+    let mut next = step;
+    progress(0, total);
     let mut left = vd.MftValidDataLength as u64; // bytes of the table still to read
     let mut recs = HashMap::with_capacity(left as usize / rs / 2);
     let (mut idx, mut buf) = (0u32, vec![0u8; 4 << 20]);
@@ -134,7 +146,7 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
     for (lcn, clusters) in runs {
         let mut len = (clusters * cl).min(left);
         left -= len;
-        if lcn == 0 { idx += (len / rs as u64) as u32; continue; } // sparse hole
+        if lcn == 0 { idx += (len / rs as u64) as u32; if u64::from(idx) >= next { progress(u64::from(idx).min(total), total); next = u64::from(idx).saturating_add(step); } continue; } // sparse hole
         let mut pos = (lcn * cl) as i64;
         while len > 0 {
             let want = len.min(buf.len() as u64) as usize;
@@ -144,13 +156,15 @@ pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
             for c in buf[..want].chunks_exact_mut(rs) {
                 seen += 1;
                 magic += (&c[..4] == b"FILE") as u32;
-                if let Some((base, r)) = parse(c) { merge(&mut recs, if base == 0 { idx } else { base as u32 }, r); }
+                parse_slot(&mut recs, idx, c);
                 idx += 1;
             }
+            if u64::from(idx) >= next { progress(u64::from(idx).min(total), total); next = u64::from(idx).saturating_add(step); }
             pos += want as i64;
             len -= want as u64;
         }
     }
+    if u64::from(idx) < next && u64::from(idx) > 0 { progress(u64::from(idx).min(total), total); }
     recs.retain(|_, r| !r.name.is_empty()); // no $FILE_NAME anywhere (e.g. attribute list in a record we never saw)
     eprintln!("mft: {seen} slots read, {magic} with FILE magic, {} named", recs.len());
     Ok(recs)
@@ -190,4 +204,33 @@ pub fn totals(recs: &HashMap<u32, Rec>, logical: bool) -> HashMap<u32, u64> {
         }
     }
     tot
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn parsed_slots_match_with_and_without_progress() {
+        fn run(progress: &mut dyn FnMut(u64, u64)) -> HashMap<u32, Rec> {
+            let mut slots = vec![vec![0u8; 1024]; 3];
+            for slot in &mut slots {
+                slot[..4].copy_from_slice(b"FILE");
+                slot[4..6].copy_from_slice(&48u16.to_le_bytes());
+                slot[6..8].copy_from_slice(&1u16.to_le_bytes());
+                slot[0x14..0x16].copy_from_slice(&56u16.to_le_bytes());
+                slot[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+                slot[0x18..0x1c].copy_from_slice(&64u32.to_le_bytes());
+                slot[56..60].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            }
+            let mut recs = HashMap::new();
+            for (i, slot) in slots.iter_mut().enumerate() { parse_slot(&mut recs, i as u32, slot); progress(i as u64 + 1, 3); }
+            recs
+        }
+        let a = run(&mut |_, _| {});
+        let mut calls = Vec::new();
+        let b = run(&mut |read, total| calls.push((read, total)));
+        assert_eq!(a.len(), 3);
+        for (id, r) in a { let other = &b[&id]; assert_eq!((&r.name, r.parent, r.dir, r.alloc, r.logical), (&other.name, other.parent, other.dir, other.alloc, other.logical)); }
+        assert_eq!(calls.last(), Some(&(3, 3)));
+    }
 }
