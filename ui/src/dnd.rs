@@ -6,12 +6,13 @@ use std::cell::RefCell;
 
 use windows::Win32::Foundation::{HWND, POINT, POINTL};
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
-use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, OleInitialize, ReleaseStgMedium, RegisterDragDrop, RevokeDragDrop};
+use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, OleInitialize, ReleaseStgMedium, RegisterDragDrop, RevokeDragDrop};
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::core::{Ref, Result, implement};
 
 use crate::anim;
+use crate::core::DropFx;
 use crate::window::{event, with};
 
 /// The paths a drag carries (`CF_HDROP`); empty when it carries none.
@@ -50,30 +51,32 @@ impl Target {
         (p.x as f32 / s, p.y as f32 / s)
     }
 
-    fn over(&self, pt: &POINTL, effect: *mut DROPEFFECT) {
+    fn over(&self, k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) {
         let (x, y) = self.client(pt);
         let paths = self.paths.borrow();
         let mut ok = false;
+        let mut fx = DropFx::Copy;
         if !paths.is_empty() {
             event(self.hwnd as _, |h| {
                 ok = h.core.drag_over(&paths, x, y);
+                fx = h.core.app.drag_effect(&paths, k.0 & 8 != 0); // MK_CONTROL
                 None
             });
         }
         // SAFETY: OLE gives a valid pointer to the effect.
-        unsafe { *effect = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE } };
+        unsafe { *effect = if !ok { DROPEFFECT_NONE } else if fx == DropFx::Move { DROPEFFECT_MOVE } else { DROPEFFECT_COPY } };
     }
 }
 
 impl IDropTarget_Impl for Target_Impl {
-    fn DragEnter(&self, o: Ref<'_, IDataObject>, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+    fn DragEnter(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         *self.paths.borrow_mut() = o.as_ref().map(hdrop_paths).unwrap_or_default();
-        self.over(pt, effect);
+        self.over(k, pt, effect);
         Ok(())
     }
 
-    fn DragOver(&self, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        self.over(pt, effect);
+    fn DragOver(&self, k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        self.over(k, pt, effect);
         Ok(())
     }
 
@@ -86,21 +89,23 @@ impl IDropTarget_Impl for Target_Impl {
         Ok(())
     }
 
-    fn Drop(&self, o: Ref<'_, IDataObject>, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+    fn Drop(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         let paths = o.as_ref().map(hdrop_paths).unwrap_or_default();
         self.paths.borrow_mut().clear();
         let (x, y) = self.client(pt);
         let got = !paths.is_empty();
+        let mut fx = DropFx::Copy;
         // the app is told after OLE has the answer: it may show a dialog, which must not hold the drag source
         event(self.hwnd as _, |h| {
             h.core.drag_leave(anim::now_ms());
             if got {
+                fx = h.core.app.drag_effect(&paths, k.0 & 8 != 0);
                 h.core.files(paths, x, y, anim::now_ms());
             }
             None
         });
         // SAFETY: OLE gives a valid pointer to the effect.
-        unsafe { *effect = if got { DROPEFFECT_COPY } else { DROPEFFECT_NONE } };
+        unsafe { *effect = if !got { DROPEFFECT_NONE } else if fx == DropFx::Move { DROPEFFECT_MOVE } else { DROPEFFECT_COPY } };
         Ok(())
     }
 }
