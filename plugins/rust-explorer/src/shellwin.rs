@@ -17,6 +17,34 @@ use windows::{
 
 /// Posted to the window when the shell wants a file selected: lp = Box<PathBuf>. The shell calls us on an RPC thread, so the UI does the work.
 pub const WM_SHELL_SELECT: u32 = WM_APP + 6;
+/// `WM_COPYDATA` tag: the desktop's stand-in hands an open window on its folder the file to pick (UTF-16 path, no NUL).
+pub const COPY_SELECT: usize = 0x5753_454C;
+
+/// The stand-ins are found first by the shell, before any window the user opened later on the same folder: the file goes to such a
+/// window (the file manager's title is its folder) when one answers, so "Show in folder" twice does not open the folder twice.
+fn hand_to_open_window(dir: &str, path: &Path) -> bool {
+    let dir = dir.trim_end_matches('\\');
+    let text: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let cds = windows::Win32::System::DataExchange::COPYDATASTRUCT { dwData: COPY_SELECT, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut c_void };
+    let mut w = HWND::default();
+    // SAFETY: plain window queries; the data outlives the synchronous send, which gives up on a hung window.
+    unsafe {
+        while let Ok(next) = FindWindowExW(None, (!w.is_invalid()).then_some(w), w!("RustExplorer"), PCWSTR::null()) {
+            w = next;
+            let mut buf = [0u16; 1024];
+            let n = GetWindowTextW(w, &mut buf) as usize;
+            if !String::from_utf16_lossy(&buf[..n]).trim_end_matches('\\').eq_ignore_ascii_case(dir) {
+                continue;
+            }
+            let _ = AllowSetForegroundWindow(ASFW_ANY); // the window raises itself: the shell gave the foreground to us
+            let mut r = 0usize;
+            if SendMessageTimeoutW(w, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 2000, Some(&mut r)).0 != 0 && r == 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 struct Reg { sw: IShellWindows, cookie: i32, live: bool } // live: the window whose folder changes (not a stand-in)
 thread_local! { static REG: RefCell<Vec<Reg>> = const { RefCell::new(Vec::new()) }; }
@@ -123,6 +151,10 @@ impl IShellView_Impl for View_Impl {
        
         let path = item_path(pidl, &cur(&self.dir)).ok_or(E_FAIL)?;
         if self.resident {
+            // a window shows the folder already: it picks the file, as Explorer's own window would (no second window)
+            if hand_to_open_window(&cur(&self.dir), &path) {
+                return Ok(());
+            }
             let exe = std::env::current_exe().map_err(|_| E_FAIL)?;
             std::process::Command::new(exe).raw_arg(format!("/select,\"{}\"", path.display())).spawn().map_err(|_| E_FAIL)?;
         } else {

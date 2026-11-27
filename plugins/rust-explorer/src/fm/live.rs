@@ -18,7 +18,7 @@ use windows_sys::Win32::{
     Graphics::Gdi::{BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, ClientToScreen, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC},
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
-        WindowsAndMessaging::{ChangeWindowMessageFilterEx, IsIconic, MSGFLT_ALLOW, PostMessageW, SW_RESTORE, SendMessageW, SetForegroundWindow, ShowWindow, WM_APP, WM_APPCOMMAND, WM_LBUTTONUP, WM_NCDESTROY, WM_TIMER},
+        WindowsAndMessaging::{ChangeWindowMessageFilterEx, IsIconic, MSGFLT_ALLOW, PostMessageW, SW_RESTORE, SendMessageW, SetForegroundWindow, ShowWindow, WM_APP, WM_APPCOMMAND, WM_COPYDATA, WM_LBUTTONUP, WM_NCDESTROY, WM_TIMER},
     },
 };
 use winrust_common::{deskmenu, filemenu, t, tf};
@@ -142,6 +142,19 @@ impl crate::shellmenu::Win for WinHost {
 }
 
 unsafe extern "system" fn subclass(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    // the desktop's stand-in for this folder hands over the file "Show in folder" asked for (shellwin::hand_to_open_window)
+    if m == WM_COPYDATA {
+        // SAFETY: WM_COPYDATA's lp is a COPYDATASTRUCT that lives for the call.
+        let cds = unsafe { &*(lp as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
+        if cds.dwData == crate::shellwin::COPY_SELECT && !cds.lpData.is_null() {
+            // SAFETY: cbData bytes of UTF-16 at lpData, as the stand-in sent them.
+            let w = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
+            let path = PathBuf::from(<std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(w));
+            // SAFETY: a message to our own window; WM_SHELL_SELECT takes the box back.
+            unsafe { PostMessageW(h, crate::shellwin::WM_SHELL_SELECT, 0, Box::into_raw(Box::new(path)) as LPARAM) };
+            return 1;
+        }
+    }
     // what the bar's menu answered: the host knows no registered message
     if m == filemenu::act_msg() {
         crate::shellmenu::act_with(&WinHost, h, wp, lp);
