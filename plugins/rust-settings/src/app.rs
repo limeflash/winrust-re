@@ -458,7 +458,7 @@ impl Settings {
         // a default app is Windows' to set: its own chooser opens and the user confirms there
         if let Some(a) = crate::def_assoc(op) {
             os().assoc_pick(&a, i, self.hwnd, note());
-            self.say(if a.protocol { t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there") } else { t!("Windows спросит, чем открывать: подтвердите «Всегда использовать это приложение»", "Windows asks which app to use: confirm \u{201c}Always use this app\u{201d}") }, cx);
+            self.say(if os().assoc_on_page(&a) { t!("Откроются параметры Windows: подтвердите выбор там", "Windows\u{2019} settings open: confirm the choice there") } else { t!("Windows спросит, чем открывать: подтвердите «Всегда использовать это приложение»", "Windows asks which app to use: confirm \u{201c}Always use this app\u{201d}") }, cx);
             self.read_page();
             cx.invalidate();
             return;

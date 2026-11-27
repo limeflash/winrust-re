@@ -268,16 +268,20 @@ pub fn spawn_as_user(exe: &std::path::Path, args: &[String]) -> std::io::Result<
     }
 }
 
-/// Starts Explorer as the shell with the user's normal token. Started straight from an unelevated process: under the
-/// `runas /trustlevel` token it is a shell that never shows a Store app (Settings stays a blue splash, its window cloaked).
-/// That token is only for an elevated caller, which must not hand Explorer its admin rights.
+/// Starts Explorer as the shell with the user's normal token. An elevated caller (the bar, WinRust Settings) must not hand Explorer
+/// its admin rights: [`spawn_as_user`] gives it the full normal token of rs-shell. Under the `runas /trustlevel` token it is a shell
+/// that never shows a Store app (Settings stays a blue splash, its window cloaked): only the last resort.
 pub fn start_shell_explorer() -> std::io::Result<()> {
     use std::{os::windows::process::CommandExt, process::Command};
-    if elevated() {
-        Command::new("runas.exe").args(["/trustlevel:0x20000", r"C:\Windows\explorer.exe"]).creation_flags(0x0800_0000).status().map(|_| ())
-    } else {
-        Command::new(r"C:\Windows\explorer.exe").spawn().map(|_| ())
+    let explorer = std::path::Path::new(r"C:\Windows\explorer.exe");
+    if !elevated() {
+        return Command::new(explorer).spawn().map(|_| ());
     }
+    let normal_parent = ["rs-shell.exe", "rust-explorer.exe"].iter().flat_map(|n| pids(n)).any(|p| process_elevated(p) == Some(false));
+    if normal_parent && spawn_as_user(explorer, &[]).is_ok() {
+        return Ok(());
+    }
+    Command::new("runas.exe").args(["/trustlevel:0x20000", r"C:\Windows\explorer.exe"]).creation_flags(0x0800_0000).status().map(|_| ())
 }
 
 #[cfg(test)]

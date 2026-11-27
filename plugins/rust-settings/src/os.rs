@@ -169,6 +169,10 @@ pub trait Os {
     /// The user chose app `i` of `assoc_apps`: Windows' own chooser opens so they confirm it (the real one never sets the default itself);
     /// `done` says the dialog closed.
     fn assoc_pick(&self, a: &Assoc, i: usize, owner: isize, done: Note);
+    /// The choice for `a` is made on Windows' own Default apps page (a link scheme; a file type when Explorer is not the shell).
+    fn assoc_on_page(&self, a: &Assoc) -> bool {
+        a.protocol
+    }
     /// What WinRust's own file manager or terminal is here (not a Windows setting).
     fn own_default(&self, k: DefKind) -> String;
     /// Sets the computer's name (applies after a restart); the error is a line for the user.
@@ -549,6 +553,9 @@ impl Os for Live {
     }
     fn assoc_pick(&self, a: &Assoc, _i: usize, owner: isize, done: Note) {
         sysx::assoc_pick(a, owner, done);
+    }
+    fn assoc_on_page(&self, a: &Assoc) -> bool {
+        sysx::assoc_on_page(a)
     }
     fn own_default(&self, k: DefKind) -> String {
         sysx::own_default(k)
