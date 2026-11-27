@@ -2379,6 +2379,15 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         bars::invalidate_all();
         return 0;
     }
+    if msg != 0 && msg == winrust_common::deskmenu::request_msg() {
+        // rust-explorer's desktop was right-clicked: the design's menu at the pointer. The desktop is waiting for a yes or a no
+        // (no = it shows its own menu), so it gets it before the panel opens.
+        let Some(r) = winrust_common::deskmenu::Request::decode(wp, lp) else { return 0 };
+        let Some((content, a)) = menus::desk_menu(&r) else { return 0 };
+        ReplyMessage(1);
+        ui::panel::open(content, a);
+        return 1;
+    }
     if msg != 0 && msg == TB_MSG.get() {
         // also our own announce(): act only when explorer's taskbar is a new window (explorer restarted / came back)
         let t = tray()[0];

@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU8, Ordering::Relaxed},
 };
 
+pub mod deskmenu;
 pub mod desktop;
 pub mod fg;
 pub mod journal;
