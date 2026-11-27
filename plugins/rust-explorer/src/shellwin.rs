@@ -92,6 +92,15 @@ fn add(hwnd: isize, dir: &Path, resident: bool) -> Result<()> {
             }
             REG.with_borrow_mut(|r| r.push(Reg { sw: sw.clone(), cookie, live: !resident, form }));
         }
+        // "Show in folder" with no window on the folder starts us and waits for a window on it, looking again on each
+        // registration; an entry gets its folder only after its own registration, so the last form would never be seen
+        // (Telegram, a subfolder of Downloads: 20 s, then the folder without the file). One more registration, gone at
+        // once, makes it look when every form is in place.
+        if !resident {
+            if let Ok(c) = sw.Register(&disp, hwnd as i32, SWC_BROWSER) {
+                let _ = sw.Revoke(c);
+            }
+        }
         free_forms(forms);
     }
     Ok(())
