@@ -179,6 +179,22 @@ pub fn explorer_lent() -> bool {
     true
 }
 
+/// The registered message the bar gets when Explorer is lent (it gives up the taskman role at once, see `tell_bar`).
+pub const LEND_MSG: &str = "WinRust-ExplorerLend";
+
+/// Tells the bar Explorer is being lent, and waits until it has handled it (a second at most: a bar that hangs is not waited for).
+fn tell_bar() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW};
+    // SAFETY: plain window lookups and a message with no pointers.
+    unsafe {
+        let bar = FindWindowW(w("topbar").as_ptr(), std::ptr::null());
+        if !bar.is_null() {
+            let mut r = 0usize;
+            SendMessageTimeoutW(bar, RegisterWindowMessageW(w(LEND_MSG).as_ptr()), 1, 0, SMTO_ABORTIFHUNG, 1000, &mut r);
+        }
+    }
+}
+
 /// (runs in progress in this process, the marker handle of the Explorer that was started for them, 0: none). Launches that
 /// overlap share the one Explorer, and the last one to finish ends it: one that ended it under another's open page would kill
 /// that page. (Another process's launches are not counted: the named marker only tells them Explorer is lent.)
@@ -194,6 +210,9 @@ fn run(uri: &str) {
         st.0 += 1;
         if st.1 == 0 && !explorer_shell() {
             st.1 = unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, w(LENT).as_ptr()) } as usize;
+            // the bar holds the taskman role (Explorer's taskbar's) while Explorer is away: Explorer must get it, or it starts without
+            // its shell services and every Store app it opens, Settings first, stays cloaked. Told now, it lets go before Explorer starts.
+            tell_bar();
             // our desktop is a window of class Progman too: with it up Explorer thinks a shell exists and starts as a plain folder host
             proc::pids("rust-explorer.exe").into_iter().filter(|&p| has_desktop(p)).for_each(proc::kill);
             // a frame host left from an earlier Explorer stays tied to that dead shell: the Settings frame it hosts is cloaked for

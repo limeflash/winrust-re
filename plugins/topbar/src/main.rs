@@ -224,6 +224,7 @@ thread_local! {
     static TICK: Cell<u32> = const { Cell::new(0) };
     static EP: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) };
     static TB_MSG: Cell<u32> = const { Cell::new(0) }; // "TaskbarCreated"
+    static LEND_MSG: Cell<u32> = const { Cell::new(0) }; // Explorer is being lent for a Windows Settings page (common::settings)
     static SH_MSG: Cell<u32> = const { Cell::new(0) }; // "SHELLHOOK": window events for the shell (we are the shell hook window without explorer)
     static EXP_TRAY: Cell<HWND> = const { Cell::new(null_mut()) }; // explorer's taskbar we registered with
     static FLASH: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // windows asking for attention (FlashWindowEx) until activated (#129)
@@ -423,6 +424,26 @@ unsafe fn show_taskbar(state: usize) {
     set_state(tray()[0], state);
     for t in tray().into_iter().filter(|t| !t.is_null()) {
         ShowWindow(t, SW_SHOWNA);
+    }
+}
+
+/// The "taskman" window is what Explorer's taskbar is to Windows. Without Explorer nobody holds it, Windows treats minimized windows
+/// as loose icons and leaves them as caption stubs on the desktop; holding it (`bar`) makes them hide properly and gets us
+/// HSHELL_GETMINRECT. Explorer must have it whenever it runs as the shell: one lent for a Windows Settings page
+/// (common::settings) that could not take it started without its shell services, and the Settings window stayed cloaked by the
+/// shell (DWM_CLOAKED_SHELL), never on screen. So the bar holds it only while there is no Explorer taskbar and nothing is lent,
+/// lets go as soon as either appears, and takes it back once Explorer is gone (its window, and with it the role, goes away).
+unsafe fn taskman_sync(bar: HWND) {
+    let u = GetModuleHandleW(wide("user32.dll").as_ptr());
+    let (Some(get), Some(set)) = (GetProcAddress(u, b"GetTaskmanWindow\0".as_ptr()), GetProcAddress(u, b"SetTaskmanWindow\0".as_ptr())) else { return };
+    let get = std::mem::transmute::<_, unsafe extern "system" fn() -> HWND>(get);
+    let set = std::mem::transmute::<_, unsafe extern "system" fn(HWND) -> i32>(set);
+    let explorer = winrust_common::settings::explorer_lent() || !find_other("Shell_TrayWnd").is_null();
+    let cur = get();
+    if explorer && cur == bar {
+        set(null_mut());
+    } else if !explorer && cur.is_null() && !bar.is_null() {
+        set(bar);
     }
 }
 
@@ -2516,6 +2537,10 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             _ => {}
         }
     }
+    if msg != 0 && msg == LEND_MSG.get() {
+        taskman_sync(BAR.load(Relaxed) as HWND); // let go of the taskman role before the lent Explorer starts
+        return 1;
+    }
     if msg != 0 && msg == TB_MSG.get() {
         // also our own announce(): act only when explorer's taskbar is a new window (explorer restarted / came back)
         let t = tray()[0];
@@ -2628,6 +2653,7 @@ unsafe fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_TIMER => {
             hide_taskbar_if_shown();
+            taskman_sync(BAR.load(Relaxed) as HWND);
             refresh_status();
             if TICK.get() % 5 == 0 {
                 refresh_windows(); // safety net for a window event the hook did not report
@@ -2849,6 +2875,7 @@ fn run() {
         GdiplusStartup(&mut gtok, &gin, null_mut()); // anti-aliased shapes; fill() falls back to GDI if this failed
         i18n::style::follow_system(); // light or dark, as Windows has it: read here and again on its broadcast
         TB_MSG.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()));
+        LEND_MSG.set(RegisterWindowMessageW(wide(winrust_common::settings::LEND_MSG).as_ptr()));
         SH_MSG.set(RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()));
         // per monitor (v2): the windows are in physical pixels on every monitor, whatever its scale, so a bar on a second monitor
         // with another scale is not stretched by the system; without it (an old Windows) the system's scale for all
@@ -2897,14 +2924,9 @@ fn run() {
         OLD_STATE.set(remember_taskbar_state());
         bars::appbar_register(&main_bar);
         EXP_TRAY.set(tray()[0]);
-        // Without explorer nobody is the "taskman" window, so Windows treats minimized windows as loose icons and leaves
-        // them as caption stubs on the desktop. Becoming that window (what explorer's taskbar does) makes them hide properly
-        // and gets us HSHELL_GETMINRECT. Only when explorer's taskbar is absent: with it running its own registration stays.
-        if find_other("Shell_TrayWnd").is_null() {
-            if let Some(f) = GetProcAddress(GetModuleHandleW(wide("user32.dll").as_ptr()), b"SetTaskmanWindow\0".as_ptr()) {
-                std::mem::transmute::<_, unsafe extern "system" fn(HWND) -> i32>(f)(hwnd);
-            }
-        }
+        // the taskman role (see taskman_sync); Explorer lending messages may come from an unelevated Settings
+        ChangeWindowMessageFilterEx(hwnd, LEND_MSG.get(), MSGFLT_ALLOW, null_mut());
+        taskman_sync(hwnd);
         // window events for the shell (minimize target, HSHELL_FLASH): also next to explorer, whose taskbar we hide
         RegisterShellHookWindow(hwnd);
         hide_taskbar();
