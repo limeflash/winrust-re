@@ -428,6 +428,20 @@ impl Store {
         }
     }
 
+    /// The description of an app was read: its notes (key `key`) that still carry the file's name `old` (`stem`) take `name`, in the
+    /// app's line and in the title that was filled in from it. `true` if any changed.
+    pub fn rename_app(&mut self, key: &str, old: &str, name: &str) -> bool {
+        let mut any = false;
+        for n in self.notes.iter_mut().filter(|n| n.app.key == key && n.app.name == old && old != name) {
+            if n.title == n.app.name {
+                n.title = name.to_string();
+            }
+            n.app.name = name.to_string();
+            any = true;
+        }
+        any
+    }
+
     /// "Clear all": everything collapses at once and can be brought back for [`UNDO_MS`].
     pub fn clear_all(&mut self, now: u64) {
         let kept: Vec<Note> = self.notes.iter().filter(|n| n.gone.is_none()).cloned().collect();
@@ -781,44 +795,88 @@ pub fn screenshot_failed() {
     post(Note::new(shot_app(), t!("Не удалось сделать скриншот", "Could not take a screenshot", ja: "スクリーンショットを撮影できませんでした", pt: "Não foi possível capturar a tela", zh: "无法截图"), ""));
 }
 
-/// The name an app goes by: its file's description (what Task Manager shows), else the file's name. Read from the file once per
-/// program (balloons come in on the bar's thread, inside the sender's `WM_COPYDATA`: a chatty tray icon must not read the file
-/// again for every balloon).
-#[must_use]
-pub fn app_name(exe: &str) -> String {
-    thread_local! { static NAMES: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
-    if let Some(n) = NAMES.with_borrow(|m| m.get(exe).cloned()) {
-        return n;
-    }
-    let name = read_app_name(exe);
+thread_local! {
+    static NAMES: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static ASKED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn remember_name(exe: &str, name: String) {
+    ASKED.with_borrow_mut(|a| a.remove(exe));
     NAMES.with_borrow_mut(|m| {
         if m.len() >= 256 {
             m.clear();
         }
-        m.insert(exe.to_string(), name.clone());
+        m.insert(exe.to_string(), name);
     });
-    name
+}
+
+/// The name an app goes by: its file's description (what Task Manager shows), else the file's name. Reading the description means
+/// reading the file, and balloons come in on the bar's thread inside the sender's `WM_COPYDATA` (the sender waits): so the first
+/// balloon of a program gets the file's name at once, a thread reads the description, and `names_done` puts it into the notes
+/// when it arrives. Cached per program after that.
+#[must_use]
+pub fn app_name(exe: &str) -> String {
+    if let Some(n) = NAMES.with_borrow(|m| m.get(exe).cloned()) {
+        return n;
+    }
+    // reads in flight are bounded (a disk that does not answer): past that, the file's name now and another try with the next balloon
+    if ASKED.with_borrow_mut(|a| a.len() < 8 && a.insert(exe.to_string())) {
+        let (exe, bar) = (exe.to_string(), crate::BAR.load(std::sync::atomic::Ordering::Relaxed));
+        let spawned = std::thread::Builder::new().name("app-name".into()).spawn({
+            let exe = exe.clone();
+            move || {
+                let name = read_app_name(&exe);
+                NAMES_DONE.lock().unwrap_or_else(|e| e.into_inner()).push((exe, name));
+                // SAFETY: posting to a window that is gone just fails.
+                unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(bar as _, APP_NAME, 0, 0) };
+            }
+        });
+        if spawned.is_err() {
+            ASKED.with_borrow_mut(|a| a.remove(&exe));
+        }
+    }
+    stem(exe)
+}
+
+/// Posted to the bar when a thread of `app_name` has read a description: `names_done` on the bar's thread.
+pub const APP_NAME: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 21;
+static NAMES_DONE: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The bar's thread, on `APP_NAME`: the descriptions that were read go into the notes already shown under the file's name (and
+/// into the cache for the next balloon of the program).
+pub fn names_done() {
+    let done = std::mem::take(&mut *NAMES_DONE.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut any = false;
+    for (exe, name) in done {
+        any |= with(|s| s.rename_app(&exe.to_lowercase(), &stem(&exe), &name));
+        remember_name(&exe, name);
+    }
+    if any {
+        changed();
+    }
+}
+
+/// The file's name as a title: `C:\Apps\qbittorrent.exe` is `Qbittorrent`.
+fn stem(exe: &str) -> String {
+    let f = exe.rsplit('\\').next().unwrap_or(exe);
+    let f = f.rsplit_once('.').map_or(f, |(a, _)| a);
+    let mut c = f.chars();
+    c.next().map(|h| h.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn read_app_name(exe: &str) -> String {
     use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-    let stem = || {
-        let f = exe.rsplit('\\').next().unwrap_or(exe);
-        let f = f.rsplit_once('.').map_or(f, |(a, _)| a);
-        let mut c = f.chars();
-        c.next().map(|h| h.to_uppercase().chain(c).collect()).unwrap_or_default()
-    };
     let path = wide(exe);
     // SAFETY: the version block is read through the sizes the API itself gave; the pointers VerQueryValueW returns point into it.
     let from_file = unsafe {
         let mut h = 0u32;
         let size = GetFileVersionInfoSizeW(path.as_ptr(), &mut h);
         if size == 0 {
-            return stem();
+            return stem(exe);
         }
         let mut block = vec![0u8; size as usize];
         if GetFileVersionInfoW(path.as_ptr(), 0, size, block.as_mut_ptr().cast()) == 0 {
-            return stem();
+            return stem(exe);
         }
         // `unit`: bytes per length unit (the translation table counts bytes, a string counts characters); a value that does not lie
         // inside the block (a damaged resource) is refused rather than read past its end
@@ -839,7 +897,7 @@ fn read_app_name(exe: &str) -> String {
             Some(String::from_utf16_lossy(w).trim_end_matches('\0').trim().to_string())
         })
     };
-    from_file.filter(|d| !d.is_empty()).unwrap_or_else(stem)
+    from_file.filter(|d| !d.is_empty()).unwrap_or_else(|| stem(exe))
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -893,6 +951,20 @@ mod tests {
 
     fn note(k: &str, t: &str) -> Note {
         Note::new(app(k), t, "body")
+    }
+
+    #[test]
+    fn a_description_that_arrives_late_renames_the_notes_shown_under_the_file_name() {
+        let mut s = Store::new();
+        let mut n = Note::new(App { key: r"c:\q.exe".into(), name: "Q".into(), icon: AppIcon::Winrust }, "Q", "body");
+        n.target = Target::Nothing;
+        s.push(n, 0);
+        s.push(Note::new(App { key: r"c:\q.exe".into(), name: "Q".into(), icon: AppIcon::Winrust }, "Done", "x"), 10_000);
+        assert!(s.rename_app(r"c:\q.exe", "Q", "qBittorrent"));
+        assert!(s.notes().iter().all(|n| n.app.name == "qBittorrent"));
+        assert_eq!(s.notes().iter().map(|n| n.title.as_str()).collect::<Vec<_>>(), ["Done", "qBittorrent"], "only a title that was the name follows it");
+        assert!(!s.rename_app(r"c:\q.exe", "Q", "qBittorrent"), "nothing left under the old name");
+        assert_eq!(stem(r"C:\Apps\qbittorrent.exe"), "Qbittorrent");
     }
 
     #[test]
