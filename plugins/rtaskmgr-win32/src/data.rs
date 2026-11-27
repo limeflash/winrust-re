@@ -105,6 +105,13 @@ struct HistAcc {
     net: f32,
 }
 
+/// What an app usually uses: memory in bytes, the processor in per cent (the 30 s average).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Usual {
+    pub mem: u64,
+    pub cpu: f32,
+}
+
 pub struct Data {
     pub sys: System,
     nets: Networks,
@@ -115,6 +122,11 @@ pub struct Data {
     /// Command lines that are told, not read (the made-up processes of the demo); empty for the real thing.
     pub cmds: HashMap<u32, String>,
     pub startup: Vec<startup::Item>,
+    /// What Windows logged of its last startups (read with the startup entries, by an administrator; the time is the local one).
+    pub boot: startup::BootLog,
+    /// What an app usually uses, by its exe name in lower case. Nothing here keeps a week of per-app history yet, so the real set is
+    /// empty and the What's slow page says only what is now; the demo and the tests tell it by hand.
+    pub usual: HashMap<String, Usual>,
     pub hist: Vec<Vec<String>>,
     pub series: Series,
     pub rules: Vec<Rule>,
@@ -194,6 +206,8 @@ impl Data {
             svc_pids: HashMap::new(),
             cmds: HashMap::new(),
             startup: vec![],
+            boot: startup::BootLog::default(),
+            usual: HashMap::new(),
             hist: vec![],
             series: Series::default(),
             rules: cfg.rules.clone(),
@@ -234,6 +248,12 @@ impl Data {
 
     pub fn load_startup(&mut self) {
         self.startup = startup::list();
+        if self.is_admin {
+            self.boot = startup::boot_log().clone();
+            for b in &mut self.boot.boots {
+                b.0 = startup::utc_to_local(&b.0);
+            }
+        }
     }
 
     pub fn load_history(&mut self) {
@@ -518,111 +538,6 @@ impl Data {
         }
         g.into_values().max_by(|a, b| a.1.total_cmp(&b.1)).map_or(String::new(), |(n, v)| format!("{n} ({v:.0}%)"))
     }
-
-    /// Подсказки «что сейчас тормозит» по текущим данным.
-    pub fn hints(&self) -> Vec<String> {
-        let mut out = vec![];
-        let mut groups: HashMap<String, Vec<&Proc>> = HashMap::new();
-        for p in &self.procs {
-            groups.entry(group_key(&p.name)).or_default().push(p);
-        }
-        let disp = |g: &[&Proc]| if g.len() > 1 { tf!("{} ({} шт.)", "{} ({} pcs)", ja: "{} ({} 個)", pt: "{} ({} un.)", zh: "{}（{} 个）", g[0].name, g.len()) } else { g[0].name.clone() };
-        let avg = |g: &Vec<&Proc>| g.iter().map(|p| p.avg).sum::<f32>();
-        let mut gs: Vec<&Vec<&Proc>> = groups.values().collect();
-        gs.sort_by(|a, b| avg(b).total_cmp(&avg(a)));
-        for g in gs.iter().take(3) {
-            let (a, now): (f32, f32) = (avg(g), g.iter().map(|p| p.cpu).sum());
-            if a >= 8.0 {
-                let mut t = tf!("ЦП: «{}» занимает в среднем {a:.0}% за последние 30 с (сейчас {now:.0}%).", "CPU: '{}' averages {a:.0}% over the last 30 s (now {now:.0}%).", ja: "CPU: '{}' は直近 30 秒の平均で {a:.0}% を使用 (現在 {now:.0}%)。", pt: "CPU: '{}' usa em média {a:.0}% nos últimos 30 s (agora {now:.0}%).", zh: "CPU：「{}」最近 30 秒平均 {a:.0}%（当前 {now:.0}%）。", disp(g));
-                if g[0].name.eq_ignore_ascii_case("svchost.exe") {
-                    let top = g.iter().max_by(|x, y| x.avg.total_cmp(&y.avg)).unwrap();
-                    if let Some(s) = self.svc_pids.get(&top.pid) {
-                        t += &tf!(" Самый занятый svchost (PID {}) держит службы: {}.", " The busiest svchost (PID {}) hosts services: {}.", ja: " 最も負荷の高い svchost (PID {}) のサービス: {}。", pt: " O svchost mais ocupado (PID {}) hospeda os serviços: {}.", zh: " 最繁忙的 svchost（PID {}）承载了这些服务：{}。", top.pid, s.iter().take(5).cloned().collect::<Vec<_>>().join(", "));
-                    }
-                }
-                out.push(t);
-            }
-        }
-        if self.mem_pct >= 80.0 {
-            gs.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|p| p.mem).sum::<u64>()));
-            let top: Vec<String> = gs.iter().take(3).map(|g| format!("{} — {}", disp(g), crate::ui::fmt_mem(g.iter().map(|p| p.mem).sum()))).collect();
-            out.push(tf!("Память занята на {:.0}%. Больше всего у: {}.", "Memory is {:.0}% used. Biggest users: {}.", ja: "メモリ使用率 {:.0}%。使用量の多いもの: {}。", pt: "Memória {:.0}% em uso. Maiores consumidores: {}.", zh: "内存已使用 {:.0}%。占用最多的进程：{}。", self.mem_pct, top.join("; ")));
-        }
-        let io = self.sample.disk_read + self.sample.disk_write;
-        if io > 150.0 * 1_048_576.0 || self.sample.disk_active > 90.0 {
-            out.push(tf!("Диск загружен на {:.0}% (чтение+запись {:.0} МБ/с).", "Disk is {:.0}% busy (read+write {:.0} MB/s).", ja: "ディスクの使用率 {:.0}% (読み取り+書き込み {:.0} MB/秒)。", pt: "O disco está {:.0}% ocupado (leitura+gravação {:.0} MB/s).", zh: "磁盘忙碌 {:.0}%（读+写 {:.0} MB/s）。", self.sample.disk_active, io / 1_048_576.0));
-        }
-        if self.etw.is_some() {
-            gs.sort_by(|a, b| b.iter().map(|p| p.net).sum::<f64>().total_cmp(&a.iter().map(|p| p.net).sum::<f64>()));
-            if let Some(g) = gs.first() {
-                let n: f64 = g.iter().map(|p| p.net).sum();
-                if n > 1_000_000.0 {
-                    out.push(tf!("Сеть: «{}» передаёт {:.1} МБ/с — больше всех остальных.", "Network: '{}' moves {:.1} MB/s - more than any other.", ja: "ネットワーク: '{}' が {:.1} MB/秒を転送中 - 他のどれよりも多い。", pt: "Rede: '{}' transfere {:.1} MB/s - mais que qualquer outro.", zh: "网络：「{}」传输 {:.1} MB/s——比其他任何进程都多。", disp(g), n / 1e6));
-                }
-            }
-        }
-        let high: Vec<String> = gs.iter().filter(|g| g.iter().any(|p| p.reasons.iter().any(|r| r.sev == 3))).map(|g| disp(g)).take(5).collect();
-        if !high.is_empty() {
-            out.push(tf!("Подозрительные процессы (высокая степень): {}. Наведите курсор на метку в колонке «Подозрительное» — там причина.", "Suspicious processes (high severity): {}. Hover the label in the 'Suspicious' column to see the reason.", ja: "不審なプロセス (重要度: 高): {}。「不審」列のラベルにカーソルを合わせると理由が表示されます。", pt: "Processos suspeitos (gravidade alta): {}. Passe o mouse sobre o rótulo na coluna 'Suspeito' para ver o motivo.", zh: "可疑进程（高严重性）：{}。将鼠标悬停在「可疑」列的标记上可查看原因。", high.join(", ")));
-        }
-        if self.cpu_total > 90.0 {
-            out.push(t!("ЦП почти полностью занят — отсортируйте процессы по ЦП, чтобы увидеть виновника.", "CPU is almost fully used - sort processes by CPU to see the culprit.", ja: "CPU がほぼ使い切られています。CPU で並べ替えて原因を確認してください。", pt: "A CPU está quase toda em uso - ordene os processos por CPU para ver o culpado.", zh: "CPU 几乎满载——按 CPU 排序进程，找出占用最多的那个。").into());
-        }
-        for (pid, title) in &self.hung {
-            let name = self.procs.iter().find(|p| p.pid == *pid).map_or_else(|| format!("PID {pid}"), |p| p.name.clone());
-            out.push(tf!("Не отвечает: «{title}» ({name}). Окно зависло: подождите или снимите задачу на странице «Процессы».", "Not responding: '{title}' ({name}). The window hangs: wait or end the task on the 'Processes' page.", ja: "応答なし: '{title}' ({name})。ウィンドウがハングしています。待つか、「プロセス」ページでタスクを終了してください。", pt: "Sem resposta: '{title}' ({name}). A janela travou: aguarde ou finalize a tarefa na página 'Processos'.", zh: "无响应：「{title}」（{name}）。窗口已挂起：请等待，或在「进程」页面结束该任务。"));
-        }
-        let drv = self.dpc_pct + self.intr_pct;
-        if drv >= 5.0 {
-            out.push(tf!("Драйверы заняли {:.1}% времени ЦП (DPC {:.1}%, прерывания {:.1}%; норма — до 2%). Так выглядит «драйвер тормозит систему»: трещит звук, дёргается мышь, проседают кадры. Чаще всего виноваты Wi-Fi/сеть, звук, видеодрайвер или USB: обновите их или отключайте по очереди в диспетчере устройств.", "Drivers took {:.1}% of CPU time (DPC {:.1}%, interrupts {:.1}%; normal is under 2%). This is what 'a driver slows the system down' looks like: crackling audio, jerky mouse, frame drops. Usually Wi-Fi/network, audio, graphics or USB drivers: update them or disable them one by one in Device Manager.", ja: "ドライバーが CPU 時間の {:.1}% を使用 (DPC {:.1}%、割り込み {:.1}%。正常値は 2% 未満)。これが「ドライバーがシステムを遅くする」状態です: 音が途切れる、マウスがぎこちない、フレーム落ち。多くは Wi-Fi/ネットワーク、オーディオ、グラフィックス、USB のドライバーが原因です。更新するか、デバイス マネージャーで 1 つずつ無効にしてください。", pt: "Os drivers consumiram {:.1}% do tempo da CPU (DPC {:.1}%, interrupções {:.1}%; o normal é menos de 2%). É assim que parece 'um driver deixa o sistema lento': áudio chiando, mouse travando, queda de quadros. Em geral são drivers de Wi-Fi/rede, áudio, vídeo ou USB: atualize-os ou desative-os um a um no Gerenciador de Dispositivos.", zh: "驱动程序占用了 {:.1}% 的 CPU 时间（DPC {:.1}%，中断 {:.1}%；正常应低于 2%）。这就是「驱动程序拖慢系统」的样子：音频爆音、鼠标卡顿、掉帧。通常是 Wi-Fi/网络、声卡、显卡或 USB 驱动：请更新它们，或在设备管理器中逐个禁用排查。", drv, self.dpc_pct, self.intr_pct));
-        }
-        if self.sample.disk_ms > 50.0 && self.sample.disk_active > 50.0 {
-            out.push(tf!("Диск отвечает медленно: {:.0} мс на запрос при загрузке {:.0}% (у SSD норма — единицы мс). Если это HDD, программы и игры с него будут грузиться долго; если SSD — проверьте его здоровье и свободное место.", "The disk responds slowly: {:.0} ms per request at {:.0}% busy (an SSD normally takes a few ms). On an HDD apps and games load slowly; on an SSD check its health and free space.", ja: "ディスクの応答が遅い: 使用率 {:.0}% で 1 要求あたり {:.0} ms (SSD は通常数 ms)。HDD ではアプリやゲームの読み込みが遅くなります。SSD では健康状態と空き容量を確認してください。", pt: "O disco responde devagar: {:.0} ms por solicitação com {:.0}% de uso (um SSD normalmente leva poucos ms). Em um HDD, apps e jogos carregam devagar; em um SSD, verifique a saúde e o espaço livre.", zh: "磁盘响应缓慢：忙碌 {:.0}% 时每次请求 {:.0} ms（SSD 通常只需几毫秒）。在 HDD 上应用和游戏加载会变慢；在 SSD 上请检查其健康状态和可用空间。", self.sample.disk_ms, self.sample.disk_active));
-        }
-        let total = self.sys.total_memory();
-        if total > 0 && self.sample.mem_free < total / 20 && self.sample.mem_standby > 1 << 30 {
-            out.push(tf!("Свободной памяти почти нет ({}), а кэш (standby) занимает {}. В играх это даёт рывки: включите «Очистить кэш памяти» на странице «Ускорение».", "Almost no free memory ({}) while the standby cache holds {}. In games this shows as stutter: use 'Clear memory cache' on the 'Speed' page.", ja: "空きメモリがほとんどありません ({})。スタンバイ キャッシュが {} を占めています。ゲームではカクつきとして現れます。「速度」ページの「メモリ キャッシュをクリア」を使ってください。", pt: "Quase sem memória livre ({}) enquanto o cache em espera ocupa {}. Em jogos isso aparece como engasgos: use 'Limpar o cache de memória' na página 'Velocidade'.", zh: "几乎没有可用内存（{}），而备用缓存占用了 {}。游戏中表现为卡顿：请到「速度」页面使用「清理内存缓存」。", crate::ui::fmt_mem(self.sample.mem_free), crate::ui::fmt_mem(self.sample.mem_standby)));
-        }
-        if out.is_empty() {
-            out.push(t!("Всё в порядке: ни один процесс не потребляет заметно больше обычного.", "All good: no process uses noticeably more than usual.", ja: "問題なし: 通常より大幅に多く使用しているプロセスはありません。", pt: "Tudo certo: nenhum processo usa visivelmente mais que o normal.", zh: "一切正常：没有进程的占用明显高于平时。").into());
-        }
-        if self.cpu_times.is_some() && drv < 5.0 {
-            out.push(tf!("Драйверы в норме: DPC {:.1}%, прерывания {:.1}% времени ЦП.", "Drivers are fine: DPC {:.1}%, interrupts {:.1}% of CPU time.", ja: "ドライバーは正常: DPC {:.1}%、割り込み {:.1}% (CPU 時間に対して)。", pt: "Drivers em ordem: DPC {:.1}%, interrupções {:.1}% do tempo da CPU.", zh: "驱动程序正常：DPC 占 {:.1}%，中断占 CPU 时间的 {:.1}%。", self.dpc_pct, self.intr_pct));
-        }
-        if self.is_admin {
-            out.extend(boot_hint(crate::startup::boot_log()));
-        }
-        out
-    }
-}
-
-/// Последние загрузки Windows и что их замедлило (журнал Diagnostics-Performance).
-pub fn boot_hint(log: &crate::startup::BootLog) -> Option<String> {
-    let s = |ms: u32| crate::model::dec(ms as f64 / 1000.0, 0);
-    let first = log.boots.first()?;
-    let times: Vec<String> = log.boots.iter().take(5).map(|b| s(b.1)).collect();
-    let mut t = tf!("Загрузка Windows: последняя {} с ({}), до рабочего стола {} с. Предыдущие: {} с.", "Windows boot: last {} s ({}), {} s to the desktop. Before that: {} s.", ja: "Windows の起動: 前回 {} 秒 ({})、デスクトップまで {} 秒。その前: {} 秒。", pt: "Inicialização do Windows: última {} s ({}), {} s até a área de trabalho. Antes disso: {} s.", zh: "Windows 启动：上次 {} 秒（{}），到桌面 {} 秒。此前为 {} 秒。", s(first.1), first.0, s(first.2), times[1..].join(", "));
-    if times.len() == 1 {
-        t = tf!("Загрузка Windows: {} с ({}), до рабочего стола {} с.", "Windows boot: {} s ({}), {} s to the desktop.", ja: "Windows の起動: {} 秒 ({})、デスクトップまで {} 秒。", pt: "Inicialização do Windows: {} s ({}), {} s até a área de trabalho.", zh: "Windows 启动：{} 秒（{}），到桌面 {} 秒。", s(first.1), first.0, s(first.2));
-    }
-    let slow: Vec<String> = log.slow.iter().take(5).map(|x| format!("{} (+{} с)", if x.1.is_empty() { &x.0 } else { &x.1 }, crate::model::dec(x.2 as f64 / 1000.0, 1))).collect();
-    if !slow.is_empty() {
-        t += &tf!(" Больше всего замедляли: {}. Отключить можно на странице «Автозагрузка» (колонка «Замедляет загрузку»).", " The worst slowdowns: {}. Disable them on the 'Startup' page ('Slows boot by' column).", ja: " 特に遅くしているもの: {}。「スタートアップ」ページ (「起動を遅らせる時間」列) で無効にできます。", pt: " Maiores atrasos: {}. Desative-os na página 'Inicialização' (coluna 'Atrasa a inicialização em').", zh: " 拖慢最多的项目：{}。可在「启动项」页面（「拖慢启动」列）禁用。", slow.join(", "));
-    }
-    Some(t)
-}
-
-#[cfg(test)]
-mod boot_tests {
-    #[test]
-    fn boot_hint_text() {
-        let mut log = crate::startup::BootLog::default();
-        assert_eq!(super::boot_hint(&log), None);
-        log.boots = vec![("2026-11-20 08:15".into(), 41_000, 15_000), ("2026-11-19 09:00".into(), 52_400, 18_000)];
-        log.slow = vec![("onedrive.exe".into(), "Microsoft OneDrive".into(), 2100)];
-        let h = super::boot_hint(&log).unwrap();
-        assert!(h.contains("последняя 41 с") && h.contains("Предыдущие: 52 с") && h.contains("Microsoft OneDrive (+2,1 с)"), "{h}");
-    }
 }
 
 /// Размер системного диска, байт.
@@ -664,6 +579,6 @@ mod tests {
         assert!(d.procs.iter().any(|p| p.pid == std::process::id()));
         assert_eq!(d.series.cpu.len(), 1); // первый замер отбрасывается
         assert!(d.meminfo.processes > 0);
-        assert!(!d.hints().is_empty());
+        assert!(!crate::slow::build(&d).title.is_empty());
     }
 }

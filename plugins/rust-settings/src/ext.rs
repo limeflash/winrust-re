@@ -356,6 +356,7 @@ pub fn night_helper() {
 pub struct App {
     pub name: String,
     pub version: String,
+    pub publisher: String,
     pub uninstall: String,
 }
 
@@ -373,7 +374,7 @@ pub fn programs() -> Vec<App> {
                 continue;
             }
             if !out.iter().any(|a| a.name == name) {
-                out.push(App { version: sys::string_long(root, &key, "DisplayVersion").unwrap_or_default(), name, uninstall: cmd });
+                out.push(App { version: sys::string_long(root, &key, "DisplayVersion").unwrap_or_default(), publisher: sys::string_long(root, &key, "Publisher").unwrap_or_default(), name, uninstall: cmd });
             }
         }
     }

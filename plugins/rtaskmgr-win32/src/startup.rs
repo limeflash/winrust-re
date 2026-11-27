@@ -348,7 +348,7 @@ fn services() -> Vec<Item> {
 // ---------- журнал загрузки ----------
 
 /// Из журнала Microsoft-Windows-Diagnostics-Performance (его ведёт сама Windows, читает только администратор).
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub struct BootLog {
     /// (дата, полная загрузка мс, основная фаза до рабочего стола мс), новые первыми
     pub boots: Vec<(String, u32, u32)>,
@@ -401,6 +401,20 @@ pub fn boot_log() -> &'static BootLog {
             .output();
         out.map(|o| parse_boot_log(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
     })
+}
+
+/// The time of the log (UTC, `2026-11-20 08:15`) as the clock on this computer's wall showed it.
+pub fn utc_to_local(s: &str) -> String {
+    use windows_sys::Win32::{Foundation::SYSTEMTIME, System::Time::SystemTimeToTzSpecificLocalTime};
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|v| v.parse::<u16>().ok());
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi)) = (num(0..4), num(5..7), num(8..10), num(11..13), num(14..16)) else { return s.to_string() };
+    let utc = SYSTEMTIME { wYear: y, wMonth: mo, wDayOfWeek: 0, wDay: d, wHour: h, wMinute: mi, wSecond: 0, wMilliseconds: 0 };
+    let mut l = utc;
+    // SAFETY: both pointers are to live SYSTEMTIMEs; a null zone is the one this computer is set to.
+    if unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut l) } == 0 {
+        return s.to_string();
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", l.wYear, l.wMonth, l.wDay, l.wHour, l.wMinute)
 }
 
 /// Насколько элемент автозагрузки замедлил загрузку (по журналу), мс.

@@ -552,6 +552,45 @@ fn a_destructive_row_needs_a_second_click_on_the_same_row() {
     assert_eq!(d.log(), vec!["bt_unpair xm5"]);
 }
 
+#[test]
+fn the_apps_page_has_a_search_box_of_its_own() {
+    let (mut s, d) = win("apps");
+    let names = |s: &Settings| s.pg.groups.iter().flat_map(|g| g.rows.iter().map(|l| l.row.label().to_string())).collect::<Vec<_>>();
+    assert_eq!(names(&s).len(), 12);
+    let count = |s: &Settings| s.pg.groups.iter().find_map(|g| if let Extra::Search(c) = &g.extra { Some(c.clone()) } else { None }).expect("the box is on the page");
+    assert_eq!(count(&s), "", "nothing typed: no count");
+    // the name or the publisher, any case
+    let mut cx = Cx { focus: Some(app::ID_AQ), ..Cx::default() };
+    s.text("MICRO", &mut cx);
+    assert_eq!(names(&s), ["Microsoft Edge", "Microsoft Outlook", "Visual Studio Code"], "Visual Studio Code is by Microsoft Corporation");
+    assert!(count(&s).starts_with('3') && count(&s).ends_with("12"), "3 of 12: {}", count(&s));
+    s.number_lines();
+    assert!(invalidated(&cx));
+    // the title still says how many there are in all, and the sidebar's search does not see the filter
+    assert!(s.pg.groups[0].title.contains("12"));
+    assert_eq!(pages()[APPS_PAGE].groups.iter().map(|g| g.rows.len()).sum::<usize>(), 12);
+    // a click on Uninstall arms the row; typing disarms it, and the second click does not uninstall what was armed before
+    let edge = id(&s, |l| l.row.label() == "Microsoft Edge", P_CTL);
+    click(&mut s, edge);
+    assert!(s.armed.is_some());
+    s.text("o", &mut cx);
+    assert!(s.armed.is_none() && d.log().is_empty());
+    // nothing matches: the line says so
+    s.aq.set_text("");
+    s.text("photoshop", &mut cx);
+    assert!(names(&s).is_empty());
+    assert!(s.pg.groups.iter().any(|g| g.empty.contains("photoshop")), "the empty line names the query");
+    // Esc empties the box first; with it empty Esc is the window's
+    assert!(s.key(0x1B, Mods::default(), &mut cx));
+    assert!(s.aq.text.is_empty() && names(&s).len() == 12 && count(&s).is_empty());
+    assert!(!s.key(0x1B, Mods::default(), &mut cx), "an empty box lets Esc through");
+    // the clear button
+    s.text("git", &mut cx);
+    assert_eq!(names(&s), ["Git"]);
+    click(&mut s, app::ID_AQ + 1);
+    assert!(s.aq.text.is_empty() && names(&s).len() == 12);
+}
+
 const P_BODY_FOR_TEST: Id = 0;
 
 #[test]

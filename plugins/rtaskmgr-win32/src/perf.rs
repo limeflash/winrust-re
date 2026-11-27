@@ -72,6 +72,7 @@ pub struct Sample {
     pub disk_active: f32, // %
     pub disk_read: f64,   // байт/с
     pub disk_write: f64,
+    #[allow(dead_code)] // the live probe prints it; the What's slow page has no disk card
     pub disk_ms: f32, // средний отклик, мс
     pub gpu_total: f32,
     pub gpu_types: HashMap<String, f32>, // загрузка по типам движков: 3D, Copy, VideoEncode, VideoDecode ...

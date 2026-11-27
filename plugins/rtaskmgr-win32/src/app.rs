@@ -75,7 +75,7 @@ pub const TAG_TRAY: u32 = 4;
 pub const TAG_BOOST: u32 = 5;
 
 /// What the pages of the sidebar are, in its order.
-pub const NAV_PAGES: [Page; 10] = [Page::Processes, Page::Performance, Page::History, Page::Startup, Page::Users, Page::Details, Page::Services, Page::Boost, Page::Rules, Page::Settings];
+pub const NAV_PAGES: [Page; 11] = [Page::Processes, Page::Performance, Page::History, Page::Startup, Page::Users, Page::Details, Page::Services, Page::Boost, Page::Insights, Page::Rules, Page::Settings];
 
 pub const ROW_H: f32 = 40.0;
 pub const KID_H: f32 = 36.0;
@@ -106,6 +106,7 @@ pub enum Act {
     StartEnable,
     StartDisable,
     Export,
+    CheckSlow,
     ClearHistory,
     SetTheme(u8),
     ToggleTray,
@@ -133,6 +134,14 @@ pub enum Ask {
     End(Act, Vec<u32>),
     /// Switch a thing of the Speed page on.
     Boost(boost::Id),
+}
+
+/// "Check again" of the What's slow page, running: the page waits a moment, as the design's does.
+#[derive(Clone, Copy, Debug)]
+pub struct SlowCheck {
+    pub serial: u32,
+    /// The frame clock when it was first drawn.
+    pub born: Option<u64>,
 }
 
 pub struct Toast {
@@ -179,6 +188,16 @@ pub struct Tm {
     pub tw_open: HashSet<usize>,
     pub set_sc: Scroll,
     pub ins_sc: Scroll,
+    /// What the What's slow page says, made again with every tick.
+    pub slow: crate::slow::Slow,
+    /// The cards of that page the user folded or unfolded (0 startup, 1 apps, 2 drivers); the others are open when they are wrong.
+    pub slow_open: HashMap<u8, bool>,
+    pub slow_chk: Option<SlowCheck>,
+    slow_serial: u32,
+    /// "Check again" has finished: the banner says "just now" instead of the time.
+    pub slow_just: bool,
+    /// When the page was looked at (HH:MM).
+    pub slow_at: String,
     pub alert_off: HashSet<String>,
     pub toast: Option<Toast>,
     toast_serial: u32,
@@ -194,6 +213,12 @@ pub struct Tm {
     pub away: bool,
     /// The row the keys moved to last, that the next frame brings into view.
     pub reveal: Option<usize>,
+}
+
+/// The clock as the page says when it looked: `17:02`.
+fn clock() -> String {
+    let (_, _, _, h, m, _) = sys::local_time();
+    format!("{h:02}:{m:02}")
 }
 
 pub fn nav_label(p: Page) -> &'static str {
@@ -233,6 +258,7 @@ impl Tm {
     pub fn new(m: Arc<dyn Machine>, d: Data, demo: Option<Demo>, hidden_start: bool, page: Page) -> Self {
         let mut sorts = HashMap::new();
         sorts.insert(Page::Processes, (d.cfg.sort.min(7), d.cfg.desc));
+        let slow = crate::slow::build(&d);
         let mut me = Self {
             m,
             d,
@@ -257,6 +283,12 @@ impl Tm {
             tw_open: HashSet::new(),
             set_sc: Scroll::default(),
             ins_sc: Scroll::default(),
+            slow,
+            slow_open: HashMap::new(),
+            slow_chk: None,
+            slow_serial: 0,
+            slow_just: false,
+            slow_at: String::new(),
             alert_off: HashSet::new(),
             toast: None,
             toast_serial: 0,
@@ -294,6 +326,10 @@ impl Tm {
         match self.page {
             Page::Startup => self.m.load_startup(&mut self.d),
             Page::History => self.m.load_history(&mut self.d),
+            Page::Insights => {
+                self.m.load_startup(&mut self.d);
+                (self.slow_just, self.slow_at) = (false, clock());
+            }
             _ => {}
         }
         self.sel = None;
@@ -314,6 +350,7 @@ impl Tm {
     }
 
     pub fn rebuild(&mut self) {
+        self.slow = crate::slow::build(&self.d);
         if self.page == Page::Boost {
             let admin = self.d.is_admin;
             self.speed = boost::ALL.iter().map(|&id| SpeedItem { id, state: self.m.boost_state(id, admin) }).collect();
@@ -390,12 +427,25 @@ impl Tm {
             return; // the table and the page lists wait until the window is shown
         }
         let ticks = self.d.ticks;
-        if self.page == Page::Startup && ticks.is_multiple_of(10) {
+        if matches!(self.page, Page::Startup | Page::Insights) && ticks.is_multiple_of(10) {
             self.m.load_startup(&mut self.d);
         }
         if self.page == Page::History && ticks.is_multiple_of(30) {
             self.m.load_history(&mut self.d);
         }
+        self.rebuild();
+    }
+
+    /// "Check again": the startup entries are read again and the page waits a moment.
+    pub fn slow_check(&mut self) {
+        if self.slow_chk.is_some() {
+            return;
+        }
+        self.slow_serial += 1;
+        self.slow_chk = Some(SlowCheck { serial: self.slow_serial, born: None });
+        self.slow_just = false;
+        self.slow_at = clock();
+        self.m.load_startup(&mut self.d);
         self.rebuild();
     }
 
@@ -544,7 +594,7 @@ impl Tm {
         let mut v = vec![
             it(t!("Запустить новую задачу", "Run new task", ja: "新しいタスクの実行", pt: "Executar nova tarefa", zh: "运行新任务"), crate::look::I_PLUS, Act::RunTask),
             it(t!("Экспорт в CSV", "Export to CSV", ja: "CSV にエクスポート", pt: "Exportar para CSV", zh: "导出为 CSV"), crate::look::I_CSV, Act::Export),
-            it(t!("Что тормозит", "What's slow", ja: "遅い原因", pt: "O que está lento", zh: "什么在变慢"), crate::look::NAV_BOOST, Act::Go(Page::Insights)),
+            it(t!("Что тормозит", "What's slow", ja: "遅い原因", pt: "O que está lento", zh: "什么在变慢"), crate::look::NAV_SLOW, Act::Go(Page::Insights)),
             MenuItem::sep(),
         ];
         acts.extend([Act::SetTheme(0), Act::SetTheme(1), Act::SetTheme(2)]);
@@ -643,6 +693,7 @@ impl Tm {
                 return self.save_settings();
             }
             Act::Export => return self.export(),
+            Act::CheckSlow => return self.slow_check(),
             Act::ClearHistory => {
                 self.m.clear_history();
                 self.d.hist.clear();
@@ -943,6 +994,7 @@ impl Tm {
                 more,
             ],
             Page::Startup | Page::Users => vec![more],
+            Page::Insights => vec![(HeadAct::Do(Act::CheckSlow), if self.slow_chk.is_some() { t!("Проверяем…", "Checking\u{2026}", ja: "確認中…", pt: "Verificando…", zh: "检查中…") } else { t!("Проверить снова", "Check again", ja: "もう一度確認", pt: "Verificar de novo", zh: "重新检查") }, crate::look::I_TW_UPD, self.slow_chk.is_none())],
             Page::History => vec![(HeadAct::Do(Act::ClearHistory), t!("Удалить историю использования", "Delete usage history", ja: "使用履歴を削除", pt: "Excluir histórico de uso", zh: "删除使用历史记录"), crate::look::I_TRASH, !self.d.hist.is_empty()), more],
             Page::Rules => vec![(HeadAct::Do(Act::RuleDelete), t!("Удалить правило", "Delete rule", ja: "ルールを削除", pt: "Excluir regra", zh: "删除规则"), crate::look::I_TRASH, has), more],
             _ => vec![],
@@ -1035,7 +1087,7 @@ impl Tm {
             Page::Users => self.click_users(id, cx),
             Page::Boost => self.click_speed(id, cx),
             Page::Settings => self.click_settings(id, cx),
-            Page::Insights => {}
+            Page::Insights => self.click_slow(id, cx),
             _ => self.click_table(id, b, x, y, cx),
         }
     }
@@ -1136,6 +1188,31 @@ impl Tm {
             }
             let name = self.d.procs.iter().find(|p| pids.contains(&p.pid)).map(|p| p.name.clone()).unwrap_or_default();
             let row = Row { pids, cells: vec![name], ..Row::default() };
+            self.act_process(&row, Act::EndTask, cx);
+        }
+    }
+
+    fn click_slow(&mut self, id: Id, cx: &mut Cx) {
+        use crate::draw::slowpage::{ID_SLOW, ID_SLOW_ADMIN, ID_SLOW_ALL, ID_SLOW_DEL, ID_SLOW_END};
+        if (ID_SLOW..ID_SLOW + 3).contains(&id) {
+            let k = (id - ID_SLOW) as usize;
+            let bad = [self.slow.boot.bad, self.slow.apps.bad, self.slow.drivers.bad][k];
+            let now = self.slow_open.get(&(k as u8)).copied().unwrap_or(bad);
+            self.slow_open.insert(k as u8, !now);
+        } else if (ID_SLOW_DEL..ID_SLOW_DEL + 8).contains(&id) {
+            // the startup entry behind a row: off, or on again (the Startup page's own action)
+            if let Some(d) = self.slow.boot.delays.get((id - ID_SLOW_DEL) as usize).filter(|d| d.can) {
+                let row = Row { key: d.key.clone(), ..Row::default() };
+                self.act_startup(&row, if d.on { Act::StartDisable } else { Act::StartEnable });
+            }
+        } else if id == ID_SLOW_ALL {
+            self.go_page(Page::Startup);
+        } else if id == ID_SLOW_ADMIN {
+            self.do_act(Act::RelaunchAdmin, cx);
+        } else if (ID_SLOW_END..ID_SLOW_END + 8).contains(&id)
+            && let Some(r) = self.slow.apps.rows.get((id - ID_SLOW_END) as usize)
+        {
+            let row = Row { pids: r.pids.clone(), cells: vec![r.name.clone()], ..Row::default() };
             self.act_process(&row, Act::EndTask, cx);
         }
     }

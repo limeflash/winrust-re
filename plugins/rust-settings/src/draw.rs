@@ -16,7 +16,7 @@ use winrust_ui::{
 use crate::{
     Box4, Cmd, Drive, Extra, Fill, Hero, Hue, Line, Op, Row, Tile, Tone,
     app::{
-        Fid, ID_FIRST_SELECT, ID_ARR, ID_BACK, ID_DLG_KEEP, ID_DLG_REVERT, ID_DLG_SCRIM, ID_GACT, ID_HERO, ID_HIT, ID_IDENTIFY, ID_NAV, ID_PROFILE, ID_SCROLL, ID_SEARCH, ID_WALL, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, row_id,
+        Fid, ID_FIRST_SELECT, ID_ARR, ID_BACK, ID_DLG_KEEP, ID_DLG_REVERT, ID_DLG_SCRIM, ID_GACT, ID_HERO, ID_HIT, ID_IDENTIFY, ID_NAV, ID_PROFILE, ID_SCROLL, ID_SEARCH, ID_WALL, ID_AQ, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, row_id,
         style_search,
     },
     look::{self, AMBER, CARD, GREEN, RED, SIDE, T1, T2, T3, T4, WIN, acc, acc_at, ink},
@@ -124,6 +124,7 @@ fn extra_height(e: &Extra) -> f32 {
         Extra::Battery(_) => 81.0,
         Extra::Drives(d) => d.iter().enumerate().map(|(i, _)| 76.0 + if i > 0 { 1.0 } else { 0.0 }).sum(),
         Extra::Walls(_) => 88.0,
+        Extra::Search(_) => 52.0,
     }
 }
 
@@ -464,6 +465,10 @@ impl Settings {
                     Extra::Battery(b) => paint_battery(c, ex, b.as_ref()),
                     Extra::Drives(d) => paint_drives(c, ex, d),
                     Extra::Walls(wl) => paint_walls(c, f, ex, wl),
+                    Extra::Search(count) => {
+                        let count = count.clone();
+                        me.paint_app_search(c, f, ex, &count);
+                    }
                 }
                 for ri in 0..me.pg.groups[gi].rows.len() {
                     me.paint_line(c, f, view, gi, ri, card, lay);
@@ -923,6 +928,29 @@ impl Settings {
 
     // -----------------------------------------------------------------------------------------------------------------
     // the picture of the displays
+
+    /// The Apps page's own search box: a well with a magnifier, the text, "3 of 12" and a clear button once something is typed.
+    fn paint_app_search(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, ex: Rect, count: &str) {
+        let b = Rect::new(ex.x + 12.0, ex.y + 12.0, ex.w - 24.0, 36.0);
+        let has = !self.aq.text.trim().is_empty();
+        let ring = f.tween(ID_AQ, 8, f32::from(has), 160, EASE);
+        c.fill(b, 10.0, look::ui::WELL);
+        c.ring(b, 10.0, 1.0, ink(0.08).mix(acc_at(0.55), ring));
+        let mut right = b.x + b.w - 6.0;
+        if has {
+            let cb = Rect::new(right - 24.0, b.cy() - 12.0, 24.0, 24.0);
+            let hot = f.item(ID_AQ + 1, cb);
+            f.hand();
+            c.fill(cb, 7.0, ink(0.08 + 0.06 * hot.hover));
+            c.icon("M7 7l10 10M17 7L7 17", (cb.cx(), cb.cy()), 11.0, 2.6, T2, 0.0);
+            let cw = c.measure(count, SMALL.tabular()).ceil();
+            c.text(count, Rect::new(cb.x - 8.0 - cw, b.y, cw, b.h), SMALL.tabular(), T3, Align::Start);
+            right = cb.x - 8.0 - cw - 8.0;
+        }
+        let st = winrust_ui::widgets::field::FieldStyle { font: BODY, icon: Some(look::SEARCH), clear: false, bare: true, radius: 10.0, pad: 0.0 };
+        let fr = Rect::new(b.x + 12.0, b.y, (right - b.x - 12.0).max(40.0), b.h);
+        field_with(c, f, ID_AQ, fr, &mut self.aq, t!("Поиск приложений по названию или издателю", "Search apps by name or publisher", ja: "名前または発行元でアプリを検索", pt: "Pesquisar apps por nome ou editor", zh: "按名称或发布者搜索应用"), &st);
+    }
 
     fn paint_arrange(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, ex: Rect) {
         let bx = Rect::new(ex.x + 14.0, ex.y + 14.0, ex.w - 28.0, 200.0);

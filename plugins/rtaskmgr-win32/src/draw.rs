@@ -21,6 +21,8 @@ use winrust_ui::{
     },
 };
 
+pub mod slowpage;
+
 pub const HEAD_H: f32 = 64.0;
 pub const SIDE_W: f32 = 228.0;
 const F13: Font = Font::new(13.0, 400);
@@ -315,6 +317,11 @@ impl Tm {
         }
     }
 
+    /// Whether the file at `path` has an icon to show (else the page draws a letter tile).
+    pub(super) fn has_icon(&self, path: &str) -> bool {
+        crate::demo::tile_of(path).is_some() || self.d.res.get(path).is_some_and(|r| r.icon != 0)
+    }
+
     /// The icon for a process named `name` (what the history says is the top consumer).
     fn icon_named(&self, name: &str) -> Option<String> {
         if self.is_demo() {
@@ -360,6 +367,7 @@ impl Tm {
             Page::Startup => self.d.startup.iter().filter(|s| s.enabled).count().to_string(),
             Page::Services => self.demo.as_ref().map_or(self.d.svcs.len(), |dm| dm.svc_total).to_string(),
             Page::Rules => self.d.rules.len().to_string(),
+            Page::Insights if self.slow.n > 0 => self.slow.n.to_string(),
             _ => String::new(),
         }
     }
@@ -372,7 +380,7 @@ impl Tm {
         tile(c, mark, T_WIN);
         c.icon(NAV_PERF, (mark.cx(), mark.cy()), 14.0, 2.4, Rgba::pure_white(1.0), 0.0);
         c.text(t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器"), Rect::new(52.0, 16.0, 150.0, 36.0), Font::new(14.0, 600), T1, Align::Start);
-        let icons = [NAV_PROC, NAV_PERF, NAV_HIST, NAV_START, NAV_USERS, NAV_DET, NAV_SVC, NAV_BOOST, NAV_RULES, NAV_SET];
+        let icons = [NAV_PROC, NAV_PERF, NAV_HIST, NAV_START, NAV_USERS, NAV_DET, NAV_SVC, NAV_BOOST, NAV_SLOW, NAV_RULES, NAV_SET];
         for (i, &p) in NAV_PAGES.iter().enumerate() {
             let y = if i < 7 { 66.0 + i as f32 * 38.0 } else { 355.0 + (i - 7) as f32 * 38.0 };
             if i == 7 {
@@ -1416,33 +1424,6 @@ impl Tm {
             c.text(&format!("{} · WinRust v{version} · {}", t!("Диспетчер задач (Rust)", "Task Manager (Rust)", ja: "タスク マネージャー (Rust)", pt: "Gerenciador de Tarefas (Rust)", zh: "任务管理器（Rust）"), t!("Ctrl+Alt+T возвращает окно", "Ctrl+Alt+T brings the window back", ja: "Ctrl+Alt+T でウィンドウを戻します", pt: "Ctrl+Alt+T traz a janela de volta", zh: "Ctrl+Alt+T 可调回窗口")), Rect::new(x, y, w, 24.0), F12.tabular(), T3, Align::Start);
         });
         self.set_sc = sc;
-    }
-
-    // -----------------------------------------------------------------------------------------------------------------
-    // What's slow
-
-    fn page_insights(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, body: Rect) {
-        let hints = self.d.hints();
-        let mut sc = std::mem::take(&mut self.ins_sc);
-        let w = (body.w - 48.0).min(900.0);
-        let mut heights = Vec::new();
-        for h in &hints {
-            let lines = c.lines(h, F13, w - 32.0) as f32;
-            heights.push(lines * 19.5 + 24.0);
-        }
-        let content = heights.iter().sum::<f32>() + hints.len() as f32 * 8.0 + 24.0;
-        scroll(c, f, ID_SCROLL_INS, body, &mut sc, content, |c, _f, v| {
-            let mut y = v.at(0.0);
-            for (h, hh) in hints.iter().zip(&heights) {
-                let r = Rect::new(body.x + 24.0, y, w, *hh);
-                c.fill(r, 14.0, CARD);
-                c.ring(r, 14.0, 1.0, ink(0.05));
-                c.text_wrapped(h, Rect::new(r.x + 16.0, r.y + 12.0, r.w - 32.0, *hh - 24.0), F13, T1, 19.5, 0);
-                y += hh + 8.0;
-            }
-        });
-        self.ins_sc = sc;
-        let _ = f;
     }
 
     // -----------------------------------------------------------------------------------------------------------------
