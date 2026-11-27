@@ -125,6 +125,7 @@ fn key_of(name: &str) -> i32 {
         "restart" => POW_R,
         "power" => POW_S,
         "clock" => CLOCK,
+        "showdesk" => SHOWDESK,
         n => n.parse().unwrap_or(NONE),
     }
 }
@@ -159,6 +160,7 @@ pub(crate) unsafe fn render(args: &[String]) {
     let (mut battery, mut tray, mut n_apps) = (false, 0usize, 8usize);
     let (mut unread, mut dnd) = (0usize, false);
     let mut rec_time = None::<String>;
+    let mut desk_on = false; // `deskon`: the windows are away, the show-desktop button is lit
     let (mut second, mut same) = (false, false); // a bar on another monitor (1920x1080): the lighter one, or with `same` the whole one
     let Some(file) = args.first() else { return };
     for a in &args[1..] {
@@ -174,6 +176,7 @@ pub(crate) unsafe fn render(args: &[String]) {
             Some(("rec", v)) => rec_time = Some(v.to_string()),
             _ => match a.as_str() {
                 "dnd" => dnd = true,
+                "deskon" => desk_on = true,
                 "second" => second = true,
                 "same" => same = true,
                 "battery" => battery = true,
@@ -218,6 +221,7 @@ pub(crate) unsafe fn render(args: &[String]) {
         unread,
         dnd,
         rec: if second && !same { None } else { rec_time },
+        desk_on,
     };
     let still = barui::Live { now: 0, hot: NONE, press: NONE, ..Default::default() };
     let shown = barui::Live {
@@ -570,6 +574,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
         unread: 0,
         dnd: false,
         rec: None,
+        desk_on: false,
     };
     let lit = barui::Live {
         now: 100_000,

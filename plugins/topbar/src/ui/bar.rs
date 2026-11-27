@@ -137,6 +137,8 @@ pub struct View {
     pub dnd: bool,
     /// The time of the recording in progress (`0:24`): a red button with it stands before the clock.
     pub rec: Option<String>,
+    /// The windows are away because of the show-desktop button: it is lit, and the next press brings them back.
+    pub desk_on: bool,
 }
 
 /// The pointer and the panels that are open.
@@ -179,7 +181,7 @@ pub enum Kind {
     /// The recording button (`recbar`): a pulsing dot and the time; it stops the recording.
     Rec,
     Clock,
-    /// The thin click zone at the far end (show the desktop); drawn as nothing.
+    /// The sliver at the far end (show the desktop): a glow from the edge and a pill; hovering it peeks at the desktop.
     ShowDesk,
 }
 
@@ -323,6 +325,11 @@ fn groups(g: &mut Gfx, v: &View, sh: &Shape, app_main: Option<f32>, clock_extra:
         (g.measure(&v.time, FONT_TIME).max(g.measure(&v.date, FONT_DATE)) + 20.0 + clock_extra, 44.0)
     };
     right.push(b(Kind::Clock, CLOCK, 0, clock_w, clock_h, 16.0 + 2.0 * 16.0));
+    // the show-desktop button (`.shd`): the bar's whole height and 20 wide, `margin: 0 -10px 0 2px` so that it reaches into the
+    // bar's end padding; a vertical bar's is the bar's whole width and 18 high at the bottom, `margin: 4px 0 -2px`
+    let mut shd = if vert { Cell::btn(Kind::ShowDesk, SHOWDESK, 0, 18.0, sh.thick) } else { Cell::btn(Kind::ShowDesk, SHOWDESK, 0, 20.0, sh.thick) };
+    (shd.mb, shd.ma) = if vert { (4.0, -2.0) } else { (2.0, -10.0) };
+    right.push(shd);
     [left, mid, right]
 }
 
@@ -424,9 +431,6 @@ pub fn layout(g: &mut Gfx, v: &View, sh: &Shape, thick: f32, bar_len: Option<f32
             lay.lines.push(Line { rect: Rect::new(p3 - 8.0, (thick - 44.0) / 2.0, 1.0, 44.0), vertical: true, alpha: 0.12, edge: 0.0 });
         }
     }
-    // the far end: the show-desktop zone
-    let zone = if vert { Rect::new(0.0, len - 6.0, thick, 6.0) } else { Rect::new(len - 6.0, 0.0, 6.0, thick) };
-    lay.items.push(Item { key: SHOWDESK, kind: Kind::ShowDesk, rect: zone, idx: 0 });
     lay.bar = if vert { Rect::new(0.0, 0.0, thick, len) } else { Rect::new(0.0, 0.0, len, thick) };
     lay
 }
@@ -481,6 +485,10 @@ const LANG_IN: u8 = 8;
 /// The room the clock makes for its badge (`padding .25s`), and how far the badge's `badgeIn` has run.
 const EXTRA: u8 = 9;
 const BADGE: u8 = 10;
+/// The show-desktop button: how lit its pill is (hover), whether it is on, and the pill's length (BG is its glow).
+const SHD_HOV: u8 = 11;
+const SHD_ON: u8 = 12;
+const SHD_PILL: u8 = 13;
 /// What the badge takes: 18 wide and 6 of air (the padding goes from 10 to 34).
 const BADGE_ROOM: f32 = 24.0;
 // bar-level properties
@@ -860,7 +868,16 @@ impl Bar {
                 _ => (false, 0.0),
             };
             match it.kind {
-                Kind::ShowDesk => {}
+                Kind::ShowDesk => {
+                    // `.shd`: the glow fades in .25 s, the pill grows 16 -> 26 on hover or "on" (20 while pressed, a horizontal bar only)
+                    let on = v.desk_on;
+                    let pressed = hover && live.press == key && !on && !vert;
+                    m.go(key, BG, f32::from(hover || on), now, 250, EASE);
+                    m.go(key, SHD_HOV, f32::from(hover), now, 200, EASE);
+                    m.go(key, SHD_ON, f32::from(on), now, 300, EASE);
+                    let len = if pressed { 20.0 } else if hover || on { 26.0 } else { 16.0 };
+                    m.go(key, SHD_PILL, len, now, 300, SPRING);
+                }
                 Kind::App => {
                     let a = &v.apps[it.idx];
                     m.go(key, BG, if a.active || live.jump == Some(key) { 0.11 } else { 0.0 }, now, 250, EASE);
@@ -962,11 +979,42 @@ fn paint(c: &mut Canvas<'_>, lay: &Layout, v: &View, live: &Live, m: &Motion, lo
     }
     for it in &lay.items {
         match it.kind {
-            Kind::ShowDesk => {}
+            Kind::ShowDesk => shd(c, it, bar, v, m, now, look, pal, vert),
             Kind::App => app(c, it, &v.apps[it.idx], m, now, pal, dock, vert, v.side == Side::Left),
             _ => button(c, it, lay, v, live, m, pal, dock, vert),
         }
     }
+}
+
+/// The show-desktop button (`.shd`): a glow from the outer edge (ink 13 %, or the accent's 24 % while "on") and, in the middle, a
+/// pill of 3 x 16 that grows to 26 on hover; "on" it is the accent with a 12 px glow of its own.
+#[allow(clippy::too_many_arguments)]
+fn shd(c: &mut Canvas<'_>, it: &Item, bar: Rect, v: &View, m: &Motion, now: u64, look: &Look, pal: &Palette, vert: bool) {
+    let (glow, hov, on, len) = (m.val(it.key, BG, now), m.val(it.key, SHD_HOV, now), m.val(it.key, SHD_ON, now), m.val(it.key, SHD_PILL, now));
+    let r = it.rect;
+    if glow > 0.001 {
+        let (from, to) = if v.desk_on { (pal.accent.alpha(0.24 * glow), pal.accent.alpha(0.0)) } else { (Rgba::white(0.13 * glow), Rgba::white(0.0)) };
+        // the corners at the far end are the bar's own (a vertical bar's: 12), the others are square: the rounded rectangle is drawn
+        // longer on the square side and cut to the button, so that the gradient still runs over the button alone; the dock's
+        // 2 px that reach past the bar are cut as well
+        let (pr, ext, rad, deg) = if vert {
+            let pr = Rect::new(r.x, r.y, r.w, (r.y + r.h).min(bar.y + bar.h) - r.y);
+            let rad = 12.0f32.min(pr.w / 2.0);
+            (pr, Rect::new(pr.x, pr.y - rad, pr.w, pr.h + rad), rad, 0.0)
+        } else {
+            let pr = Rect::new(r.x, r.y, (r.x + r.w).min(bar.x + bar.w) - r.x, r.h);
+            let rad = look.radius.min(pr.h / 2.0);
+            (pr, Rect::new(pr.x - rad, pr.y, pr.w + rad, pr.h), rad, 270.0)
+        };
+        let k = if vert { pr.h / ext.h } else { pr.w / ext.w };
+        c.clipped(pr, |c| c.gradient_angle(ext, rad, deg, &[(0.0, from), (k, to), (1.0, to)]));
+    }
+    let (cx, cy) = (r.cx(), r.cy());
+    let pill = if vert { Rect::new(cx - len / 2.0, cy - 1.5, len, 3.0) } else { Rect::new(cx - 1.5, cy - len / 2.0, 3.0, len) };
+    if on > 0.01 {
+        c.shadow(pill, 1.5, 0.0, 12.0, pal.accent.alpha(0.7 * on));
+    }
+    c.fill(pill, 1.5, Rgba::white(0.26 + 0.36 * hov).mix(pal.accent, on));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1230,6 +1278,7 @@ mod tests {
             unread: 0,
             dnd: false,
             rec: None,
+            desk_on: false,
         }
     }
 
@@ -1251,7 +1300,7 @@ mod tests {
         assert_eq!(lay.hit(cx(3), 27.0), 3);
         assert_eq!(lay.hit(cx(3) + 23.0, 27.0), NONE); // the 4 px gap between two buttons
         let clock = lay.rect_of(CLOCK).unwrap();
-        assert!((clock.x + clock.w - 1430.0).abs() < 0.5);
+        assert!((clock.x + clock.w - 1416.0).abs() < 0.5, "the clock ends 14 px earlier than it did: the show-desktop button's room");
     }
 
     #[test]
@@ -1444,7 +1493,12 @@ mod tests {
         assert_eq!(kinds(&light).iter().filter(|k| **k == Kind::App).count(), 8);
         // the clock is at the end of the bar like the whole bar's; the apps stay in the middle of the 1920
         let clock = light.rect_of(CLOCK).expect("the clock");
-        assert!((clock.x + clock.w - 1910.0).abs() < 0.5, "{clock:?}");
+        // ...less the show-desktop button's 12 px of room, and the 2 px gap before it
+        assert!((clock.x + clock.w - 1896.0).abs() < 0.5, "{clock:?}");
+        let sliver = light.rect_of(SHOWDESK).expect("the show-desktop button");
+        assert_eq!((sliver.x, sliver.y, sliver.w, sliver.h), (1900.0, 0.0, 20.0, 54.0), "20 wide and the bar's height, to the bar's end");
+        assert_eq!(light.hit(sliver.cx(), sliver.cy()), SHOWDESK);
+        assert_eq!(light.hit(clock.x + clock.w + 1.0, clock.cy()), NONE, "the margin and the gap between the clock and the button");
         let (first, last) = (light.rect_of(SEARCH).expect("search"), light.rect_of(8).expect("app 8"));
         assert!(((first.x + last.x + last.w) / 2.0 - 960.0).abs() < 1.0, "the group is centred: {first:?} {last:?}");
         assert_eq!(light.hit(clock.cx(), clock.cy()), CLOCK);
@@ -1483,6 +1537,49 @@ mod tests {
         b.set_origin((100, 900));
         let below = b.frame(&v, &live(10_000));
         assert_eq!((below.bar.0, below.bar.1), (100 + at_origin.bar.0, 900 + at_origin.bar.1));
+    }
+
+    #[test]
+    fn a_vertical_bars_show_desktop_button_is_its_width_and_18_high_at_the_bottom() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: COM for WIC on the test thread.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok() };
+        let mut g = Gfx::new(1.0).expect("the renderer");
+        let sh = shape(Style::Classic, Side::Left, 1);
+        let lay = layout(&mut g, &view(3), &sh, 54.0, Some(900.0), 0.0);
+        let s = lay.rect_of(SHOWDESK).expect("the button");
+        // the column's end is 900 - 10 of padding; `margin: 4px 0 -2px` lets the button reach 2 px past it
+        assert_eq!((s.x, s.w, s.h, s.y + s.h), (0.0, 54.0, 18.0, 892.0), "{s:?}");
+        let clock = lay.rect_of(CLOCK).expect("the clock");
+        assert!(clock.y + clock.h <= s.y - 4.0, "4 px of margin and the column's gap above it: {clock:?} {s:?}");
+    }
+
+    #[test]
+    fn the_show_desktop_button_lights_on_hover_and_on_and_the_pill_grows() {
+        let mut b = bar();
+        let v = view(3);
+        b.frame(&v, &live(0));
+        let at = |b: &Bar| b.layout().rect_of(SHOWDESK).expect("the button");
+        let m = &b.motion;
+        let rest = (m.val(SHOWDESK, BG, 0), m.val(SHOWDESK, SHD_PILL, 0));
+        assert_eq!(rest, (0.0, 16.0));
+        let r = at(&b);
+        assert!((r.w - 20.0).abs() < 0.1, "{r:?}");
+        b.frame(&v, &Live { hot: SHOWDESK, ..live(1_000) });
+        b.frame(&v, &Live { hot: SHOWDESK, ..live(2_000) });
+        let m = &b.motion;
+        assert_eq!((m.val(SHOWDESK, BG, 2_000), m.val(SHOWDESK, SHD_PILL, 2_000)), (1.0, 26.0), "hover");
+        b.frame(&v, &Live { hot: SHOWDESK, press: SHOWDESK, ..live(3_000) });
+        b.frame(&v, &Live { hot: SHOWDESK, press: SHOWDESK, ..live(4_000) });
+        assert_eq!(b.motion.val(SHOWDESK, SHD_PILL, 4_000), 20.0, "pressed");
+        let on = View { desk_on: true, ..v };
+        b.frame(&on, &live(5_000));
+        b.frame(&on, &live(6_000));
+        let m = &b.motion;
+        assert_eq!((m.val(SHOWDESK, BG, 6_000), m.val(SHOWDESK, SHD_ON, 6_000), m.val(SHOWDESK, SHD_PILL, 6_000)), (1.0, 1.0, 26.0), "on, pointer away");
+        b.frame(&on, &Live { hot: SHOWDESK, press: SHOWDESK, ..live(7_000) });
+        b.frame(&on, &Live { hot: SHOWDESK, press: SHOWDESK, ..live(8_000) });
+        assert_eq!(b.motion.val(SHOWDESK, SHD_PILL, 8_000), 26.0, "no pressed look while on");
     }
 
     #[test]
