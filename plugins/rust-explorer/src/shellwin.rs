@@ -46,7 +46,7 @@ fn hand_to_open_window(dir: &str, path: &Path) -> bool {
     false
 }
 
-struct Reg { sw: IShellWindows, cookie: i32, live: bool } // live: the window whose folder changes (not a stand-in)
+struct Reg { sw: IShellWindows, cookie: i32, live: bool, form: usize } // live: the window whose folder changes (not a stand-in); form: which of pidl_forms
 thread_local! { static REG: RefCell<Vec<Reg>> = const { RefCell::new(Vec::new()) }; }
 static DIR: Mutex<String> = Mutex::new(String::new());
 
@@ -56,25 +56,43 @@ fn url(dir: &str) -> String { format!("file:///{}", cur(dir).replace('\\', "/"))
 fn cur(dir: &str) -> String { if dir.is_empty() { DIR.lock().unwrap().clone() } else { dir.to_string() } }
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> { s.encode_wide().chain([0]).collect() }
 
-fn pidl_variant(dir: &Path) -> Option<(VARIANT, *mut ITEMIDLIST)> {
+/// The folder's ID lists the way callers build them. `SHParseDisplayName` gives a known folder (Downloads, Pictures...) as the
+/// known folder; `ILCreateFromPath`, and so Chromium (Brave, Chrome, Edge) and Telegram, as This PC > D: > Downloads. The shell's
+/// window list matches only the exact form, so a folder whose two forms differ is registered under both; other folders have one.
+fn pidl_forms(dir: &Path) -> Vec<*mut ITEMIDLIST> {
     let w = wide(dir.as_os_str());
+    let mut v = Vec::new();
     unsafe {
         let mut pidl = std::ptr::null_mut();
-        SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).ok()?;
-        InitVariantFromBuffer(pidl as *const c_void, ILGetSize(Some(pidl))).ok().map(|v| (v, pidl))
+        if SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
+            v.push(pidl);
+        }
+        let fs = ILCreateFromPathW(PCWSTR(w.as_ptr()));
+        if !fs.is_null() {
+            if v.iter().any(|p| ILIsEqual(*p, fs).as_bool()) { ILFree(Some(fs)); } else { v.push(fs); }
+        }
     }
+    v
 }
+fn free_forms(v: Vec<*mut ITEMIDLIST>) { for p in v { unsafe { ILFree(Some(p)) } } }
+fn variant(pidl: *mut ITEMIDLIST) -> Option<VARIANT> { unsafe { InitVariantFromBuffer(pidl as *const c_void, ILGetSize(Some(pidl))).ok() } }
 
 fn add(hwnd: isize, dir: &Path, resident: bool) -> Result<()> {
     unsafe {
         let sw: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)?;
         let me: IWebBrowser2 = Browser { hwnd, dir: if resident { dir.to_string_lossy().into_owned() } else { String::new() }, resident }.into();
-        let cookie = sw.Register(&me.cast::<IDispatch>()?, hwnd as i32, SWC_BROWSER)?;
-        if let Some((v, pidl)) = pidl_variant(dir) {
-            let _ = sw.OnNavigate(cookie, &v);
-            CoTaskMemFree(Some(pidl as *const c_void));
+        let disp = me.cast::<IDispatch>()?;
+        let forms = pidl_forms(dir);
+        // a live window keeps an entry for each form whatever it shows now: the next folder may have two
+        let n = if resident { forms.len().max(1) } else { 2 };
+        for form in 0..n {
+            let cookie = match sw.Register(&disp, hwnd as i32, SWC_BROWSER) { Ok(c) => c, Err(e) => { free_forms(forms); return Err(e) } };
+            if let Some(v) = forms.get(form).or(forms.first()).and_then(|p| variant(*p)) {
+                let _ = sw.OnNavigate(cookie, &v);
+            }
+            REG.with_borrow_mut(|r| r.push(Reg { sw: sw.clone(), cookie, live: !resident, form }));
         }
-        REG.with_borrow_mut(|r| r.push(Reg { sw, cookie, live: !resident }));
+        free_forms(forms);
     }
     Ok(())
 }
@@ -92,13 +110,15 @@ pub fn register_resident(dirs: &[PathBuf]) {
 /// The window now shows `dir`: the shell matches later requests against it.
 pub fn navigated(dir: &Path) {
     *DIR.lock().unwrap() = dir.to_string_lossy().into_owned();
+    let forms = pidl_forms(dir);
     REG.with_borrow(|rs| {
         for r in rs.iter().filter(|r| r.live) {
-            if let Some((v, pidl)) = pidl_variant(dir) {
-                unsafe { let _ = r.sw.OnNavigate(r.cookie, &v); CoTaskMemFree(Some(pidl as *const c_void)); }
+            if let Some(v) = forms.get(r.form).or(forms.first()).and_then(|p| variant(*p)) {
+                unsafe { let _ = r.sw.OnNavigate(r.cookie, &v); }
             }
         }
     });
+    free_forms(forms);
 }
 
 pub fn revoke() {
@@ -173,18 +193,16 @@ fn item_path(pidl: *const ITEMIDLIST, dir: &str) -> Option<PathBuf> {
         CoTaskMemFree(Some(s.0 as *const c_void));
         r.map(PathBuf::from)
     };
-    let w = wide(std::ffi::OsStr::new(dir));
-    let joined = unsafe {
-        let mut base = std::ptr::null_mut();
-        SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut base, 0, None).ok().and_then(|_| {
-            let abs = ILCombine(Some(base), Some(pidl));
-            let p = name(abs);
-            ILFree(Some(abs));
-            CoTaskMemFree(Some(base as *const c_void));
-            p
-        })
-    };
-    joined.filter(|p| p.parent().is_some_and(|d| d.as_os_str().eq_ignore_ascii_case(dir))).or_else(|| name(pidl))
+    // the item comes relative to whichever form of the folder the caller found us by
+    let forms = pidl_forms(Path::new(dir));
+    let joined = forms.iter().find_map(|base| unsafe {
+        let abs = ILCombine(Some(*base), Some(pidl));
+        let p = name(abs);
+        ILFree(Some(abs));
+        p.filter(|p| p.parent().is_some_and(|d| d.as_os_str().eq_ignore_ascii_case(dir)))
+    });
+    free_forms(forms);
+    joined.or_else(|| name(pidl))
 }
 
 // the rest of the browser interface: nothing to offer
@@ -257,4 +275,26 @@ impl IWebBrowser2_Impl for Browser_Impl {
     fn SetAddressBar(&self, _value: windows::Win32::Foundation::VARIANT_BOOL) -> Result<()> { nope() }
     fn Resizable(&self) -> Result<windows::Win32::Foundation::VARIANT_BOOL> { nope() }
     fn SetResizable(&self, _value: windows::Win32::Foundation::VARIANT_BOOL) -> Result<()> { nope() }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Brave's "Show in folder" for a download found no window: the known folder was registered only in its known-folder form.
+    #[test]
+    fn a_known_folder_is_registered_in_both_forms_an_ordinary_one_once() {
+        unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); }
+        let plain = super::pidl_forms(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert_eq!(plain.len(), 1, "an ordinary folder has one form");
+        super::free_forms(plain);
+        let dl = crate::sh::known_dir(&FOLDERID_Downloads).expect("Downloads");
+        let both = super::pidl_forms(&dl);
+        assert_eq!(both.len(), 2, "{} as the known folder and as This PC > drive > folder", dl.display());
+        // the second is the form Chromium and ILCreateFromPath build
+        let w: Vec<u16> = dl.as_os_str().encode_wide().chain([0]).collect();
+        let fs = unsafe { ILCreateFromPathW(PCWSTR(w.as_ptr())) };
+        assert!(unsafe { ILIsEqual(both[1], fs) }.as_bool());
+        unsafe { ILFree(Some(fs)) };
+        super::free_forms(both);
+    }
+    use super::*;
 }
