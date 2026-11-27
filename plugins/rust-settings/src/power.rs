@@ -17,7 +17,8 @@ pub fn size(bytes: u64) -> String {
     if b >= 1024.0 * GB { format!("{:.2} TB", b / (1024.0 * GB)) } else { format!("{:.1} GB", b / GB) }
 }
 
-/// "73%, on battery" / "100%, plugged in" / "No battery".
+/// "73%, on battery" / "100%, plugged in" / "No battery". (The Power page draws the numbers of `status` instead; this is the line of text.)
+#[allow(dead_code)]
 pub fn battery(on_ac: u8, flag: u8, percent: u8) -> String {
     if flag == 128 || flag == 255 || percent > 100 {
         return t!("Нет батареи", "No battery", ja: "バッテリーなし", pt: "Sem bateria", zh: "无电池").into();
@@ -26,12 +27,23 @@ pub fn battery(on_ac: u8, flag: u8, percent: u8) -> String {
     format!("{percent}%, {src}")
 }
 
+#[allow(dead_code)]
 pub fn battery_text() -> String {
     let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
     if unsafe { GetSystemPowerStatus(&mut s) } == 0 {
         return "?".into();
     }
     battery(s.ACLineStatus, s.BatteryFlag, s.BatteryLifePercent)
+}
+
+/// The battery as the Power page draws it: the percentage, whether the charger is in and charging, the time left on battery.
+/// None without a battery (the same test as `battery`).
+pub fn status() -> Option<crate::os::Battery> {
+    let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    if unsafe { GetSystemPowerStatus(&mut s) } == 0 || s.BatteryFlag == 128 || s.BatteryFlag == 255 || s.BatteryLifePercent > 100 {
+        return None;
+    }
+    Some(crate::os::Battery { pct: s.BatteryLifePercent, ac: s.ACLineStatus == 1, charging: s.BatteryFlag & 8 != 0, left: (s.BatteryLifeTime != u32::MAX).then_some(s.BatteryLifeTime) })
 }
 
 /// Fixed drives as (letter, free, total).
