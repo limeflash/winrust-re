@@ -20,12 +20,12 @@ use crate::{
 use windows_sys::core::GUID;
 
 /// What `--render-all` goes through: the states of the design's "Preview states" list, the pages, and a few more.
-pub const STATES: [&str; 62] = [
+pub const STATES: [&str; 70] = [
     "display", "sound", "power", "network", "bluetooth", "apps", "update", "personal", "about", "battery-charging", "battery-on-battery", "battery-low", "battery-none", "net-wifi", "net-ethernet", "net-no-wifi-adapter",
     "net-offline", "net-airplane", "identify", "bt-paired", "bt-searching", "bt-needs-pin", "bt-off", "wu-up-to-date", "wu-available", "wu-installing", "wu-restart", "dialog-none", "dialog-keep-display", "appearance-dark",
     "appearance-light", "appearance-night-light", "wifi-password", "wifi-connected-open", "adapter-open", "dropdown", "search", "search-page", "search-none", "display-single", "sound-muted", "power-plans-many", "update-checking",
     "bt-pairing", "network-hidden", "proxy-on", "personal-light", "apps-many", "apps-search", "apps-none", "notify", "notify-open", "notify-off", "keyboard", "time", "privacy", "privacy-camera-off", "privacy-scanning",
-    "privacy-location", "defaults", "defaults-lookup", "defaults-none",
+    "privacy-location", "defaults", "defaults-lookup", "defaults-none", "wu-stale", "wu-available-optional", "wu-downloading", "wu-restart-schedule", "wu-scheduled", "wu-failed", "wu-history", "wu-restart-dialog",
 ];
 
 fn guid() -> GUID {
@@ -189,6 +189,36 @@ fn demo_assoc(a: &Assoc) -> Option<(&'static str, &'static [&'static str])> {
     })
 }
 
+/// The design's updates: three required and three optional.
+fn demo_updates() -> Vec<wu::Upd> {
+    let u = |id: &str, title: &str, kb: &str, cat, mb, restart, optional| wu::Upd { id: id.into(), title: title.into(), kb: kb.into(), cat, mb, restart, optional };
+    use wu::Cat::*;
+    vec![
+        u("cu", "2026-11 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems", "KB5046617", Security, 612, true, false),
+        u("net", "2026-11 Cumulative Update for .NET Framework 3.5 and 4.8.1 for Windows 11, version 24H2", "KB5045934", Net, 74, true, false),
+        u("def", "Security Intelligence Update for Microsoft Defender Antivirus \u{2013} 1.421.411.0", "KB2267602", Definitions, 18, false, false),
+        u("nv", "NVIDIA \u{2013} Display \u{2013} 32.0.15.6614", "", Driver, 712, true, true),
+        u("rt", "Realtek Semiconductor Corp. \u{2013} Extension \u{2013} 10.0.26100.31337", "", Driver, 2, false, true),
+        u("pv", "2026-11 Cumulative Update Preview for Windows 11 Version 24H2 (KB5046740)", "KB5046740", Preview, 640, true, true),
+    ]
+}
+
+/// The design's update history, the latest first.
+fn demo_history() -> Vec<wu::Hist> {
+    use wu::HGroup::*;
+    let h = |group, title: &str, kb: &str, when: &str, ok: bool| wu::Hist { group, title: title.into(), kb: kb.into(), when: when.into(), ok, code: if ok { String::new() } else { "0x80070643".into() } };
+    vec![
+        h(Definition, "Security Intelligence Update for Microsoft Defender \u{2013} 1.421.316.0", "KB2267602", "Today, 15:12", true),
+        h(Driver, "Intel \u{2013} System \u{2013} 10.1.48.6", "", "20 Nov", true),
+        h(Quality, "2026-10 Cumulative Update for Windows 11 Version 24H2", "KB5044284", "16 Oct", true),
+        h(Quality, "2026-10 Cumulative Update for .NET Framework 3.5 and 4.8.1", "KB5044035", "9 Oct", true),
+        h(Quality, "2026-09 Cumulative Update for Windows 11 Version 24H2", "KB5043080", "11 Sep", false),
+        h(Driver, "NVIDIA \u{2013} Display \u{2013} 32.0.15.6094", "", "2 Oct", true),
+        h(Definition, "Security Intelligence Update for Microsoft Defender \u{2013} 1.421.288.0", "KB2267602", "Yesterday, 09:40", true),
+        h(Other, "Windows Malicious Software Removal Tool x64 \u{2013} v5.131", "KB890830", "16 Oct", true),
+    ]
+}
+
 fn app_entry(name: &str, version: &str, publisher: &str) -> ext::App {
     // a size and a day of the demo's own, the same for the same name
     let h: u64 = name.bytes().map(u64::from).sum();
@@ -270,8 +300,8 @@ impl Demo {
                 app_entry("Telegram Desktop", "5.8.3", "Telegram FZ-LLC"),
                 app_entry("Visual Studio Code", "1.95.3", "Microsoft Corporation"),
             ],
-            wu: wu::State { busy: None, found: Some(Vec::new()), note: "Last checked today, 17:02".into() },
-            wu_extra: WuExtra { last_check: Some(when(0, 17, 2)), last_install: Some(when(3, 8, 40)), ..WuExtra::default() },
+            wu: wu::State { found: Some(Vec::new()), ..wu::State::default() },
+            wu_extra: WuExtra { last_check: Some(when(0, 17, 2)), last_install: Some(when(7, 8, 40)), history: demo_history(), active: Some((8, 17)), ..WuExtra::default() },
             walls: vec![
                 ("Obsidian (current)".into(), Fill::Gradient(0x1a2a46, 0x14203a, 0x0a0f1a, 0.6)),
                 ("Dusk".into(), Fill::Gradient(0x1e2a4a, 0x4a2a5e, 0xc2546a, 0.6)),
@@ -353,15 +383,35 @@ impl Demo {
             }
             "bt-needs-pin" => s.bt.nearby = vec![bt::Dev { id: "gb".into(), name: "Galaxy Buds2".into(), connected: false }],
             "bt-off" => s.bt.bt = Some(false),
-            "wu-available" => s.wu = wu::State { busy: None, found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() },
-            "wu-installing" => {
-                s.wu = wu::State { busy: Some("Downloading and installing updates\u{2026}".into()), found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() };
-                s.wu_extra = WuExtra { progress: Some(46), restart: false, ..s.wu_extra };
+            "wu-available" | "wu-available-optional" => s.wu = wu::State { found: Some(demo_updates()), ..wu::State::default() },
+            "wu-stale" => {
+                s.wu = wu::State::default();
+                s.wu_extra.last_check = Some(when(1, 21, 40));
             }
-            "wu-checking" | "update-checking" => s.wu = wu::State { busy: Some("Checking for updates\u{2026}".into()), found: None, note: String::new() },
+            "wu-downloading" | "wu-installing" => {
+                let installing = name == "wu-installing";
+                s.wu = wu::State { found: Some(demo_updates()), phase: if installing { wu::Phase::Installing } else { wu::Phase::Downloading }, pct: if installing { 84.0 } else { 38.0 }, run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+            }
+            "wu-restart-schedule" | "wu-restart-dialog" => {
+                s.wu = wu::State { found: Some(Vec::new()), run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+                s.wu_extra.restart = true;
+            }
+            "wu-scheduled" => {
+                s.wu = wu::State { found: Some(Vec::new()), sched: Some("03:00".into()), run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+                s.wu_extra.restart = true;
+            }
+            "wu-failed" => {
+                s.wu = wu::State {
+                    found: Some(Vec::new()),
+                    run: demo_updates().into_iter().filter(|u| !u.optional).collect(),
+                    failed: Some(wu::Failure { title: "2026-11 Cumulative Update for .NET Framework 3.5 and 4.8.1 for Windows 11, version 24H2".into(), kb: "KB5045934".into(), code: "0x800f0922".into(), text: "Windows couldn\u{2019}t finish setting it up and rolled it back. This usually fixes itself on the next try; if it keeps failing, free up space on C: or turn off a VPN while it downloads.".into() }),
+                    ..wu::State::default()
+                };
+            }
+            "wu-checking" | "update-checking" => s.wu = wu::State { phase: wu::Phase::Checking, ..wu::State::default() },
             "wu-restart" => {
-                s.wu = wu::State { busy: None, found: Some(vec!["2026-11 Cumulative Update for Windows 11 Version 24H2 (KB5046617)".into(), "Security Intelligence Update for Microsoft Defender (KB2267602)".into()]), note: String::new() };
-                s.wu_extra = WuExtra { progress: None, restart: true, ..s.wu_extra };
+                s.wu = wu::State { found: Some(Vec::new()), run: demo_updates().into_iter().filter(|u| !u.optional).collect(), ..wu::State::default() };
+                s.wu_extra.restart = true;
             }
             "appearance-night-light" => s.night = 4800,
             "display-single" => {
@@ -733,7 +783,35 @@ impl Os for Demo {
         self.with(|s| s.wu.clone())
     }
     fn wu_extra(&self) -> WuExtra {
-        self.with(|s| s.wu_extra)
+        self.with(|s| s.wu_extra.clone())
+    }
+    fn wu_cancel(&self) {
+        self.note("wu_cancel");
+        self.with(|s| {
+            s.wu.phase = wu::Phase::Idle;
+            s.wu.pct = 0.0;
+            if s.wu.found.is_none() {
+                s.wu.found = Some(Vec::new());
+            }
+        });
+    }
+    fn wu_schedule(&self, sch: wu::Sched) -> bool {
+        self.note(format!("wu_schedule {sch:?}"));
+        self.with(|s| s.wu.sched = Some(wu::plan((17, 46), sch).1));
+        true
+    }
+    fn wu_unschedule(&self) {
+        self.note("wu_unschedule");
+        self.with(|s| s.wu.sched = None);
+    }
+    fn wu_admin(&self) -> bool {
+        false
+    }
+    fn restart_apps(&self) -> Vec<String> {
+        ["File manager", "Task Manager", "Telegram", "Discord", "Spotify", "Notepad"].map(String::from).to_vec()
+    }
+    fn open_link(&self, target: &str) {
+        self.note(format!("open_link {target}"));
     }
     fn restart_now(&self) -> bool {
         self.note("restart_now");
@@ -741,9 +819,17 @@ impl Os for Demo {
     }
     fn wu_check(&self, _done: Ping) {
         self.note("wu_check");
+        // the demo's search is over at once
+        self.with(|s| s.wu.found = Some(demo_updates()));
     }
-    fn wu_install(&self, _done: Ping) {
-        self.note("wu_install");
+    fn wu_install(&self, ids: Vec<String>, _done: Ping) {
+        self.note(format!("wu_install {}", ids.join(",")));
+        self.with(|s| {
+            let list: Vec<wu::Upd> = s.wu.found.clone().unwrap_or_default().into_iter().filter(|u| ids.contains(&u.id)).collect();
+            s.wu_extra.restart |= list.iter().any(|u| u.restart);
+            s.wu.found = s.wu.found.take().map(|f| f.into_iter().filter(|u| !ids.contains(&u.id)).collect());
+            s.wu.run = list;
+        });
     }
 
     fn night_kelvin(&self) -> u32 {
@@ -956,6 +1042,7 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
     set_os(d.clone());
     crate::set_app_query(""); // the Apps page's own search box starts empty in every state
     crate::more::set_ext_query("");
+    crate::wupage::reset();
     crate::more::set_pv_tab(Cap::Mic); // and the Privacy page's tab is the design's first one
     let page = match name {
         "sound" | "sound-muted" => 1,
@@ -963,7 +1050,7 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "network" | "net-wifi" | "net-ethernet" | "net-no-wifi-adapter" | "net-offline" | "net-airplane" | "wifi-password" | "wifi-connected-open" | "adapter-open" | "network-hidden" | "proxy-on" => 3,
         "bluetooth" | "bt-paired" | "bt-searching" | "bt-needs-pin" | "bt-off" | "bt-pairing" => 4,
         "apps" | "apps-many" | "apps-search" | "apps-none" => 5,
-        "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" => crate::WU_PAGE,
+        "update" | "wu-up-to-date" | "wu-available" | "wu-installing" | "wu-restart" | "update-checking" | "wu-stale" | "wu-available-optional" | "wu-downloading" | "wu-restart-schedule" | "wu-scheduled" | "wu-failed" | "wu-history" | "wu-restart-dialog" => crate::WU_PAGE,
         "defaults" | "defaults-lookup" | "defaults-none" => crate::DEFAULTS_PAGE,
         "notify" | "notify-open" | "notify-off" => crate::NOTIFY_PAGE,
         "personal" | "appearance-dark" | "appearance-light" | "personal-light" => crate::PERSONAL_PAGE,
@@ -988,6 +1075,11 @@ pub fn settings(name: &str) -> (crate::app::Settings, Rc<Demo>) {
         "apps-none" => s.demo_app_search("photoshop"),
         "notify-open" => s.demo_open("na:telegram", None),
         "defaults-lookup" => s.demo_app_search(".webp"),
+        "wu-available-optional" => crate::wupage::set_optional(true),
+        "wu-restart-schedule" => crate::wupage::set_chips(true),
+        "wu-failed" => crate::wupage::set_details(true),
+        "wu-history" => crate::wupage::set_history_all(true),
+        "wu-restart-dialog" => s.demo_restart_dialog(),
         "defaults-none" => s.demo_app_search(".xyz"),
         "privacy-camera-off" => crate::more::set_pv_tab(Cap::Cam),
         "privacy-location" => crate::more::set_pv_tab(Cap::Loc),

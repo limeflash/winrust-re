@@ -781,6 +781,20 @@ pub fn own_default(k: DefKind) -> String {
     }
 }
 
+/// Opens a page of Windows or Microsoft the way the shell does; anything else is refused (the addresses are built from numbers and fixed words).
+pub fn open_link(target: &str) {
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    if target.starts_with("ms-settings:") {
+        return winrust_common::settings::open(target);
+    }
+    let ok = target.starts_with("https://support.microsoft.com/") || target.starts_with("shell:::{");
+    if !ok || target.chars().any(|c| c.is_control() || c == '"' || c == ' ') {
+        return;
+    }
+    // SAFETY: a documented call with an address that was just checked.
+    unsafe { ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(target).as_ptr(), null(), null(), SW_SHOWNORMAL) };
+}
+
 #[cfg(test)]
 mod live {
     use super::*;

@@ -14,9 +14,9 @@ use winrust_ui::{
 };
 
 use crate::{
-    Box4, Cmd, Drive, Extra, Fill, Hero, Hue, Line, Op, Row, Tile, Tone, WU_PAGE, is_seg,
+    Box4, Cmd, Drive, Extra, Fill, Hero, Hue, Line, Op, Row, Tile, Tone, WU_PAGE, is_seg, wupage,
     app::{
-        Fid, ID_FIRST_SELECT, ID_ARR, ID_BACK, ID_DLG_KEEP, ID_DLG_REVERT, ID_DLG_SCRIM, ID_GACT, ID_HERO, ID_HIT, ID_IDENTIFY, ID_NAV, ID_PROFILE, ID_SCROLL, ID_SEARCH, ID_WALL, ID_AQ, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, row_id,
+        Fid, ID_FIRST_SELECT, ID_ARR, ID_BACK, ID_DLG_KEEP, ID_DLG_REVERT, ID_DLG_SCRIM, ID_GACT, ID_HERO, ID_HIT, ID_IDENTIFY, ID_NAV, ID_PROFILE, ID_SCROLL, ID_SEARCH, ID_WALL, ID_AQ, ID_RD_NO, ID_RD_OK, ID_RD_SCRIM, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, row_id,
         style_search,
     },
     look::{self, AMBER, CARD, GREEN, RED, SIDE, T1, T2, T3, T4, WIN, acc, acc_at, ink},
@@ -133,6 +133,7 @@ fn extra_height(e: &Extra) -> f32 {
         Extra::Drives(d) => d.iter().enumerate().map(|(i, _)| 76.0 + if i > 0 { 1.0 } else { 0.0 }).sum(),
         Extra::Walls(_) => 88.0,
         Extra::Search(_) => 52.0,
+        Extra::WuCard(w) => wu_card_height(w),
     }
 }
 
@@ -140,8 +141,6 @@ fn extra_height(e: &Extra) -> f32 {
 fn row_height(l: &Line) -> f32 {
     if let Some(h) = l.h {
         h
-    } else if l.big {
-        72.0
     } else if matches!(l.row, Row::Cycle(_, _, Op::Proxy | Op::Pac | Op::Try)) {
         40.0
     } else if l.sub.is_empty() {
@@ -313,6 +312,9 @@ impl Settings {
         self.paint_sidebar(c, f, h);
         if self.confirm.is_some() {
             self.paint_confirm(c, f);
+        }
+        if self.rd.is_some() {
+            self.paint_restart_dialog(c, f);
         }
         if self.demo_identify {
             // the render of the Identify button's result: the numbers as the mockup lays them on its one screen (the real ones are windows
@@ -486,6 +488,10 @@ impl Settings {
                     Extra::Battery(b) => paint_battery(c, ex, b.as_ref()),
                     Extra::Drives(d) => paint_drives(c, ex, d),
                     Extra::Walls(wl) => paint_walls(c, f, ex, wl, &mut me.wall_pics),
+                    Extra::WuCard(w) => {
+                        let w = w.clone();
+                        me.paint_wu_card(c, f, ex, &w);
+                    }
                     Extra::Search(count) => {
                         let count = count.clone();
                         me.paint_app_search(c, f, ex, &count);
@@ -533,7 +539,7 @@ impl Settings {
         if !first {
             c.fill(Rect::new(card.x, y - 1.0, card.w, 1.0), 0.0, ink(0.06));
         }
-        let clickable = matches!(l.row, Row::Wifi(..) | Row::Adapter(..)) || matches!(l.row, Row::Cycle(_, _, Op::Hidden)) || matches!(l.row, Row::Item(_, _, Cmd::BtUnpair(_) | Cmd::NotifyApp(_) | Cmd::PrivGo(_) | Cmd::OpenSecurity));
+        let clickable = matches!(l.row, Row::Wifi(..) | Row::Adapter(..)) || matches!(l.row, Row::Cycle(_, _, Op::Hidden)) || matches!(l.row, Row::Item(_, _, Cmd::BtUnpair(_) | Cmd::NotifyApp(_) | Cmd::PrivGo(_) | Cmd::OpenSecurity | Cmd::WuUninstall | Cmd::WuAdvanced));
         let mut hover = 0.0;
         if clickable {
             let hot = f.item(row_id(flat, P_BODY), r);
@@ -556,6 +562,11 @@ impl Settings {
     }
 
     fn paint_row_main(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, flat: usize, gi: usize, ri: usize, r: Rect) {
+        if let Row::Upd(u) = &self.pg.groups[gi].rows[ri].row {
+            let u = (**u).clone();
+            self.paint_upd(c, f, flat, r, &u);
+            return;
+        }
         let l = &self.pg.groups[gi].rows[ri];
         // the items at the right, from the right edge
         let items = self.right_items(l);
@@ -646,6 +657,7 @@ impl Settings {
     fn right_items(&self, l: &Line) -> Vec<RItem> {
         let mut v = Vec::new();
         match &l.row {
+            Row::Upd(_) => {}
             Row::Toggle { .. } | Row::Switch(..) | Row::Flag(..) => v.push(RItem::Switch(l.on, l.dis)),
             Row::Gauge(..) => v.push(RItem::Slider { w: 260.0, v: l.vol, mute: None }),
             Row::Cycle(_, _, Op::Try) => {}
@@ -707,17 +719,7 @@ impl Settings {
                     let me = self.pairing.as_deref() == Some(id.as_str());
                     v.push(RItem::Btns(vec![RBtn { label: if me { t!("Сопряжение", "Pairing").into() } else { l.val.clone() }, kind: BKind::Primary, busy: me, dis: self.pairing.is_some() }]));
                 }
-                Cmd::Check | Cmd::Install => {
-                    if l.busy {
-                        v.push(RItem::Btns(vec![RBtn { label: l.val.clone(), kind: BKind::Quiet, busy: true, dis: true }]));
-                    } else if l.restart {
-                        v.push(RItem::Btns(vec![RBtn { label: t!("Позже", "Later").into(), kind: BKind::Quiet, busy: false, dis: false }, RBtn { label: if self.armed.as_deref() == Some("wu-restart") { t!("Нажмите ещё раз: перезагрузка", "Click again to restart").into() } else { t!("Перезагрузить", "Restart now").into() }, kind: if self.armed.as_deref() == Some("wu-restart") { BKind::Danger } else { BKind::Primary }, busy: false, dis: false }]));
-                    } else if matches!(cmd, Cmd::Install) {
-                        v.push(RItem::Btns(vec![RBtn { label: t!("Скачать и установить", "Download and install", ja: "ダウンロードしてインストール", pt: "Baixar e instalar", zh: "下载并安装").into(), kind: BKind::Primary, busy: false, dis: false }]));
-                    } else {
-                        v.push(RItem::Btns(vec![RBtn { label: t!("Проверить наличие обновлений", "Check for updates", ja: "更新プログラムのチェック", pt: "Verificar atualizações", zh: "检查更新").into(), kind: BKind::Primary, busy: false, dis: false }]));
-                    }
-                }
+                Cmd::WuUninstall | Cmd::WuAdvanced => v.push(RItem::Chev(false)),
                 _ => {}
             },
             Row::Adapter(_, open) => v.push(RItem::Chev(*open)),
@@ -1469,4 +1471,288 @@ fn paint_radar(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, _on: bool) {
     c.circle(cx, cy, 4.0, acc());
     f.due(f.now + 16);
     c.text(t!("Ищем устройства поблизости. Переведите своё в режим сопряжения.", "Looking for devices nearby. Put yours in pairing mode."), Rect::new(r.x + 16.0 + 30.0 + 14.0, r.y, r.w - 80.0, r.h), BODY, T2, Align::Start);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Windows Update: the status card, the rows of updates, the "Restart now?" dialog
+
+/// The ids of the status card's buttons and chips.
+pub const ID_WU: Id = 600; // + the button
+pub const ID_WUCHIP: Id = 620; // + the chip
+
+fn tone_plate(t: Tone) -> (Rgba, Rgba) {
+    match t {
+        Tone::Good => (Rgba::css(76, 195, 138, 0.16), GREEN),
+        Tone::Warn => (Rgba::css(255, 163, 72, 0.16), AMBER),
+        Tone::Bad => (Rgba::css(229, 72, 77, 0.14), RED),
+        Tone::Accent => (acc_at(0.16), acc().accent_text()),
+        Tone::Dim | Tone::Faint => (ink(0.07), T2),
+    }
+}
+
+/// How many lines `text` takes at about `per` characters a line.
+fn lines_of(text: &str, per: usize) -> f32 {
+    text.chars().count().div_ceil(per.max(1)).max(1) as f32
+}
+
+/// The height of the status card.
+fn wu_card_height(w: &wupage::WuCard) -> f32 {
+    let text: f32 = 21.0 + 3.0 + 20.0 + if w.sub2.is_empty() { 0.0 } else { 3.0 + 15.0 };
+    let mut h = 18.0 + text.max(48.0 + 2.0) + 18.0;
+    if w.prog.is_some() {
+        h += 14.0 + 6.0 + 6.0 + 16.0;
+    }
+    if w.chips.is_some() {
+        h += 14.0 + 28.0 + 10.0 + 16.0;
+    }
+    if let Some((_, t, _)) = &w.err {
+        h += 14.0 + 12.0 + 20.0 + 6.0 + 19.5 * lines_of(t, 70) + 6.0 + 16.0 + 12.0;
+    }
+    h
+}
+
+impl Settings {
+    fn paint_wu_card(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect, w: &wupage::WuCard) {
+        let (x, mut y) = (r.x + 18.0, r.y + 18.0);
+        let (bg, fg) = tone_plate(w.tone);
+        let t = Rect::new(x, y, 48.0, 48.0);
+        c.fill(t, 13.0, bg);
+        c.icon(w.d, (t.cx(), t.cy()), 24.0, 1.9, fg, if w.spin { (f.now % 800) as f32 / 800.0 * 360.0 } else { 0.0 });
+        if w.spin {
+            f.due(f.now + 16);
+        }
+        // the buttons at the right: 32 high, a shield or a spinner before the words
+        let mut widths = Vec::new();
+        for b in &w.btns {
+            widths.push(c.measure(&b.label, BODY_M).ceil() + 28.0 + if b.shield { 21.0 } else { 0.0 } + if b.busy { 19.0 } else { 0.0 });
+        }
+        let total: f32 = widths.iter().sum::<f32>() + 6.0 * (widths.len().saturating_sub(1)) as f32;
+        let mut bx = r.x + r.w - 18.0 - total;
+        let by = y + 6.0;
+        for (k, b) in w.btns.iter().enumerate() {
+            let rect = Rect::new(bx, by, widths[k], 32.0);
+            let hot = f.focusable(ID_WU + k as Id, rect);
+            if !b.dis {
+                f.hand();
+            }
+            c.faded(if b.dis && !b.busy { 0.45 } else { 1.0 }, |c| {
+                c.transformed(rect.cx(), rect.cy(), 1.0 - 0.03 * hot.press, 0.0, 0.0, |c| {
+                    let (fill, ink_c) = match b.kind {
+                        wupage::WuKind::Primary => (acc().accent_fill(), Rgba::pure_white(1.0)),
+                        wupage::WuKind::On => (acc_at(0.20), T1),
+                        wupage::WuKind::Quiet => (ink(0.08), T1),
+                    };
+                    c.fill(rect, 9.0, fill);
+                    if hot.hover > 0.0 && !b.dis {
+                        c.fill(rect, 9.0, Rgba::pure_white(0.08 * hot.hover));
+                    }
+                    let mut tx = rect.x + 14.0;
+                    if b.shield {
+                        // the UAC shield: blue with a yellow half
+                        let at = (tx + 7.0, rect.cy());
+                        c.glyph("M12 2.5l8 3v6.2c0 4.8-3.4 8.4-8 9.8-4.6-1.4-8-5-8-9.8V5.5z", at, 14.0, Rgba::css(0x2f, 0x7b, 0xf6, 1.0));
+                        c.glyph("M12 2.5l8 3v6.2c0 4.8-3.4 8.4-8 9.8z", at, 14.0, Rgba::css(0xf5, 0xc5, 0x42, 1.0));
+                        tx += 21.0;
+                    }
+                    if b.busy {
+                        spinner(c, f, (tx + 6.0, rect.cy()), 12.0, ink_c);
+                        tx += 19.0;
+                    }
+                    c.text(&b.label, Rect::new(tx, rect.y, rect.w, rect.h), BODY_M, ink_c, Align::Start);
+                });
+            });
+            if hot.focus {
+                c.ring(rect.inset(-3.0), 11.0, 2.0, winrust_ui::widgets::look::focus_ring().fade(0.9));
+            }
+            bx += widths[k] + 6.0;
+        }
+        // the words
+        let tx = x + 48.0 + 16.0;
+        let tw = (r.x + r.w - 18.0 - total - 16.0 - tx).max(60.0);
+        c.text_fit(&w.title, Rect::new(tx, y + 2.0, tw, 21.0), Font::new(17.0, 600).tracking(-0.01), T1, Align::Start);
+        c.text_fit(&w.sub, Rect::new(tx, y + 2.0 + 24.0, tw, 20.0), BODY, T2, Align::Start);
+        if !w.sub2.is_empty() {
+            c.text_fit(&w.sub2, Rect::new(tx, y + 2.0 + 47.0, tw, 15.0), SMALL, T3, Align::Start);
+        }
+        y += (21.0f32 + 3.0 + 20.0 + if w.sub2.is_empty() { 0.0 } else { 18.0 }).max(50.0) + 14.0;
+        let ix = x + 64.0;
+        let iw = r.x + r.w - 18.0 - ix;
+        if let Some((p, left, right)) = &w.prog {
+            let bar = Rect::new(ix, y, iw, 6.0);
+            c.fill(bar, 3.0, ink(0.08));
+            c.fill(Rect::new(bar.x, bar.y, bar.w * (p / 100.0).clamp(0.0, 1.0), 6.0), 3.0, acc().accent_fill());
+            c.text(left, Rect::new(ix, y + 12.0, iw, 16.0), SMALL.tabular(), T3, Align::Start);
+            c.text(right, Rect::new(ix, y + 12.0, iw, 16.0), SMALL.tabular(), T3, Align::End);
+            y += 6.0 + 6.0 + 16.0 + 14.0;
+        }
+        if let Some((chips, note)) = &w.chips {
+            let mut cx = ix;
+            c.text("Restart", Rect::new(cx, y, 60.0, 28.0), SMALL, T3, Align::Start);
+            cx += c.measure("Restart", SMALL).ceil() + 4.0 + 6.0;
+            for (i, label) in chips.iter().enumerate() {
+                let cw = c.measure(label, Font::new(12.5, 500)).ceil() + 24.0;
+                let rect = Rect::new(cx, y, cw, 28.0);
+                let hot = f.focusable(ID_WUCHIP + i as Id, rect);
+                f.hand();
+                c.fill(rect, 14.0, ink(0.07 + 0.04 * hot.hover));
+                c.text(label, rect, Font::new(12.5, 500), T1, Align::Center);
+                if i == 2 {
+                    self.wu_chip = Some(rect);
+                }
+                if hot.focus {
+                    c.ring(rect.inset(-3.0), 16.0, 2.0, winrust_ui::widgets::look::focus_ring().fade(0.9));
+                }
+                cx += cw + 6.0;
+            }
+            c.icon(look::CLOCK, (ix + 6.5, y + 28.0 + 10.0 + 8.0), 13.0, 2.0, T3, 0.0);
+            c.text_fit(note, Rect::new(ix + 19.0, y + 28.0 + 10.0, iw - 19.0, 16.0), SMALL, T3, Align::Start);
+            y += 28.0 + 10.0 + 16.0 + 14.0;
+        }
+        if let Some((title, text, code)) = &w.err {
+            let h = 12.0 + 20.0 + 6.0 + 19.5 * lines_of(text, 70) + 6.0 + 16.0 + 12.0;
+            let b = Rect::new(ix, y, iw, h);
+            c.fill(b, 12.0, RED.alpha(0.09));
+            c.ring(b, 12.0, 1.0, RED.alpha(0.22));
+            c.text_fit(title, Rect::new(b.x + 14.0, b.y + 12.0, b.w - 28.0, 20.0), BODY_M.weight600(), T1, Align::Start);
+            c.text_wrapped(text, Rect::new(b.x + 14.0, b.y + 12.0 + 26.0, b.w - 28.0, 19.5 * lines_of(text, 70)), BODY, T2, 19.5, 0);
+            c.text(code, Rect::new(b.x + 14.0, b.y + b.h - 12.0 - 16.0, b.w - 28.0, 16.0), Font::new(12.0, 400).tabular(), T3, Align::Start);
+        }
+    }
+
+    /// A row of the list of updates: a checkbox or a state icon, the title (two lines at most), the kind, the KB link, the size or state.
+    fn paint_upd(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>, flat: usize, r: Rect, u: &wupage::UpdRow) {
+        let pick = matches!(u.mode, wupage::UMode::Pick(_));
+        let on = matches!(u.mode, wupage::UMode::Pick(true));
+        let (x0, y0) = (r.x + 16.0, r.y + 14.0);
+        let mut tx = x0;
+        match &u.mode {
+            wupage::UMode::Pick(_) => {
+                let hot = f.focusable(row_id(flat, P_BODY), r);
+                f.hand();
+                c.fill(r, 0.0, ink(0.035 * hot.hover));
+                let cb = Rect::new(x0, y0, 20.0, 20.0);
+                let k = f.tween(row_id(flat, P_BODY) + 300_000, 14, f32::from(on), 150, EASE);
+                c.fill(cb, 6.0, acc().accent_fill().alpha(k));
+                c.ring(cb, 6.0, 1.5, if hot.hover > 0.0 && !on { acc().accent_text() } else { ink(0.28).fade(1.0 - k) });
+                if k > 0.0 {
+                    c.icon("M5 12.5l4.5 4.5L19 7.5", (cb.cx(), cb.cy()), 12.0 * (0.6 + 0.4 * k), 3.4, Rgba::pure_white(k), 0.0);
+                }
+                if hot.focus {
+                    c.ring(r.inset(2.0), 8.0, 2.0, winrust_ui::widgets::look::focus_ring().fade(0.9));
+                }
+                tx += 20.0 + 14.0;
+            }
+            wupage::UMode::Icon { d, tone, spin, .. } => {
+                let (bg, fg) = tone_plate(*tone);
+                let t = Rect::new(x0, y0 - 4.0, 28.0, 28.0);
+                c.fill(t, 8.0, bg);
+                c.icon(d, (t.cx(), t.cy()), 15.0, 2.0, fg, if *spin { (f.now % 800) as f32 / 800.0 * 360.0 } else { 0.0 });
+                if *spin {
+                    f.due(f.now + 16);
+                }
+                tx += 28.0 + 14.0;
+            }
+        }
+        // the right column
+        let (right, right_ink) = match &u.mode {
+            wupage::UMode::Pick(_) => (size_label(u.upd.mb), if on { T2 } else { T3 }),
+            wupage::UMode::Icon { right, right_tone, .. } => (right.clone(), tone_ink(*right_tone)),
+        };
+        let rw = c.measure(&right, Font::new(12.5, 500).tabular()).ceil().max(96.0);
+        let rx = r.x + r.w - 16.0 - rw;
+        c.text(&right, Rect::new(rx, y0, rw, 20.0), Font::new(12.5, 500).tabular(), right_ink, Align::End);
+        if u.upd.restart && pick {
+            let label = "Restart";
+            let tw = c.measure(label, Font::new(11.5, 400)).ceil();
+            let tag = Rect::new(r.x + r.w - 16.0 - (tw + 14.0 + 15.0), y0 + 26.0, tw + 14.0 + 15.0, 20.0);
+            c.fill(tag, 6.0, ink(0.06));
+            c.icon(look::REFRESH, (tag.x + 7.0 + 5.5, tag.cy()), 11.0, 2.4, T2, 0.0);
+            c.text(label, Rect::new(tag.x + 7.0 + 15.0, tag.y, tw + 2.0, 20.0), Font::new(11.5, 400), T2, Align::Start);
+        }
+        // the title and the line under it
+        let tw = (rx - 14.0 - tx).max(60.0);
+        let title_ink = if pick && !on { T2 } else { T1 };
+        let two = wupage::title_lines(&u.upd.title, tw) > 1;
+        c.text_wrapped(&u.upd.title, Rect::new(tx, y0, tw, if two { 40.0 } else { 20.0 }), BODY_M, title_ink, 20.0, 2);
+        let my = y0 + if two { 40.0 } else { 20.0 } + 6.0;
+        let cat = u.upd.cat;
+        let cc = tone_ink(wupage::cat_tone(cat));
+        c.circle(tx + 3.5, my + 8.0, 3.5, cc);
+        let name = wupage::cat_name(cat);
+        let nw = c.measure(name, Font::new(12.0, 500)).ceil();
+        c.text(name, Rect::new(tx + 13.0, my, nw + 2.0, 16.0), Font::new(12.0, 500), cc, Align::Start);
+        if !u.upd.kb.is_empty() {
+            let kw = c.measure(&u.upd.kb, SMALL.tabular()).ceil() + 3.0 + 10.0;
+            let kr = Rect::new(tx + 13.0 + nw + 10.0, my, kw, 16.0);
+            let hot = f.item(row_id(flat, P_CTL), kr);
+            f.hand();
+            let col = T3.mix(acc().accent_text(), hot.hover);
+            c.text(&u.upd.kb, Rect::new(kr.x, kr.y, kw, 16.0), SMALL.tabular(), col, Align::Start);
+            c.icon("M14 4h6v6M20 4l-9 9M18 14v6H4V6h6", (kr.x + kw - 5.0, kr.cy()), 10.0, 2.4, col, 0.0);
+            if hot.hover > 0.0 {
+                c.fill(Rect::new(kr.x, kr.y + 15.0, kw - 13.0, 1.0), 0.0, col);
+            }
+            f.tip(t!("Открыть статью KB", "Open the KB article"));
+        }
+        if let wupage::UMode::Icon { bar: Some((p, green)), .. } = &u.mode {
+            let b = Rect::new(tx, my + 16.0 + 8.0, tw.min(rx - 14.0 - tx), 4.0);
+            c.fill(b, 2.0, ink(0.08));
+            c.fill(Rect::new(b.x, b.y, b.w * p.clamp(0.0, 1.0), 4.0), 2.0, if *green { GREEN } else { acc().accent_fill() });
+        }
+    }
+
+    /// "Restart now?": the apps that will close, and the two buttons.
+    fn paint_restart_dialog(&mut self, c: &mut Canvas<'_>, f: &mut Frame<'_>) {
+        let Some(apps) = self.rd.clone() else { return };
+        let (w, h) = f.size;
+        let win = Rect::new(0.0, 0.0, w, h);
+        let age = f.tween(ID_RD_SCRIM + 300_000, 15, 1.0, 220, SPRING);
+        f.item(ID_RD_SCRIM, win);
+        c.fill(win, 0.0, Rgba::css(0, 0, 0, 0.35 * age));
+        let waiting = os().wu_state().run.iter().filter(|u| u.restart).count();
+        let line = wupage::apps_line(&apps);
+        let body_h = 19.5 * if line.is_empty() { 1.0 } else { 2.5 };
+        let (dw, dh) = (400.0, 22.0 + 44.0 + 12.0 + body_h + 12.0 + 6.0 + 32.0 + 22.0);
+        let r = Rect::new(((w - dw) / 2.0).round(), ((h - dh) / 2.0).round(), dw, dh);
+        c.faded(age, |c| {
+            c.transformed(r.cx(), r.cy(), 0.95 + 0.05 * age, 0.0, 0.0, |c| {
+                c.outside(r, 16.0, |c| c.shadow(r, 16.0, 30.0, 80.0, Rgba::css(0, 0, 0, 0.5)));
+                c.fill(r, 16.0, winrust_ui::widgets::look::MENU);
+                c.ring(r.inset(-1.0), 17.0, 1.0, Rgba::css(0, 0, 0, 0.6));
+                c.ring(r, 16.0, 1.0, ink(0.09));
+                let mut y = r.y + 22.0;
+                let t = Rect::new(r.x + 22.0, y, 44.0, 44.0);
+                c.fill(t, 12.0, acc_at(0.18));
+                c.icon(look::REFRESH, (t.cx(), t.cy()), 22.0, 2.0, acc().accent_text(), 0.0);
+                c.text(t!("Перезагрузить сейчас?", "Restart now?"), Rect::new(t.x + 58.0, y + 1.0, dw - 80.0, 20.0), Font::new(15.0, 600), T1, Align::Start);
+                let sub = if waiting > 0 { tf!("Обновлений завершат установку: {}", "{} updates finish installing", waiting) } else { t!("Windows завершит обновления при перезагрузке", "Windows finishes the updates while it restarts").to_string() };
+                c.text_fit(&sub, Rect::new(t.x + 58.0, y + 24.0, dw - 80.0, 16.0), BODY, T3, Align::Start);
+                y += 44.0 + 12.0;
+                let parts = [(t!("Закроются приложения: ", "These apps will close: "), false), (line.as_str(), true), (t!(" Сначала сохраните работу.", " Save your work first."), false)];
+                let parts: Vec<(&str, bool)> = if line.is_empty() { vec![(t!("Сначала сохраните свою работу.", "Save your work first."), false)] } else { parts.to_vec() };
+                paint_rich(c, Rect::new(r.x + 22.0, y, dw - 44.0, body_h), &parts);
+                y += body_h + 12.0 + 6.0;
+                let (no, ok) = (t!("Не сейчас", "Not now"), t!("Перезагрузить", "Restart now"));
+                let (nw, kw) = (c.measure(no, BODY_M).ceil() + 28.0, c.measure(ok, Font::new(13.0, 600)).ceil() + 28.0);
+                let kb = Rect::new(r.x + r.w - 22.0 - kw, y, kw, 32.0);
+                let nb = Rect::new(kb.x - 8.0 - nw, y, nw, 32.0);
+                for (id, b, label, primary) in [(ID_RD_NO, nb, no, false), (ID_RD_OK, kb, ok, true)] {
+                    let hot = f.item(id, b);
+                    f.hand();
+                    c.transformed(b.cx(), b.cy(), 1.0 - 0.03 * hot.press, 0.0, 0.0, |c| {
+                        c.fill(b, 9.0, if primary { acc().accent_fill() } else { ink(0.08) });
+                        if hot.hover > 0.0 {
+                            c.fill(b, 9.0, Rgba::pure_white(0.1 * hot.hover));
+                        }
+                        c.text(label, b, Font::new(13.0, if primary { 600 } else { 500 }), if primary { Rgba::pure_white(1.0) } else { T1 }, Align::Center);
+                    });
+                }
+            });
+        });
+    }
+}
+
+/// "612 MB", "1.2 GB".
+fn size_label(mb: u32) -> String {
+    if mb >= 1000 { format!("{:.1} GB", f64::from(mb) / 1024.0) } else { format!("{mb} MB") }
 }

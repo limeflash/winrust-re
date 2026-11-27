@@ -36,6 +36,9 @@ pub const ID_SEARCH: Id = 200; // and 201, its clear button
 pub const ID_AQ: Id = 202; // the Apps page's own search box, and 203, its clear button
 pub const ID_NAV: Id = 10; // + the page
 pub const ID_SCROLL: Id = 40; // and 41, its bar
+pub const ID_RD_NO: Id = 33; // the "Restart now?" dialog's buttons, and 35, its scrim
+pub const ID_RD_OK: Id = 34;
+pub const ID_RD_SCRIM: Id = 35;
 pub const ID_DLG_SCRIM: Id = 30;
 pub const ID_DLG_REVERT: Id = 31;
 pub const ID_DLG_KEEP: Id = 32;
@@ -49,7 +52,6 @@ pub const ID_HIT: Id = 100_000; // + the hit of a search
 
 pub const P_BODY: Id = 0;
 pub const P_CTL: Id = 1;
-pub const P_CTL2: Id = 2;
 pub const P_MUTE: Id = 3;
 pub const P_SEG: Id = 8;
 pub const P_FIELD: Id = 16;
@@ -232,6 +234,10 @@ pub struct Settings {
     give_up: Option<u64>,
     tick_at: Option<u64>,
     pub demo_clicks: Vec<Id>,
+    /// The "Restart now?" dialog is up: the apps a restart would close.
+    pub rd: Option<Vec<String>>,
+    /// Where the "Pick a time" chip of the last frame is (the list opens under it).
+    pub wu_chip: Option<Rect>,
     /// The thumbnails of the Personalization page's wallpapers as pictures of the device (by the thumbnail's address).
     pub wall_pics: Vec<(usize, winrust_ui::gfx::Picture)>,
     /// The size of the window, DIPs (the picture of the arrangement is mapped from it).
@@ -293,6 +299,8 @@ impl Settings {
             give_up: None,
             tick_at: None,
             demo_clicks: Vec::new(),
+            rd: None,
+            wu_chip: None,
             wall_pics: Vec::new(),
             win: (1000.0, 720.0),
         };
@@ -308,7 +316,7 @@ impl Settings {
             self.sel_mon = os().display_selected();
         }
         let (wu, extra) = (os().wu_state(), os().wu_extra());
-        self.wu_badge = if wu.busy.is_none() && !extra.restart { wu.found.as_ref().map_or(0, Vec::len) } else { 0 };
+        self.wu_badge = if wu.phase == crate::wu::Phase::Idle { wu.found.as_ref().map_or(0, |f| f.iter().filter(|u| !u.optional).count()) + usize::from(extra.restart || wu.failed.is_some()) } else { 0 };
         self.sig = format!("{}|{}", page_sig(&self.pg), self.wu_badge);
     }
 
@@ -574,8 +582,8 @@ impl Settings {
                         o.bt_scan(ping());
                         self.pairing = None;
                     }
-                    Cmd::Check => o.wu_check(ping()),
-                    Cmd::Install => o.wu_install(ping()),
+                    Cmd::WuUninstall => o.open_link("shell:::{d450a8a1-9568-45c7-9c0e-b4f9fb4537bd}"),
+                    Cmd::WuAdvanced => o.open_link("ms-settings:windowsupdate-options"),
                     Cmd::NotifyMode(id, mode) => {
                         if !o.notify_set(&id, mode) {
                             self.say(denied(), cx);
@@ -743,11 +751,72 @@ impl Settings {
         self.pg.groups.get(g)?.rows.get(r)
     }
 
+    /// A button of Windows Update's status card.
+    fn wu_act(&mut self, k: usize, cx: &mut Cx) {
+        use crate::wupage::WuAct;
+        let Some(act) = self.pg.groups.first().and_then(|g| if let crate::Extra::WuCard(w) = &g.extra { w.btns.get(k).map(|b| b.act) } else { None }) else { return };
+        let o = os();
+        match act {
+            WuAct::Check => o.wu_check(ping()),
+            WuAct::Cancel => o.wu_cancel(),
+            WuAct::Install => {
+                let st = o.wu_state();
+                // after a failure the same updates are tried again; otherwise the ticked ones
+                let ids: Vec<String> = if st.failed.is_some() { st.run.iter().map(|u| u.id.clone()).collect() } else { st.found.unwrap_or_default().iter().filter(|u| crate::wupage::selected(u)).map(|u| u.id.clone()).collect() };
+                if ids.is_empty() {
+                    self.say(t!("Выберите хотя бы одно обновление", "Pick at least one update"), cx);
+                } else {
+                    o.wu_install(ids, ping());
+                }
+            }
+            WuAct::RestartDlg => self.rd = Some(o.restart_apps()),
+            WuAct::Sched => crate::wupage::flip_chips(),
+            WuAct::Unsched => {
+                o.wu_unschedule();
+                self.say(t!("Запланированная перезагрузка отменена", "Scheduled restart cancelled"), cx);
+            }
+            WuAct::Details => crate::wupage::flip_details(),
+        }
+        self.read_page();
+        cx.invalidate();
+    }
+
+    /// A chip of the restart row: tonight at 03:00, in an hour, or a list of times.
+    fn wu_chip_click(&mut self, i: usize, cx: &mut Cx) {
+        use crate::wu::Sched;
+        let o = os();
+        let sched = match i {
+            0 => Sched::At(3, 0),
+            1 => Sched::In(60),
+            _ => {
+                let items = crate::WU_TIMES.iter().enumerate().map(|(k, t)| MenuItem::new((*t).to_string()).value(k)).collect();
+                self.pick = Some(Op::WuTime);
+                cx.menu(TAG_PICK, items, self.wu_chip.unwrap_or_default());
+                return;
+            }
+        };
+        if o.wu_schedule(sched) {
+            crate::wupage::set_chips(false);
+            let at = o.wu_state().sched.unwrap_or_default();
+            self.say(tf!("Перезагрузка запланирована на {}", "Restart scheduled for {}", at), cx);
+        } else {
+            self.say(t!("Windows не приняла перезагрузку по расписанию", "Windows did not take the scheduled restart"), cx);
+        }
+        self.read_page();
+        cx.invalidate();
+    }
+
     /// The group's action (the button at the right of its title).
     fn group_act(&mut self, g: usize, cx: &mut Cx) {
         let Some(what) = self.pg.groups.get(g).and_then(|g| g.act.as_ref()).map(|a| a.what.clone()) else { return };
         match what {
             GAct::WifiRefresh => os().wifi_scan(),
+            GAct::WuSel(on) => {
+                let found = os().wu_state().found.unwrap_or_default();
+                crate::wupage::set_required(&found, on);
+            }
+            GAct::WuOpt => crate::wupage::flip_optional(),
+            GAct::WuHist => crate::wupage::flip_history(),
             GAct::Cmd(c) => self.run_cmd("", "", c, cx),
             GAct::Copy => {
                 // every fact of the page: the name (its line holds the button), the values, the build
@@ -767,6 +836,7 @@ impl Settings {
                 self.say(t!("Сведения об устройстве скопированы", "Device details copied"), cx);
             }
         }
+        self.read_page();
         cx.invalidate();
     }
 
@@ -805,8 +875,8 @@ impl Settings {
             Forget(String),
             Disconnect,
             Hidden,
-            Later,
-            Restart,
+            WuToggle(String, bool),
+            WuKb(String),
         }
         let seg = (P_SEG..P_SEG + 8).contains(&part);
         let act = match (&line.row, part) {
@@ -824,11 +894,12 @@ impl Settings {
             (Row::Item(_, _, Cmd::NotifyApp(id)), p) if p >= P_ACT => Do::Cmd(Cmd::NotifyMode(id.clone(), (p - P_ACT) as usize)),
             (Row::Item(_, _, cmd @ (Cmd::PrivGo(_) | Cmd::OpenSecurity)), P_BODY) => Do::Cmd(cmd.clone()),
             (Row::Item(_, _, cmd @ Cmd::BtUnpair(_)), P_ACT) => Do::Cmd(cmd.clone()),
+            (Row::Upd(u), P_BODY) if matches!(u.mode, crate::wupage::UMode::Pick(_)) => Do::WuToggle(u.upd.id.clone(), !crate::wupage::selected(&u.upd)),
+            (Row::Upd(u), P_CTL) if !u.upd.kb.is_empty() => Do::WuKb(u.upd.kb.clone()),
+            (Row::Item(_, _, cmd @ (Cmd::WuUninstall | Cmd::WuAdvanced)), P_BODY) => Do::Cmd(cmd.clone()),
             (Row::Item(_, _, Cmd::SyncTime), P_CTL) if self.syncing => Do::Nothing,
             (Row::Item(_, _, Cmd::Rename), P_ACT) => Do::RenameSave,
             (Row::Item(_, _, Cmd::Rename), p) if p == P_ACT + 1 => Do::RenameCancel,
-            (Row::Item(..), P_CTL) if line.restart => Do::Later,
-            (Row::Item(..), P_CTL2) if line.restart => Do::Restart,
             (Row::Item(_, _, cmd), P_CTL) if !line.busy && !(matches!(cmd, Cmd::BtPair(_)) && self.pairing.is_some()) => Do::Cmd(cmd.clone()),
             (Row::Adapter(a, _), P_BODY) => Do::Adapter(a.name.clone()),
             (Row::Wifi(..), P_BODY) => Do::Toggle,
@@ -877,17 +948,11 @@ impl Settings {
             Do::Forget(p) => self.wifi_forget(&p, cx),
             Do::Disconnect => self.wifi_disconnect(cx),
             Do::Hidden => self.connect_hidden(cx),
-            Do::Later => self.say(t!("Windows завершит обновление при следующей перезагрузке", "Windows will finish the next time you restart"), cx),
-            Do::Restart => {
-                // the first click arms the button ("Click again to restart"), the second restarts the PC
-                if self.once_more("wu-restart") {
-                    if os().restart_now() {
-                        self.say(t!("Перезагрузка…", "Restarting\u{2026}"), cx);
-                    } else {
-                        self.say(t!("Windows не разрешила перезагрузку", "Windows did not allow the restart"), cx);
-                    }
-                }
+            Do::WuToggle(id, on) => {
+                crate::wupage::toggle(&id, on);
+                self.read_page();
             }
+            Do::WuKb(kb) => os().open_link(&format!("https://support.microsoft.com/help/{}", kb.trim_start_matches("KB"))),
         }
         cx.invalidate();
     }
@@ -1202,6 +1267,17 @@ impl App for Settings {
                 }
             }
             i if (ID_GACT..ID_GACT + 16).contains(&i) => self.group_act((i - ID_GACT) as usize, cx),
+            i if (crate::draw::ID_WU..crate::draw::ID_WU + 8).contains(&i) => self.wu_act((i - crate::draw::ID_WU) as usize, cx),
+            i if (crate::draw::ID_WUCHIP..crate::draw::ID_WUCHIP + 4).contains(&i) => self.wu_chip_click((i - crate::draw::ID_WUCHIP) as usize, cx),
+            ID_RD_OK => {
+                self.rd = None;
+                if os().restart_now() {
+                    self.say(t!("Перезагрузка…", "Restarting\u{2026}"), cx);
+                } else {
+                    self.say(t!("Windows не разрешила перезагрузку", "Windows did not allow the restart"), cx);
+                }
+            }
+            ID_RD_NO | ID_RD_SCRIM => self.rd = None,
             i if (ID_WALL..ID_WALL + 16).contains(&i) => {
                 let n = self.pg.groups.iter().find_map(|g| if let crate::Extra::Walls(w) = &g.extra { Some(w.len()) } else { None }).unwrap_or(0);
                 let k = (i - ID_WALL) as usize;
@@ -1254,6 +1330,14 @@ impl App for Settings {
         const LEFT: u32 = 0x25;
         const F: u32 = 0x46;
         let now = anim::now_ms();
+        // the "Restart now?" dialog takes Esc; nothing else reaches the page behind it
+        if self.rd.is_some() {
+            if vk == ESC {
+                self.rd = None;
+                cx.invalidate();
+            }
+            return true;
+        }
         // the confirmation of a display change takes Enter and Esc before anything
         if self.confirm.is_some() {
             match vk {
@@ -1473,6 +1557,11 @@ impl Settings {
     /// Reads the page again (a state has changed what the source says).
     pub fn reread(&mut self) {
         self.read_page();
+    }
+
+    /// The "Restart now?" dialog, as the design's preview state opens it.
+    pub fn demo_restart_dialog(&mut self) {
+        self.rd = Some(os().restart_apps());
     }
 
     /// The "Keep these display settings?" dialog, as the mockup's preview state opens it.

@@ -49,6 +49,7 @@ mod sysx;
 mod wall;
 mod wifi;
 mod wu;
+mod wupage;
 #[cfg(test)]
 mod tests;
 
@@ -77,6 +78,8 @@ pub enum Row {
     Switch(String, fn() -> Option<bool>, Op),
     /// A visible Wi-Fi network and its status text: a click opens it (the password goes there), Connect connects.
     Wifi(wifi::Net, String),
+    /// One update of the Windows Update page (a checkbox, its words, a state).
+    Upd(Box<wupage::UpdRow>),
     /// A slider of a number the system keeps as a step of a scale (key repeat, pointer speed); the line's `vol` is 0..=1.
     Gauge(String, more::Gauge),
     /// A switch of a yes/no that is not one DWORD of `HKCU` (Do not disturb, a permission, pointer precision); a click flips it.
@@ -88,6 +91,7 @@ impl Row {
     pub fn label(&self) -> &str {
         match self {
             Row::Toggle { label, .. } | Row::Info(label, _) | Row::Cycle(label, ..) | Row::Slider(label, _) | Row::Item(label, ..) | Row::Switch(label, ..) | Row::Gauge(label, _) | Row::Flag(label, _) => label,
+            Row::Upd(u) => &u.upd.title,
             Row::Adapter(a, _) => &a.name,
             Row::Wifi(n, _) => &n.ssid,
         }
@@ -127,6 +131,8 @@ pub enum Op {
     Def(more::DefKind),
     /// The default app of the file type typed in that page's box.
     DefExt,
+    /// The time of a restart picked from the list of the chips.
+    WuTime,
     /// The accent colour of every WinRust program (the swatches of Personalization).
     Accent,
     /// How the Apps page orders its programs (name, size, install date).
@@ -151,8 +157,6 @@ pub enum Cmd {
     BtPair(String),
     BtUnpair(String),
     BtScan,
-    Check,
-    Install,
     Wallpaper,
     /// A notifying app of the Notifications page: a click unfolds its three ways.
     NotifyApp(String),
@@ -165,6 +169,9 @@ pub enum Cmd {
     SyncTime,
     /// The About page's Computer name: a click unfolds the name field.
     Rename,
+    /// Windows Update: the list of installed updates (Windows' own uninstaller), and the advanced options of Windows' settings.
+    WuUninstall,
+    WuAdvanced,
 }
 
 pub const CONFIRM_SECS: u32 = 15;
@@ -223,10 +230,6 @@ pub struct Line {
     /// The values of a segmented row (`Topology`, `Plan`) and the current one.
     pub opts: Vec<String>,
     pub cur: Option<usize>,
-    /// A taller row (the Windows Update status).
-    pub big: bool,
-    /// The buttons of the Windows Update "restart" state (the real one never has them).
-    pub restart: bool,
     /// Drawn dim and not clickable (a switch whose master switch is off).
     pub dis: bool,
     /// A height of its own, DIPs.
@@ -254,8 +257,6 @@ impl Line {
             mute: None,
             opts: Vec::new(),
             cur: None,
-            big: false,
-            restart: false,
             dis: false,
             h: None,
         };
@@ -268,6 +269,7 @@ impl Line {
                     l.val = choices(*op).and_then(|(v, c)| c.and_then(|c| v.get(c).cloned())).unwrap_or_else(|| "?".into());
                 }
             }
+            Row::Upd(_) => {}
             Row::Gauge(_, g) => {
                 l.vol = os().gauge(*g);
                 l.sub = more::gauge_text(*g, l.vol);
@@ -338,6 +340,8 @@ pub enum Extra {
     Walls(Vec<Wall>),
     /// The search box of a page's own list (the Apps page): what it says of the result ("3 of 12"), empty while nothing is typed.
     Search(String),
+    /// The Windows Update page's status card.
+    WuCard(Box<wupage::WuCard>),
 }
 
 /// A big status card (the Network page).
@@ -395,6 +399,10 @@ pub enum GAct {
     Cmd(Cmd),
     /// Puts the device details on the clipboard.
     Copy,
+    /// Windows Update: tick every required update (true) or none; show or hide the optional ones; the whole history or the latest.
+    WuSel(bool),
+    WuOpt,
+    WuHist,
 }
 
 pub struct Group {
@@ -566,7 +574,7 @@ fn orient_names() -> [&'static str; 4] {
 
 /// Rows whose value is picked from a list (the others act on a click). Screen modes need a second screen.
 pub fn listed(op: Op) -> bool {
-    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab | Op::Def(_) | Op::DefExt | Op::AppSort)
+    matches!(op, Op::Res | Op::Hz | Op::Orient | Op::Scale | Op::Monitor | Op::Plan | Op::Screen | Op::Sleep | Op::OutDev | Op::InDev | Op::Night | Op::UiLang | Op::Opt(_) | Op::PvTab | Op::Def(_) | Op::DefExt | Op::AppSort | Op::WuTime)
         || (matches!(op, Op::Topology) && os().display_connected() > 1)
 }
 
@@ -620,6 +628,7 @@ pub fn choices(op: Op) -> Option<(Vec<String>, Option<usize>)> {
             let (apps, cur) = o.assoc_apps(&def_assoc(op)?);
             (apps.into_iter().map(|a| a.name).collect(), cur)
         }
+        Op::WuTime => (WU_TIMES.iter().map(|s| (*s).to_string()).collect(), None),
         Op::AppSort => (APP_SORTS.iter().map(|s| s().to_string()).collect(), Some(APP_SORT.get())),
         Op::Accent => (winrust_common::style::Accent::ALL.iter().map(|a| a.name().to_string()).collect(), Some(o.accent())),
         Op::PvTab => (more::Cap::ALL.iter().map(|c| c.name().to_string()).collect(), more::Cap::ALL.iter().position(|&c| c == more::pv_tab())),
@@ -692,6 +701,12 @@ pub fn choose(op: Op, i: usize) -> Done {
             }
         }
         (Op::Accent, _) => o.accent_set(i),
+        (Op::WuTime, _) => {
+            if let Some((h, m)) = WU_TIMES.get(i).and_then(|t| t.split_once(':')).and_then(|(h, m)| Some((h.parse().ok()?, m.parse().ok()?))) {
+                o.wu_schedule(wu::Sched::At(h, m));
+                wupage::set_chips(false);
+            }
+        }
         (Op::AppSort, _) => APP_SORT.set(i.min(APP_SORTS.len() - 1)),
         (Op::PvTab, _) => {
             if let Some(&c) = more::Cap::ALL.get(i) {
@@ -802,6 +817,9 @@ pub const POWER_PAGE: usize = 2;
 thread_local! { static EXPANDED: RefCell<Option<String>> = const { RefCell::new(None) } } // the adapter whose details show
 thread_local! { static RADIO: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) } }
 thread_local! { static PROGRAMS: RefCell<Option<Vec<ext::App>>> = const { RefCell::new(None) } } // read when the Apps page opens
+/// The times the "Pick a time" list of a scheduled restart offers.
+pub const WU_TIMES: [&str; 6] = ["18:00", "20:00", "22:00", "23:30", "01:00", "04:00"];
+
 thread_local! { static APP_SORT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) } } // 0 name, 1 size, 2 install date
 
 /// The ways the Apps page orders its list.
@@ -1178,61 +1196,6 @@ fn apps_rows(q: &str) -> Vec<Group> {
     vec![head, g]
 }
 
-fn wu_rows() -> Vec<Group> {
-    let o = os();
-    let (s, extra) = (o.wu_state(), o.wu_extra());
-    let n = s.found.as_ref().map_or(0, Vec::len);
-    let installed = extra.last_install.map(|w| tf!("установлено: {}", "installed {}", more::when_sentence(w)));
-    let (title, sub, tile) = match (&s.busy, &s.found) {
-        (Some(b), _) => (b.clone(), extra.progress.map_or_else(|| t!("Это займёт некоторое время · можно работать", "This takes a while \u{b7} you can keep working").to_string(), |p| tf!("{}% · можно работать", "{}% \u{b7} you can keep working", p)), Tile::Lit(look::REFRESH)),
-        (_, _) if extra.restart => (t!("Установлено. Перезагрузите, чтобы завершить", "Installed. Restart to finish").to_string(), t!("Windows завершит обновление при перезагрузке", "Windows finishes the updates while it restarts").to_string(), Tile::Soft(look::WARN, Tone::Warn)),
-        // not looked in this window yet: what Windows itself last did, when it says
-        (_, None) => match extra.last_check {
-            Some(w) => (tf!("Windows проверяла: {}", "Windows last checked {}", more::when_sentence(w)), installed.clone().unwrap_or_else(|| t!("Нажмите «Проверить», чтобы увидеть, что ждёт установки", "Check for updates to see what is waiting").to_string()), Tile::Quiet(look::REFRESH)),
-            None => (t!("Ещё не проверялось", "Not checked yet", ja: "まだ確認していません", pt: "Ainda não verificado", zh: "尚未检查").to_string(), s.note.clone(), Tile::Quiet(look::REFRESH)),
-        },
-        // the verdict is the title; the line under it says when Windows last looked (and what it last installed)
-        (_, Some(f)) if f.is_empty() => {
-            let looked = extra.last_check.map(|w| tf!("Последняя проверка: {}", "Last checked {}", more::when_sentence(w)));
-            let sub = [looked, installed.clone()].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ");
-            (t!("Всё установлено", "You\u{2019}re up to date", ja: "最新の状態です", pt: "Atualizado", zh: "已是最新").to_string(), sub, Tile::Soft(look::CHECK, Tone::Good))
-        }
-        (_, Some(_)) => (tf!("Доступно обновлений: {}", "{} updates are available", ja: "利用可能な更新プログラム: {}", pt: "Atualizações disponíveis: {}", zh: "可用更新：{}", n), t!("Для установки нужны права администратора", "Installing needs administrator rights").to_string(), Tile::Soft(look::WARN, Tone::Warn)),
-    };
-    let cmd = if s.found.as_ref().is_some_and(|f| !f.is_empty()) && s.busy.is_none() { Cmd::Install } else { Cmd::Check };
-    let mut status = Line::new(Row::Item(title, String::new(), cmd)).key("wu-status").subtitle(sub).tile(tile).weight(600).busy(s.busy.is_some());
-    (status.big, status.restart) = (true, extra.restart && s.busy.is_none());
-    // what the disabled button says while something runs: installing what was found, or looking
-    status.val = if s.found.as_ref().is_some_and(|f| !f.is_empty()) { t!("Установка", "Installing") } else { t!("Проверка", "Checking") }.into();
-    let mut gs = vec![Group::new("").rows(vec![status])];
-    if s.busy.is_some() || n > 0 {
-        let rows = s
-            .found
-            .iter()
-            .flatten()
-            .take(30)
-            .enumerate()
-            .map(|(i, t)| {
-                // what each update is doing: the first takes the progress of the run, the next waits for it (the mockup's reading)
-                let state = if extra.restart {
-                    t!("Установлено · ждёт перезагрузки", "Installed \u{b7} waiting for restart").to_string()
-                } else {
-                    match (s.busy.is_some(), extra.progress) {
-                        (true, Some(p)) if i == 0 || p > 85 => tf!("Установка · {}%", "Installing \u{b7} {}%", if i == 0 { (u32::from(p) * 115 / 100).min(100) } else { ((u32::from(p) - 85) * 66 / 10).min(100) }),
-                        (true, Some(_)) => t!("Ждёт", "Waiting").to_string(),
-                        (true, None) => String::new(),
-                        (false, _) => t!("Готово к загрузке", "Ready to download").to_string(),
-                    }
-                };
-                Line::new(Row::Info(t.clone(), String::new())).subtitle(state).tile(Tile::Quiet(look::DOWNLOAD))
-            })
-            .collect();
-        gs.push(Group::new(t!("Обновления", "Updates")).rows(rows));
-    }
-    gs.push(Group::new("").foot(t!("Сам WinRust обновляется отдельно: настройки панели → Обновления.", "WinRust itself updates separately: Bar settings \u{2192} Updates.")));
-    gs
-}
-
 /// The walls the window offers: only the demo has any.
 fn wall_tiles() -> Vec<Wall> {
     os().wallpapers()
@@ -1341,7 +1304,7 @@ fn page_with(i: usize, apps: &str) -> Page {
         PRIVACY_PAGE => more::privacy_rows(),
         KEYBOARD_PAGE => more::keyboard_rows(),
         TIME_PAGE => more::time_rows(),
-        WU_PAGE => wu_rows(),
+        WU_PAGE => wupage::wu_rows(),
         _ => about_rows(),
     };
     Page { title: page_title(i), groups }

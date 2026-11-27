@@ -4,7 +4,8 @@
 use super::*;
 use crate::{
     more::{Cap, Flag, Gauge, Opt, Who},
-    app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_BODY, P_CTL, P_CTL2, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
+    wupage,
+    app::{ID_ARR, ID_DLG_KEEP, ID_DLG_REVERT, ID_GACT, ID_HIT, ID_IDENTIFY, ID_NAV, ID_WALL, P_ACT, P_BODY, P_CTL, P_FIELD, P_MUTE, P_SEG, Settings, TAG_PICK, row_id},
     demo::{self, Demo},
 };
 use std::rc::Rc;
@@ -452,14 +453,11 @@ fn the_night_light_strength_is_four_steps_that_reach_choose() {
 #[test]
 fn the_buttons_of_item_rows_run_the_same_commands() {
     type Pred = fn(&Line) -> bool;
-    let cases: [(&str, Pred, &str); 7] = [
+    let cases: [(&str, Pred, &str); 4] = [
         ("network", |l| matches!(&l.row, Row::Item(_, _, Cmd::Vpn(_))), "vpn_dial Work VPN"),
         ("power", |l| matches!(&l.row, Row::Item(_, _, Cmd::CleanTemp)), "temp_clean"),
         ("power", |l| matches!(&l.row, Row::Item(_, _, Cmd::EmptyBin)), "bin_empty"),
         ("bt-searching", |l| matches!(&l.row, Row::Item(_, _, Cmd::BtPair(_))), "bt_pair px"),
-        ("wu-up-to-date", |l| matches!(&l.row, Row::Item(_, _, Cmd::Check)), "wu_check"),
-        ("wu-available", |l| matches!(&l.row, Row::Item(_, _, Cmd::Install)), "wu_install"),
-        ("update", |l| matches!(&l.row, Row::Item(_, _, Cmd::Check)), "wu_check"),
     ];
     for (state, pred, expect) in cases {
         let (mut s, d) = win(state);
@@ -1249,41 +1247,162 @@ fn a_wallpaper_tile_reaches_the_system_and_the_current_one_is_marked() {
     assert_eq!(d.log(), vec!["wallpaper_pick"]);
 }
 
-#[test]
-fn the_update_status_says_when_windows_last_looked_and_not_the_verdict_twice() {
-    let (s, _d) = win("wu-up-to-date");
-    let st = &s.pg.groups[0].rows[0];
-    assert!(st.sub.contains("17:02"), "{}", st.sub);
-    assert_ne!(st.sub, os().wu_state().note);
-    assert_ne!(st.sub, st.row.label(), "the title is the verdict, the line under it is not");
-    assert!(st.sub.contains('\u{b7}'), "and the last installation: {}", st.sub);
-    // not looked in this window yet: Windows' own date instead of a bare "Not checked yet"
-    let d = Rc::new(Demo::for_state("wu-up-to-date"));
-    os::set_os(d.clone());
-    let mut w = Settings::new(WU_PAGE);
-    w.reread();
-    assert!(!w.pg.groups[0].rows[0].sub.is_empty());
+fn card(s: &Settings) -> &wupage::WuCard {
+    match &s.pg.groups[0].extra {
+        Extra::WuCard(w) => w,
+        _ => panic!("the status card is first"),
+    }
+}
+
+fn acts(s: &Settings) -> Vec<wupage::WuAct> {
+    card(s).btns.iter().map(|b| b.act).collect()
 }
 
 #[test]
-fn restart_now_needs_a_second_click_and_only_then_restarts() {
+fn every_state_of_the_update_page_has_the_card_the_design_draws() {
+    use wupage::WuAct::*;
+    let (s, _d) = win("wu-stale");
+    assert_eq!(acts(&s), [Check]);
+    let (s, _d) = win("update-checking");
+    assert!(card(&s).spin);
+    assert_eq!(acts(&s), [Cancel]);
+    let (s, _d) = win("wu-up-to-date");
+    assert_eq!((acts(&s), card(&s).tone), (vec![Check], Tone::Good));
+    assert!(!card(&s).sub.is_empty() && !card(&s).sub2.is_empty(), "when it last looked, and what it last installed");
+    let (s, _d) = win("wu-available");
+    let c = card(&s);
+    assert_eq!(acts(&s), [Install]);
+    assert!(c.btns[0].shield && !c.btns[0].dis && !c.sub2.is_empty(), "not an administrator: the shield, and the line that Windows asks");
+    assert_eq!(s.pg.groups[1].rows.len(), 3, "the required ones are ticked and listed");
+    assert!(&s.pg.groups[1].rows.iter().all(|l| matches!(&l.row, Row::Upd(u) if matches!(u.mode, wupage::UMode::Pick(true)))));
+    assert!(&s.pg.groups[2].rows.is_empty(), "the optional ones are folded");
+    let (s, _d) = win("wu-available-optional");
+    assert_eq!(s.pg.groups[2].rows.len(), 3);
+    assert!(&s.pg.groups[2].rows.iter().all(|l| matches!(&l.row, Row::Upd(u) if matches!(u.mode, wupage::UMode::Pick(false)))), "optional updates start unticked");
+    let (s, _d) = win("wu-downloading");
+    assert_eq!((acts(&s), card(&s).prog.as_ref().map(|p| p.0.round() as u32)), (vec![Cancel], Some(38)));
+    assert_eq!(s.pg.groups[1].rows.len(), 3);
+    let (s, _d) = win("wu-installing");
+    assert!(card(&s).btns[0].busy && card(&s).btns[0].dis, "installing cannot be cancelled");
+    let (s, _d) = win("wu-restart");
+    assert_eq!((acts(&s), card(&s).chips.is_none()), (vec![Sched, RestartDlg], true));
+    assert_eq!(s.pg.groups.iter().flat_map(|g| &g.rows).filter(|l| matches!(&l.row, Row::Upd(_))).count(), 2, "the two that wait for the restart");
+    let (s, _d) = win("wu-restart-schedule");
+    assert_eq!(card(&s).chips.as_ref().map(|c| c.0.len()), Some(3));
+    let (s, _d) = win("wu-scheduled");
+    assert_eq!(acts(&s), [Unsched, Sched]);
+    assert!(card(&s).title.contains("03:00"));
+    let (s, _d) = win("wu-failed");
+    assert_eq!(acts(&s), [Details, Install]);
+    assert!(card(&s).err.as_ref().is_some_and(|e| e.2.contains("0x800f0922")));
+    let bad = s.pg.groups.iter().flat_map(|g| &g.rows).filter(|l| matches!(&l.row, Row::Upd(u) if matches!(&u.mode, wupage::UMode::Icon { tone: Tone::Bad, .. }))).count();
+    assert_eq!(bad, 1, "one update failed, the others installed");
+    let (s, _d) = win("wu-history");
+    assert!(s.pg.groups.iter().filter(|g| g.title.contains('\u{b7}') || g.rows.iter().any(|l| l.key.starts_with("h:"))).count() >= 3, "grouped by kind");
+}
+
+#[test]
+fn the_ticks_the_buttons_and_the_links_of_the_update_page_reach_the_system() {
+    let (mut s, d) = win("wu-available");
+    let upd = |id: &str| { let k = format!("upd:{id}"); move |l: &Line| l.key == k };
+    // Download and install: the ticked ones (the required three, not the optional)
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_install cu,net,def"]);
+    // a tick: the row toggles, the card counts and the button says how many
+    let (mut s, d) = win("wu-available");
+    let sub = card(&s).sub.clone();
+    press(&mut s, upd("net"), P_BODY);
+    assert_ne!(card(&s).sub, sub, "the size to download follows the ticks");
+    assert!(card(&s).btns[0].label.contains("(2)"), "{}", card(&s).btns[0].label);
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_install cu,def"]);
+    // Clear all, then nothing can be installed
+    let (mut s, d) = win("wu-available");
+    let at = ID_GACT + 1;
+    click(&mut s, at);
+    assert!(card(&s).btns[0].dis && s.pg.groups[1].rows.iter().all(|l| matches!(&l.row, Row::Upd(u) if matches!(u.mode, wupage::UMode::Pick(false)))));
+    click(&mut s, crate::draw::ID_WU);
+    assert!(d.log().is_empty(), "nothing is ticked: nothing is asked of Windows");
+    // the optional ones: Show, then a tick makes the update part of the run
+    let (mut s, d) = win("wu-available");
+    let at = ID_GACT + 2;
+    click(&mut s, at);
+    s.number_lines(); // what a frame does: the rows that just appeared get their numbers
+    press(&mut s, upd("rt"), P_BODY);
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_install cu,net,def,rt"]);
+    // the KB link opens Microsoft's page for the number
+    d.clear_log();
+    let (mut s, d) = win("wu-available");
+    press(&mut s, upd("cu"), P_CTL);
+    assert_eq!(d.log(), vec!["open_link https://support.microsoft.com/help/5046617"]);
+    // an update without a KB has no link
+    let (mut s, d) = win("wu-available-optional");
+    press(&mut s, upd("nv"), P_CTL);
+    assert!(d.log().is_empty());
+    // the rows at the bottom
+    press(&mut s, |l| l.key == "wu-uninstall", P_BODY);
+    press(&mut s, |l| l.key == "wu-advanced", P_BODY);
+    assert_eq!(d.log(), vec!["open_link shell:::{d450a8a1-9568-45c7-9c0e-b4f9fb4537bd}", "open_link ms-settings:windowsupdate-options"]);
+    // Check, Cancel
+    let (mut s, d) = win("wu-stale");
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_check"]);
+    let (mut s, d) = win("wu-downloading");
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log(), vec!["wu_cancel"]);
+}
+
+#[test]
+fn a_restart_asks_first_and_can_be_scheduled_cancelled_and_retried() {
     let (mut s, d) = win("wu-restart");
-    let st = |l: &Line| l.key == "wu-status";
-    assert!(s.pg.groups[0].rows[0].restart);
-    press(&mut s, st, P_CTL2);
-    assert!(d.log().is_empty(), "the first click only arms the button: {:?}", d.log());
-    assert_eq!(s.armed.as_deref(), Some("wu-restart"));
-    let cx = press(&mut s, st, P_CTL2);
+    // Restart now opens the dialog that names the apps; nothing restarts yet
+    click(&mut s, crate::draw::ID_WU + 1);
+    assert_eq!(s.rd.as_ref().map(Vec::len), Some(6));
+    assert!(d.log().is_empty());
+    click(&mut s, app::ID_RD_NO);
+    assert!(s.rd.is_none() && d.log().is_empty());
+    click(&mut s, crate::draw::ID_WU + 1);
+    assert!(s.key(0x1B, Mods::default(), &mut Cx::default()), "Esc closes it");
+    assert!(s.rd.is_none() && d.log().is_empty());
+    click(&mut s, crate::draw::ID_WU + 1);
+    let cx = click(&mut s, app::ID_RD_OK);
     assert_eq!(d.log(), vec!["restart_now"]);
     assert_eq!(toasts(&cx).len(), 1);
-    // "Later" does nothing to the machine
-    d.clear_log();
-    press(&mut s, st, P_CTL);
-    assert!(d.log().is_empty());
-    // leaving the page disarms it
-    press(&mut s, st, P_CTL2);
-    click(&mut s, ID_NAV);
-    assert!(s.armed.is_none());
+    // Schedule... shows the chips; a chip sets the restart, the card says when; Cancel restart takes it back
+    let (mut s, d) = win("wu-restart");
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(card(&s).chips.as_ref().map(|c| c.0.len()), Some(3));
+    click(&mut s, crate::draw::ID_WUCHIP);
+    assert_eq!(d.log(), vec!["wu_schedule At(3, 0)"]);
+    assert!(card(&s).title.contains("03:00"), "{}", card(&s).title);
+    click(&mut s, crate::draw::ID_WU);
+    assert_eq!(d.log().last().map(String::as_str), Some("wu_unschedule"));
+    assert!(card(&s).chips.is_none(), "back to the restart card, chips folded");
+    // "In 1 hour" and the list of times
+    click(&mut s, crate::draw::ID_WU);
+    click(&mut s, crate::draw::ID_WUCHIP + 1);
+    assert_eq!(d.log().last().map(String::as_str), Some("wu_schedule In(60)"));
+    let (mut s, d) = win("wu-restart-schedule");
+    let cx = click(&mut s, crate::draw::ID_WUCHIP + 2);
+    let (tag, items) = menu(&cx).expect("a list of times");
+    assert_eq!((tag, items.len()), (TAG_PICK, WU_TIMES.len()));
+    s.command(TAG_PICK, 2, &mut Cx::default());
+    assert_eq!(d.log(), vec!["wu_schedule At(22, 0)"]);
+    // a failed run: Details unfolds the error, Try again tries the same updates
+    let (mut s, d) = win("wu-failed");
+    click(&mut s, crate::draw::ID_WU);
+    assert!(card(&s).err.is_none(), "Details folds it");
+    click(&mut s, crate::draw::ID_WU + 1);
+    assert_eq!(d.log(), vec!["wu_install cu,net,def"]);
+    // the history: Show all groups it, Show less folds it
+    let (mut s, _d) = win("wu-up-to-date");
+    let g = 1;
+    assert_eq!(s.pg.groups[g].rows.len(), 3);
+    click(&mut s, ID_GACT + g as Id);
+    assert!(s.pg.groups.iter().filter(|g| g.rows.iter().any(|l| l.key.starts_with("h:"))).count() >= 3);
+    click(&mut s, ID_GACT + g as Id);
+    assert_eq!(s.pg.groups[g].rows.len(), 3);
 }
 
 #[test]

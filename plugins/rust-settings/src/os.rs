@@ -30,14 +30,17 @@ pub struct Battery {
 }
 
 /// What the Windows Update row shows beyond `wu::State`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WuExtra {
-    pub progress: Option<u8>,
     /// Windows needs a restart to finish updates.
     pub restart: bool,
     /// When Windows (or this window) last looked for updates, and when it last installed some.
     pub last_check: Option<crate::more::When>,
     pub last_install: Option<crate::more::When>,
+    /// The latest of the update history.
+    pub history: Vec<wu::Hist>,
+    /// The hours Windows will not restart in.
+    pub active: Option<(u32, u32)>,
 }
 
 pub trait Os {
@@ -130,7 +133,19 @@ pub trait Os {
     /// Restarts the PC now (the user confirmed); false when Windows refused.
     fn restart_now(&self) -> bool;
     fn wu_check(&self, done: Ping);
-    fn wu_install(&self, done: Ping);
+    /// Downloads and installs the updates with these ids.
+    fn wu_install(&self, ids: Vec<String>, done: Ping);
+    /// Stops a search or a download that is going on.
+    fn wu_cancel(&self);
+    /// Sets a restart for later (`shutdown /r /t`); false when Windows refused.
+    fn wu_schedule(&self, s: wu::Sched) -> bool;
+    fn wu_unschedule(&self);
+    /// This window runs with administrator rights.
+    fn wu_admin(&self) -> bool;
+    /// The apps with a window open now: what a restart would close.
+    fn restart_apps(&self) -> Vec<String>;
+    /// Opens an address (a web page, a shell location, an ms-settings: page) the way the shell does.
+    fn open_link(&self, target: &str);
 
     // ---- personalization, about
     fn night_kelvin(&self) -> u32;
@@ -455,7 +470,26 @@ impl Os for Live {
         let i = wu::info();
         // our own search of this session may be newer than what Windows wrote down
         let last = i.checked.into_iter().chain(i.search).max();
-        WuExtra { progress: None, restart: i.restart, last_check: last.and_then(sysx::when_unix), last_install: i.install.and_then(sysx::when_unix) }
+        let history = i.history.iter().map(|(group, title, kb, t, ok, code)| wu::Hist { group: *group, title: title.clone(), kb: kb.clone(), when: sysx::when_unix(*t).map_or_else(String::new, crate::more::when_text), ok: *ok, code: code.clone() }).collect();
+        WuExtra { restart: i.restart, last_check: last.and_then(sysx::when_unix), last_install: i.install.and_then(sysx::when_unix), history, active: i.active }
+    }
+    fn wu_cancel(&self) {
+        wu::cancel();
+    }
+    fn wu_schedule(&self, s: wu::Sched) -> bool {
+        wu::schedule(s)
+    }
+    fn wu_unschedule(&self) {
+        wu::cancel_restart();
+    }
+    fn wu_admin(&self) -> bool {
+        winrust_common::proc::elevated()
+    }
+    fn restart_apps(&self) -> Vec<String> {
+        wu::open_apps()
+    }
+    fn open_link(&self, target: &str) {
+        sysx::open_link(target);
     }
     fn restart_now(&self) -> bool {
         wu::restart()
@@ -463,8 +497,8 @@ impl Os for Live {
     fn wu_check(&self, done: Ping) {
         wu::check(done);
     }
-    fn wu_install(&self, done: Ping) {
-        wu::install(done);
+    fn wu_install(&self, ids: Vec<String>, done: Ping) {
+        wu::install(ids, done);
     }
 
     fn night_kelvin(&self) -> u32 {
