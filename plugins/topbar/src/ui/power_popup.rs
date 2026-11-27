@@ -152,7 +152,7 @@ impl PowerPanel {
         c.text(text, Rect::new(x0, k.y + 181.0, tw + 4.0, 17.0), tf, DIM, Align::Start);
         let chip = Rect::new(x0 + tw + space, k.y + 180.0, cw, 19.0);
         c.fill(chip, 7.0, Rgba::white(0.1));
-        c.text(&count, chip, cf, Rgba::white(1.0), Align::Center);
+        c.text(&count, chip, cf, Rgba::pure_white(1.0), Align::Center);
 
         // the amber warning
         let warn = t!(
@@ -201,6 +201,7 @@ fn secs_left(age: u64) -> u64 {
 
 /// CSS `filter: brightness(1.15)`.
 fn brighter(c: Rgba) -> Rgba {
+    let c = c.themed(); // brightness of what is drawn, in either mode
     Rgba::new((c.r * 1.15).min(1.0), (c.g * 1.15).min(1.0), (c.b * 1.15).min(1.0), c.a)
 }
 

@@ -176,6 +176,7 @@ pub(crate) unsafe fn render(args: &[String]) {
                 "battery" => battery = true,
                 "0" | "1" | "2" => size = a.parse().unwrap_or(1),
                 "bottom" | "left" | "right" => side = Side::parse(a),
+                "light" | "dark" => {} // the mode: set once in main
                 s => style = Style::parse(s),
             },
         }
@@ -311,9 +312,11 @@ impl qp::Host for Demo {
     fn tick(&mut self, _wifi_page: bool) {}
 
     fn state(&mut self) -> qp::State {
-        let status = ["Not connected", "Off", "Off", "Off", "Off", "Win+Ctrl+L", "Off", "Off", "Win+P"];
-        let on_text = ["Home network", "On", "On", "On", "On", "Win+Ctrl+L", "On", "On", "Win+P"];
-        let tiles = (0..9).map(|i| qp::Tile { on: self.on.contains(&i), status: (if self.on.contains(&i) { on_text[i] } else { status[i] }).into() }).collect();
+        let status = ["Not connected", "Off", "Off", "Off", "Off", "Off", "Off", "Off", "Win+P"];
+        let on_text = ["Home network", "On", "On", "On", "On", "On", "On", "On", "Win+P"];
+        // Dark style is on while the mode is dark, whatever `on=` says
+        let on = |i: usize| if i == 5 { !i18n::style::light() } else { self.on.contains(&i) };
+        let tiles = (0..9).map(|i| qp::Tile { on: on(i), status: (if on(i) { on_text[i] } else { status[i] }).into() }).collect();
         qp::State {
             tiles,
             vol: self.vol,
@@ -469,6 +472,7 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 "alignl" => alignl = true,
                 "recent" => recent = true,
                 "bottom" | "left" | "right" => side = Side::parse(a),
+                "light" | "dark" => {} // the mode: set once in main
                 s => style = Style::parse(s),
             },
         }

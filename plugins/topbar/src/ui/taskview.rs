@@ -663,7 +663,7 @@ impl Content for Switcher {
             c.hicon(card.icon.0, Rect::new(cell.x + 10.0, cell.y + 11.0, 18.0, 18.0), 1.0);
             let cross = self.close_at(i);
             let name = Rect::new(cell.x + 36.0, cell.y + 8.0, cross.x - 8.0 - (cell.x + 36.0), 24.0);
-            c.text_fit(&card.title, name, Font::new(12.5, 500), SUB.mix(Rgba::white(1.0), on), Align::Start);
+            c.text_fit(&card.title, name, Font::new(12.5, 500), SUB.mix(Rgba::strong(1.0), on), Align::Start);
             let shown = on.max(f.hover(i as i32, 140, EASE));
             if shown > 0.01 {
                 let hot = f.hover(CLOSE_BASE + i as i32, 140, EASE);

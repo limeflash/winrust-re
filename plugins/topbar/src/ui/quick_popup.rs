@@ -90,7 +90,7 @@ const BLUETOOTH: &str = "M7 7l10 10-5 4V3l5 4L7 17";
 const AIRPLANE: &str = "M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5z";
 const ACCESS: &str = "M12 5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM5 8l7 1.5L19 8M12 9.5V15M9 21l3-6 3 6";
 const SAVER: &str = "M13 2L5 13h6l-1 9 8-12h-6z";
-const CAPTIONS: &str = "M3 6h18v12H3zM9.5 10.5a2 2 0 1 0 0 3M16 10.5a2 2 0 1 0 0 3";
+const DARK: &str = "M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z";
 const HOTSPOT: &str = "M12 13a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM8.5 16a5 5 0 0 1 0-8M15.5 8a5 5 0 0 1 0 8M5.5 18.5a9 9 0 0 1 0-13M18.5 5.5a9 9 0 0 1 0 13";
 const MOON: &str = "M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7zM16.5 3.2l.55 1.25 1.25.55-1.25.55-.55 1.25-.55-1.25L14.7 5l1.25-.55zM20 8.2l.4.9.9.4-.9.4-.4.9-.4-.9-.9-.4.9-.4z";
 const PROJECT: &str = "M3 5h18v11H3zM8 20h8M12 16v4";
@@ -101,7 +101,7 @@ const ICONS: [Icon; 9] = [
     Icon { on: AIRPLANE, off: AIRPLANE, filled: false },
     Icon { on: ACCESS, off: ACCESS, filled: false },
     Icon { on: SAVER, off: SAVER, filled: false },
-    Icon { on: CAPTIONS, off: CAPTIONS, filled: false },
+    Icon { on: DARK, off: DARK, filled: false },
     Icon { on: HOTSPOT, off: HOTSPOT, filled: false },
     Icon { on: MOON, off: SUN, filled: true },
     Icon { on: PROJECT, off: PROJECT, filled: false },
@@ -114,7 +114,7 @@ fn label(i: usize) -> &'static str {
         t!("Авиарежим", "Airplane mode", ja: "機内モード", pt: "Modo avião", zh: "飞行模式"),
         t!("Спец. возможности", "Accessibility", ja: "アクセシビリティ", pt: "Acessibilidade", zh: "辅助功能"),
         t!("Экономия энергии", "Energy saver", ja: "省エネ", pt: "Economia de energia", zh: "节能模式"),
-        t!("Субтитры", "Live captions", ja: "ライブ キャプション", pt: "Legendas ao vivo", zh: "实时字幕"),
+        t!("Тёмный стиль", "Dark style", ja: "ダーク スタイル", pt: "Estilo escuro", zh: "深色样式"),
         t!("Точка доступа", "Mobile hotspot", ja: "モバイル ホットスポット", pt: "Hotspot móvel", zh: "移动热点"),
         t!("Ночной свет", "Night light", ja: "夜間モード", pt: "Luz noturna", zh: "夜间模式"),
         t!("Проецировать", "Project", ja: "表示", pt: "Projetar", zh: "投影"),
@@ -672,6 +672,7 @@ fn fit<'a>(c: &mut Canvas<'_>, s: &'a str, font: Font, w: f32) -> Cow<'a, str> {
 
 /// CSS `filter: brightness(k)`.
 fn brighter(c: Rgba, k: f32) -> Rgba {
+    let c = c.themed();
     Rgba::new((c.r * k).min(1.0), (c.g * k).min(1.0), (c.b * k).min(1.0), c.a)
 }
 
@@ -910,7 +911,7 @@ impl QuickPanel {
         let on = f.tween(SWITCH, 1, f32::from(wf.on), 160, EASE);
         let knob = f.tween(SWITCH, 2, f32::from(wf.on), 180, SPRING);
         c.fill(sw, 10.0, Rgba::white(0.16).mix(accent, on));
-        c.circle(sw.x + 2.0 + 8.0 + 16.0 * knob, sw.cy(), 8.0, Rgba::white(1.0));
+        c.circle(sw.x + 2.0 + 8.0 + 16.0 * knob, sw.cy(), 8.0, Rgba::pure_white(1.0));
 
         if let Some((ssid, text)) = &self.pass {
             // the password of a new network
@@ -1039,7 +1040,7 @@ fn slider(c: &mut Canvas<'_>, f: &mut Frame<'_>, id: i32, track: Rect, v: f32, f
     let knob = Rect::new(track.x + 2.0 + (track.w - 28.0) * v, track.y + 2.0, 24.0, 24.0);
     c.transformed(knob.cx(), knob.cy(), grow, 0.0, 0.0, |c| {
         c.shadow(knob, 12.0, 1.0, 3.0, Rgba::css(0, 0, 0, 0.35));
-        c.circle(knob.cx(), knob.cy(), 12.0, Rgba::white(1.0));
+        c.circle(knob.cx(), knob.cy(), 12.0, Rgba::pure_white(1.0));
         c.ring(knob, 12.0, 0.5, Rgba::css(0, 0, 0, 0.2));
     });
 }

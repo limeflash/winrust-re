@@ -318,7 +318,7 @@ impl Content for WinxPanel {
                         Glyph::Icon(icon) => c.hicon(icon.0, at, 1.0),
                         Glyph::Plate(d, from, to) => {
                             c.gradient_diagonal(at, 7.0, *from, *to);
-                            c.icon(d, (at.cx(), at.cy()), 15.0, 2.0, Rgba::white(1.0), 0.0);
+                            c.icon(d, (at.cx(), at.cy()), 15.0, 2.0, Rgba::pure_white(1.0), 0.0);
                         }
                     }
                     c.text_fit(&t.label, Rect::new(r.x + 2.0, at.y + 26.0 + 6.0, r.w - 4.0, 14.0), Font::new(11.0, 500), Rgba::css(201, 205, 216, 1.0), Align::Center);
@@ -455,7 +455,7 @@ mod tests {
     use super::*;
 
     fn menu(max_h: f32) -> WinxPanel {
-        let tiles = (0..4).map(|i| Tile { label: format!("T{i}"), glyph: Glyph::Plate("M0 0", Rgba::white(1.0), Rgba::white(1.0)) }).collect();
+        let tiles = (0..4).map(|i| Tile { label: format!("T{i}"), glyph: Glyph::Plate("M0 0", Rgba::pure_white(1.0), Rgba::pure_white(1.0)) }).collect();
         let item = |m: char| Row::Item(Item::new("M0 0", "Installed apps", m));
         let rows = vec![item('F'), item('O'), Row::Rule, item('A'), Row::Rule, Row::Item(Item::new("M0 0", "Shut down or sign out", 'U').submenu()), item('D')];
         let sub = vec![item('L'), Row::Rule, item('S')];

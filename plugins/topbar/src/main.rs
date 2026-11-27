@@ -1382,6 +1382,16 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
     }
 }
 
+/// The mode changed (the Dark style tile, or Windows itself): the bar and whatever is open are painted again in it.
+unsafe fn theme_changed() {
+    let bar = BAR.load(Relaxed) as HWND;
+    if !bar.is_null() {
+        InvalidateRect(bar, null(), 0);
+    }
+    ui::panel::refresh();
+    ui::notice_pop::changed(None);
+}
+
 /// Hash of everything the bar paints from polled state.
 unsafe fn view_sig() -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1451,7 +1461,7 @@ unsafe fn dominant(ic: HICON) -> Option<ui::gfx::Rgba> {
         return None;
     }
     let c = ui::gfx::Rgba::new(best.1 / best.0, best.2 / best.0, best.3 / best.0, 1.0);
-    Some(c.mix(ui::gfx::Rgba::white(1.0), 0.12))
+    Some(c.mix(ui::gfx::Rgba::pure_white(1.0), 0.12))
 }
 
 thread_local! {
@@ -2492,6 +2502,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_DISPLAYCHANGE => place(hwnd),
+        // Windows' own Settings (or our Dark style tile) switched the theme: read it again and paint everything in it
+        WM_SETTINGCHANGE if i18n::style::is_color_change(lp) => {
+            if i18n::style::follow_system() {
+                theme_changed();
+            }
+            return 0;
+        }
         WM_DESTROY => {
             pacing::set(hwnd as isize, false);
             let mut ab: APPBARDATA = zeroed();
@@ -2519,6 +2536,10 @@ fn main() {
             set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // a killed bar's reserved strip
             announce(); // a killed bar took its tray icons with it; apps re-register with explorer
             return;
+        }
+        // the renderers draw dark unless `light` is among the arguments: the registry's choice is the live bar's, not theirs
+        if ["--render", "--render-panel", "--render-thumbs", "--bench", "--selftest"].iter().any(|f| std::env::args().any(|a| a == *f)) {
+            i18n::style::set_light(std::env::args().any(|a| a == "light"));
         }
         // `topbar --render <file.png> [classic|floating|dock] [bottom|left|right] [0|1|2] ...`: one frame of the bar into a PNG, no windows
         if let Some(i) = std::env::args().position(|a| a == "--render") {
@@ -2584,6 +2605,7 @@ fn main() {
         let (mut gtok, mut gin): (usize, GdiplusStartupInput) = (0, zeroed());
         gin.GdiplusVersion = 1;
         GdiplusStartup(&mut gtok, &gin, null_mut()); // anti-aliased shapes; fill() falls back to GDI if this failed
+        i18n::style::follow_system(); // light or dark, as Windows has it: read here and again on its broadcast
         TB_MSG.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()));
         SH_MSG.set(RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()));
         SetProcessDPIAware();

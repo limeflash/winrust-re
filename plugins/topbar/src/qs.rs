@@ -407,7 +407,7 @@ impl qp::Host for Live {
             tile(air == Some(true), onoff(air)),
             tile(acc, onoff(Some(acc))),
             tile(eco, onoff(Some(eco))),
-            tile(false, "Win+Ctrl+L".into()),
+            tile(!i18n::style::light(), onoff(Some(!i18n::style::light()))), // Dark style: on while the mode is dark
             tile(hot == Some(true), onoff(hot)),
             tile(night == Some(true), onoff(night)),
             tile(false, "Win+P".into()),
@@ -442,7 +442,10 @@ impl qp::Host for Live {
                 2 => crate::quick::set(true, !crate::quick::airplane().unwrap_or(false)),
                 3 => cx.close_then(|| accessibility_menu()),
                 4 => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
-                5 => cx.close_then(|| keys(&[VK_LWIN, VK_CONTROL, b'L' as u16])), // live captions
+                5 => {
+                    i18n::style::set_system_light(!i18n::style::light()); // Windows' own switch: system and apps, and the broadcast
+                    crate::theme_changed();
+                }
                 6 => match crate::quick::hotspot() {
                     Some(on) => crate::quick::set_hotspot(!on),
                     None => {

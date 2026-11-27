@@ -145,7 +145,7 @@ impl Content for PreviewPanel {
                     let x = Self::close(i);
                     c.faded(hot, |c| {
                         c.fill(x, 7.0, Rgba::css(229, 72, 77, hot_x));
-                        c.icon(CROSS, (x.cx(), x.cy()), 11.0, 2.6, DIM.mix(Rgba::white(1.0), hot_x), 0.0);
+                        c.icon(CROSS, (x.cx(), x.cy()), 11.0, 2.6, DIM.mix(Rgba::pure_white(1.0), hot_x), 0.0);
                     });
                 });
             });
