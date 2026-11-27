@@ -1728,7 +1728,8 @@ impl Settings {
                 let sub = if waiting > 0 { tf!("Обновлений завершат установку: {}", "{} updates finish installing", waiting) } else { t!("Windows завершит обновления при перезагрузке", "Windows finishes the updates while it restarts").to_string() };
                 c.text_fit(&sub, Rect::new(t.x + 58.0, y + 24.0, dw - 80.0, 16.0), BODY, T3, Align::Start);
                 y += 44.0 + 12.0;
-                let parts = [(t!("Закроются приложения: ", "These apps will close: "), false), (line.as_str(), true), (t!(" Сначала сохраните работу.", " Save your work first."), false)];
+                let line_dot = format!("{line}.");
+        let parts = [(t!("Закроются приложения: ", "These apps will close: "), false), (line_dot.as_str(), true), (t!("Сначала сохраните работу.", "Save your work first."), false)];
                 let parts: Vec<(&str, bool)> = if line.is_empty() { vec![(t!("Сначала сохраните свою работу.", "Save your work first."), false)] } else { parts.to_vec() };
                 paint_rich(c, Rect::new(r.x + 22.0, y, dw - 44.0, body_h), &parts);
                 y += body_h + 12.0 + 6.0;
