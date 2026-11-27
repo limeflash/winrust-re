@@ -25,7 +25,8 @@ const BACKDROP: i32 = 2;
 
 const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
 const DIM: Rgba = Rgba::css(163, 169, 184, 1.0);
-const ON_ACCENT: Rgba = Rgba::css(11, 18, 32, 1.0);
+/// Text on an accent fill (the design's `onA`): ink on the dark style, white on the light one.
+const ON_ACCENT: Rgba = Rgba::pair(0x0b1220, 0xffffff);
 const WARN: Rgba = Rgba::css(243, 201, 139, 1.0);
 const WARN_BG: Rgba = Rgba::css(255, 190, 90, 0.1);
 const CARD_BG: Rgba = Rgba::css(30, 31, 38, 0.96);
@@ -135,7 +136,7 @@ impl PowerPanel {
             Kind::Shutdown => icons::POWER,
         };
         // `micIn .7s`: scale .8 to 1 and opacity
-        f.rise(0, 700, SPRING, 0.0, 0.8).draw(c, ic, |c| c.icon(glyph, ic, 34.0, 1.8, accent, 0.0));
+        f.rise(0, 700, SPRING, 0.0, 0.8).draw(c, ic, |c| c.icon(glyph, ic, 34.0, 1.8, accent.accent_text(), 0.0));
 
         c.text(self.title(), Rect::new(k.x, k.y + 148.0, CARD_W, 26.0), Font::new(22.0, 600).tracking(-0.02), INK, Align::Center);
 
@@ -172,7 +173,7 @@ impl PowerPanel {
 
         let (cancel, action) = self.buttons();
         button(c, f, CANCEL, cancel, t!("Отмена", "Cancel", ja: "キャンセル", pt: "Cancelar", zh: "取消"), Rgba::white(0.09), INK);
-        button(c, f, ACTION, action, self.action(), accent, ON_ACCENT);
+        button(c, f, ACTION, action, self.action(), accent.accent_fill(), ON_ACCENT);
     }
 
     /// `.blk`: a black screen that fades in over .5 s with a spinner and what is going on.

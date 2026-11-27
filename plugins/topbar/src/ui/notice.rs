@@ -29,7 +29,8 @@ pub const CHIP: Rgba = Rgba::css(201, 205, 216, 1.0);
 pub const BODY: Rgba = Rgba::css(196, 200, 210, 1.0);
 pub const MUTED: Rgba = Rgba::css(154, 160, 176, 1.0);
 pub const FAINT: Rgba = Rgba::css(125, 131, 148, 1.0);
-pub const ON_ACCENT: Rgba = Rgba::css(11, 18, 32, 1.0);
+/// Text on an accent fill (the design's `onA`): ink on the dark style, white on the light one.
+pub const ON_ACCENT: Rgba = Rgba::pair(0x0b1220, 0xffffff);
 pub const NUMB: Rgba = Rgba::css(138, 144, 162, 1.0);
 const LILAC: Rgba = Rgba::hex(0xc0a5f5);
 const ROW_UNREAD: Rgba = Rgba::hex(0x2c2d34);
@@ -466,7 +467,7 @@ pub fn reply_field(c: &mut Canvas<'_>, tw: &mut dyn Tween, hov: Option<Hit>, id:
             }
             let full = !text.trim().is_empty();
             let down = hot(tw, hov, Hit::Send(id), 0, 160);
-            let bg = Rgba::white(0.08).mix(accent(), f32::from(full));
+            let bg = Rgba::white(0.08).mix(accent().accent_fill(), f32::from(full));
             c.fill(send, 8.0, bg.mix(Rgba::pure_white(bg.a.max(0.2)), 0.12 * down * f32::from(full)));
             c.icon(SEND, (send.cx(), send.cy()), 14.0, 2.2, if full { ON_ACCENT } else { NUMB }, 0.0);
         });
@@ -505,8 +506,17 @@ pub fn dismiss_button(c: &mut Canvas<'_>, tw: &mut dyn Tween, hov: Option<Hit>, 
                 c.fill(r, 7.0, Rgba::white(0.1 * over));
                 c.icon(CROSS, (r.cx(), r.cy()), 10.0, 2.8, DIM.mix(INK, over), 0.0);
             } else {
-                c.fill(r, 7.0, Rgba::css(52, 54, 64, 0.96).mix(RED.alpha(0.9), over));
-                c.icon(CROSS, (r.cx(), r.cy()), 10.0, 2.8, INK, 0.0);
+                // `--ncxBg` and `--ncxSh`: a slate plate on the dark style, a white one with a soft shadow on the light one; the red
+                // hover turns the x white
+                let light = winrust_common::style::light();
+                if light {
+                    c.outside(r, 7.0, |c| c.shadow(r, 7.0, 1.0, 3.0, Rgba::white(0.16)));
+                }
+                c.fill(r, 7.0, if light { Rgba::pure_white(1.0) } else { Rgba::css(52, 54, 64, 0.96) }.mix(RED.alpha(0.9), over));
+                if light {
+                    c.ring(r, 7.0, 0.5, Rgba::white(0.12));
+                }
+                c.icon(CROSS, (r.cx(), r.cy()), 10.0, 2.8, INK.mix(Rgba::pure_white(1.0), over), 0.0);
             }
         });
     });
@@ -983,7 +993,7 @@ impl Centre {
                     if let Some(b) = lay.hits.iter().find(|e| e.hit == Hit::DndOff) {
                         let over = hot(tw, on, Hit::DndOff, 0, 250);
                         c.fill(b.rect, 8.0, Rgba::white(0.1 * over));
-                        c.text(t!("Выключить", "Turn off", ja: "オフにする", pt: "Desativar", zh: "关闭"), b.rect, Font::new(12.0, 600), ac, Align::Center);
+                        c.text(t!("Выключить", "Turn off", ja: "オフにする", pt: "Desativar", zh: "关闭"), b.rect, Font::new(12.0, 600), ac.accent_text(), Align::Center);
                     }
                 });
             });
@@ -1012,7 +1022,7 @@ impl Centre {
                     if let Some(b) = b {
                         let over = hot(tw, on, Hit::Undo, 0, 250);
                         c.fill(b, 8.0, Rgba::white(0.06 + 0.04 * over));
-                        c.text(t!("Отменить", "Undo", ja: "元に戻す", pt: "Desfazer", zh: "撤销"), b, Font::new(12.0, 600), accent(), Align::Center);
+                        c.text(t!("Отменить", "Undo", ja: "元に戻す", pt: "Desfazer", zh: "撤销"), b, Font::new(12.0, 600), accent().accent_text(), Align::Center);
                     }
                 } else {
                     c.text(t!("Новые уведомления появятся здесь", "New notifications will show up here", ja: "新しい通知はここに表示されます", pt: "Novas notificações aparecerão aqui", zh: "新通知将显示在这里"), Rect::new(r.x, top + 48.0 + 16.0 + 8.0, r.w, 16.0), Font::new(12.0, 400), MUTED, Align::Center);

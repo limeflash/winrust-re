@@ -14,7 +14,7 @@ use super::panel::{Button, Content, Cx, Dir, Entry, Exit, Frame, Id, Inset, Look
 pub const INK: Rgba = Rgba::css(236, 238, 244, 1.0);
 pub const DIM: Rgba = Rgba::css(163, 169, 184, 1.0);
 pub const MUTED: Rgba = Rgba::css(138, 144, 162, 1.0);
-pub const DANGER: Rgba = Rgba::css(255, 138, 143, 1.0);
+pub const DANGER: Rgba = Rgba::pair(0xff8a8f, 0xc8333a); // `--dangerT`: pink on the dark style, deep red on the light one
 
 pub const PAD: f32 = 8.0;
 pub const ROW: f32 = 38.0;

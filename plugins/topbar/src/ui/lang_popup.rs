@@ -113,8 +113,8 @@ impl Content for LangPanel {
             let (ccx, ccy) = (r.x + r.w - 12.0 - 11.0, r.cy());
             c.faded(op, |c| {
                 c.transformed(ccx, ccy, k, 0.0, 0.0, |c| {
-                    c.circle(ccx, ccy, 11.0, accent);
-                    c.icon(CHECK, (ccx, ccy), 13.0, 3.0, ON_ACCENT, 0.0);
+                    c.circle(ccx, ccy, 11.0, accent.accent_fill());
+                    c.icon(CHECK, (ccx, ccy), 13.0, 3.0, Rgba::pair(0x0b1220, 0xffffff), 0.0); // `onA`
                 });
             });
         }

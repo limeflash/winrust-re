@@ -443,7 +443,7 @@ impl qp::Host for Live {
                 3 => cx.close_then(|| accessibility_menu()),
                 4 => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
                 5 => {
-                    i18n::style::set_system_light(!i18n::style::light()); // Windows' own switch: system and apps, and the broadcast
+                    i18n::style::toggle_dark_style(); // Windows' own switch while the bar follows it, the Appearance pick otherwise
                     crate::theme_changed();
                 }
                 6 => match crate::quick::hotspot() {

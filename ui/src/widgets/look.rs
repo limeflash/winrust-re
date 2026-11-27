@@ -1,6 +1,6 @@
 //! The colours the widgets share: the mockups' `--t1`..`--t4`, `--red`, `--menu`, written beside their light values with
 //! [`Rgba::pair`]. An application's own palette (`--win`, `--bar`, `--card`) lives next to its screens.
-use crate::gfx::{Font, Rgba};
+use crate::gfx::{Canvas, Font, Rect, Rgba};
 use winrust_common::style;
 
 pub const T1: Rgba = Rgba::pair(0xeceef4, 0x1b1d23);
@@ -26,6 +26,32 @@ pub const BODY: Font = Font::new(13.0, 400);
 #[must_use]
 pub fn accent() -> Rgba {
     Rgba::colorref(style::pal().accent)
+}
+
+/// The trough of the bar's segmented controls (the design's `--segTrack` and `--segTrackSh`): a dark well with a shadow inside
+/// it on the dark style, a faint ink tint with a half-pixel edge on the light one.
+pub fn seg_track(c: &mut Canvas<'_>, r: Rect, radius: f32) {
+    if style::light() {
+        c.fill(r, radius, Rgba::white(0.07));
+        c.ring(r, radius, 0.5, Rgba::white(0.06));
+    } else {
+        c.fill(r, radius, Rgba::css(0, 0, 0, 0.28));
+        c.fill(Rect::new(r.x + 3.0, r.y, r.w - 6.0, 1.0), 0.0, Rgba::css(0, 0, 0, 0.3));
+        c.fill(Rect::new(r.x + 2.0, r.y + 1.0, r.w - 4.0, 1.0), 0.0, Rgba::css(0, 0, 0, 0.12));
+    }
+}
+
+/// The raised option in it (`--segThumb`, `--segThumbSh`): a lit glass gradient on the dark style, a white card on the light one.
+pub fn seg_thumb(c: &mut Canvas<'_>, thumb: Rect, radius: f32) {
+    if style::light() {
+        c.outside(thumb, radius, |c| c.shadow(thumb, radius, 1.0, 3.0, Rgba::white(0.16)));
+        c.fill(thumb, radius, Rgba::pure_white(1.0));
+        c.ring(thumb, radius, 0.5, Rgba::white(0.1));
+    } else {
+        c.outside(thumb, radius, |c| c.shadow(thumb, radius, 1.0, 3.0, Rgba::css(0, 0, 0, 0.45)));
+        c.gradient(thumb, radius, Rgba::white(0.16), Rgba::white(0.1));
+        c.fill(Rect::new(thumb.x + 3.0, thumb.y, thumb.w - 6.0, 1.0), 0.0, Rgba::white(0.14));
+    }
 }
 
 /// `color-mix(in oklab, var(--acc) 80%, #fff)`, the focus ring: near enough in sRGB.

@@ -126,6 +126,7 @@ fn act(a: Act) {
         match a {
             Act::Relook => relook(),
             Act::Language => bars::invalidate_all(),
+            Act::Mode => theme_changed(),
             Act::Tile => tile_windows(),
             Act::OpenLog => open_log(),
             Act::Restart => restart_bar(),
