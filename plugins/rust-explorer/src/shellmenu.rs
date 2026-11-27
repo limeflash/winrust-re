@@ -153,6 +153,8 @@ struct Session {
     subs: Vec<(*mut c_void, u32)>,
     /// Submenus the bar opened that Windows may still be filling (Send to fills from a worker): read again for a while.
     watch: Vec<Watch>,
+    /// What the menu is for: the verbs that are ours to run ([`special`]) need the files.
+    paths: Vec<PathBuf>,
 }
 
 /// A submenu being read again: what the bar was last told about it and how many times it has been read since.
@@ -249,6 +251,14 @@ impl Backend for Session {
     }
 
     fn run(&mut self, h: HWND, id: u32) {
+        // some verbs Windows runs through explorer.exe, which does not run beside this shell: they are done here
+        let verb = {
+            let (mut src, _) = self.src();
+            menu::Source::verb(&mut src, id)
+        };
+        if special(&verb, &self.paths, &mut set_wallpaper) {
+            return;
+        }
         let mut pt = POINT::default();
         // SAFETY: plain calls; the verb is the command's offset, which is how the shell numbers its items.
         unsafe {
@@ -270,6 +280,26 @@ impl Backend for Session {
     }
 }
 
+/// The commands of the shell that rust-explorer does itself, by verb (whichever row or submenu of the menu they come from): `true` =
+/// done. "Set as desktop background" goes through `IDesktopWallpaper`, which lives in explorer.exe; the file's own path is what
+/// Windows' older `SPI_SETDESKWALLPAPER` takes, and it is right whether or not explorer.exe runs. Only the first of several
+/// files is used.
+fn special(verb: &str, paths: &[PathBuf], set_wallpaper: &mut dyn FnMut(&Path)) -> bool {
+    if verb.eq_ignore_ascii_case("setdesktopwallpaper") {
+        if let Some(p) = paths.first() { set_wallpaper(p); }
+        return true;
+    }
+    false
+}
+
+/// Makes `path` the desktop picture (the style stays as it is) and tells everybody: our own desktop reloads on that broadcast.
+fn set_wallpaper(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: a NUL-terminated path that outlives the call (SPI_SETDESKWALLPAPER only reads it).
+    unsafe { let _ = SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, Some(w.as_ptr() as *mut c_void), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE); }
+}
+
 /// The shell's menu for `paths` and its top level items. Runs on the worker.
 fn build_session(h: HWND, paths: &[PathBuf]) -> Option<(Box<dyn Backend>, Vec<ShellItem>)> {
     let cm: IContextMenu = crate::sh::ui(h, paths).ok()?;
@@ -282,7 +312,7 @@ fn build_session(h: HWND, paths: &[PathBuf]) -> Option<(Box<dyn Backend>, Vec<Sh
         return None;
     }
     let cm2 = cm.cast::<IContextMenu2>().ok();
-    let mut s = Session { cm, cm2, menu: menu_h, subs: Vec::new(), watch: Vec::new() };
+    let mut s = Session { cm, cm2, menu: menu_h, subs: Vec::new(), watch: Vec::new(), paths: paths.to_vec() };
     let (mut src, m) = s.src();
     // SAFETY: the menu was just filled by the shell and is ours.
     let items = unsafe { menu::read(m.0, &mut src) };
@@ -783,6 +813,20 @@ mod tests {
         assert!(worth_telling(Some(2), 5, false), "Send to grew");
         assert!(!worth_telling(Some(5), 5, true));
         assert!(!worth_telling(Some(5), 0, true), "an empty read after items is not news");
+    }
+
+    #[test]
+    fn set_as_desktop_background_is_done_here_by_its_verb_and_nothing_else_is() {
+        let mut set = Vec::new();
+        let paths = [PathBuf::from(r"C:\pics.png"), PathBuf::from(r"C:\pics.png")];
+        assert!(special("setdesktopwallpaper", &paths, &mut |p| set.push(p.to_path_buf())));
+        assert_eq!(set, [PathBuf::from(r"C:\pics.png")], "the first image only");
+        assert!(special("SetDesktopWallpaper", &paths, &mut |p| set.push(p.to_path_buf())), "by any case");
+        assert_eq!(set.len(), 2);
+        for other in ["open", "properties", "delete", "", "rotate90"] {
+            assert!(!special(other, &paths, &mut |_| panic!("{other} must not set the wallpaper")), "{other} is the shell's");
+        }
+        assert!(special("setdesktopwallpaper", &[], &mut |_| panic!("no files, nothing to set")), "still ours: the shell would only fail");
     }
 
     /// A shell that answers every submenu with one item.
