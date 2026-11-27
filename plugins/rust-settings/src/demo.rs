@@ -885,8 +885,12 @@ impl Os for Demo {
         let cur = self.with(|s| s.assoc.get(group).copied().unwrap_or(0));
         (list.iter().map(|n| DefApp { name: (*n).into(), exe: format!("{}.exe", n.to_lowercase().replace(' ', "")) }).collect(), Some(cur))
     }
-    fn assoc_pick(&self, a: &Assoc, i: usize, _owner: isize, _done: Ping) {
+    fn assoc_pick(&self, a: &Assoc, i: usize, _owner: isize, _done: Note) {
         self.note(format!("assoc_pick {} {i}", a.name));
+        // the flags and the sample file the real one would pass (pure, so a test can see them)
+        if let Some(p) = crate::more::sample_path(std::path::Path::new("TEMP"), &a.name) {
+            self.note(format!("assoc_dialog {} flags={}", p.to_string_lossy().replace('\\', "/"), crate::more::CHOOSER_FLAGS));
+        }
         // the demo's dialog is over at once, and the user confirmed
         if let Some((group, list)) = demo_assoc(a) {
             self.with(|s| s.assoc.insert(group, i.min(list.len() - 1)));

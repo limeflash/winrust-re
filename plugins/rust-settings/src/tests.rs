@@ -1480,7 +1480,7 @@ fn default_apps_list_what_windows_has_and_a_pick_opens_windows_own_chooser() {
     assert_eq!(items.iter().position(|m| m.radio == Some(true)), Some(0));
     let mut cx = Cx::default();
     s.command(TAG_PICK, 2, &mut cx);
-    assert_eq!(d.log(), vec!["assoc_pick .jpg 2"]);
+    assert_eq!(d.log(), vec!["assoc_pick .jpg 2".to_string(), "assoc_dialog TEMP/WinRust/defaults/Sample.jpg flags=3".to_string()], "the sample file and Explorer's flags (register ext, no force, no exec)");
     assert_eq!(toasts(&cx).len(), 1, "the toast says Windows asks to confirm");
     assert_eq!(photos(&s), "Paint", "read again after the dialog");
     // the rows that are WinRust's own do nothing
@@ -1505,7 +1505,7 @@ fn a_typed_file_type_shows_its_own_row_and_an_unknown_one_says_so() {
     let at = id(&s, |l| l.key == "def:.webp", P_CTL);
     click(&mut s, at);
     s.command(TAG_PICK, 1, &mut Cx::default());
-    assert_eq!(d.log(), vec!["assoc_pick .webp 1"]);
+    assert_eq!(d.log()[0], "assoc_pick .webp 1");
     // nothing is linked to .xyz: no row, a line that says Windows will ask
     let (s, _d) = win("defaults-none");
     assert!(s.pg.groups[0].rows.is_empty() && !s.pg.groups[0].empty.is_empty());
@@ -1536,4 +1536,21 @@ fn the_apps_page_shows_size_and_date_and_sorts_by_them() {
     assert_eq!(first(&s), "7-Zip");
     assert_eq!(ext::install_date("20260721"), Some((2026, 7, 21)));
     assert_eq!((ext::install_date("2026-07-21"), ext::install_date("")), (None, None));
+}
+
+#[test]
+fn the_chooser_is_asked_the_way_explorer_asks_it() {
+    // flags: register the extension, nothing else (no force: Windows 11 refuses it; no exec: nothing is run)
+    assert_eq!(more::CHOOSER_FLAGS, 1 | 2);
+    assert_eq!(more::CHOOSER_FLAGS & (4 | 8), 0);
+    // the sample: a real file name of that type under the temp folder, only for plain extensions
+    let t = std::path::Path::new("T");
+    let p = more::sample_path(t, ".pdf").unwrap();
+    assert_eq!(p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"), "T/WinRust/defaults/Sample.pdf");
+    assert!(more::sample_path(t, "pdf").is_none() && more::sample_path(t, ".").is_none() && more::sample_path(t, ".a/b").is_none() && more::sample_path(t, "http").is_none());
+    // the link rows say before the click that Windows Settings opens
+    let (s, _d) = win("defaults");
+    let sub = |k: &str| s.pg.groups[0].rows.iter().find(|l| l.key == k).map(|l| l.sub.clone()).unwrap();
+    assert!(sub("def:Web").contains("Windows") && sub("def:Mail").contains("Windows"), "{} / {}", sub("def:Web"), sub("def:Mail"));
+    assert!(!sub("def:Photos").contains("Windows"));
 }
