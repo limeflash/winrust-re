@@ -393,7 +393,7 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
 
 /// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|start|search|settings[:<page>]|toast|jumplist|preview|taskview|
 /// switcher|menu|power-restart|power-shutdown|power-busy [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]
-/// [q=<text>] [page=<n>] [pins=<n>] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
+/// [q=<text>] [page=<n>] [pins=<n>] [builtins] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
 ///
 /// `quick` shows the list of sound devices after a click on the Sound card's button: `click=23 after=800`. `switcher` takes
 /// `permon` (the list is one monitor's), `menu kind=winx` shows the sign-out submenu with `hover=23`.
@@ -683,6 +683,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Box::new(ui::cal_popup::CalPanel::new(demo_now, side, room).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
         } else if what == "start" || what == "search" {
             apps::load(); // the machine's apps, synchronously, with the icons of what is pinned
+            if args.iter().any(|a| a == "builtins") {
+                apps::add_demo_builtins(); // the machine may have none of the built-in apps the design draws as glyphs
+            }
             let recent = if what == "start" && args.iter().any(|a| a == "recent") {
                 let names = ["Project proposal.docx", "Meeting notes.pdf", "Budget.xlsx", "Design brief.docx", "Roadmap.pdf", "Readme.md", "Notes.txt", "Landscape.jpg", "Dashboard.png", "Photo.jpg", "Sketch.png", "Projects", "Documents"];
                 names.iter().enumerate().map(|(i, name)| apps::Recent {

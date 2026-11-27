@@ -310,8 +310,11 @@ impl SearchPanel {
         let t = f.tween(i as i32, 3, f32::from(sel), 120, EASE);
         c.fill(r, 12.0, Rgba::white(0.09 * t));
         let tile = Rect::new(r.x + 12.0, r.cy() - 16.0, 32.0, 32.0);
+        // a built-in app is the design's line glyph on the soft tile, like a command
+        let builtin = if let Glyph::App(p) = &row.glyph { apps::glyph(p) } else { None };
         let image = match &row.glyph {
             Glyph::Path(_) => None,
+            Glyph::App(_) if builtin.is_some() => None,
             Glyph::App(p) => Some(apps::icon(p)),
             Glyph::Shell(p) => apps::image(p).map(|i| i.icon),
         };
@@ -321,7 +324,7 @@ impl SearchPanel {
             c.fill(tile, 9.0, Rgba::white(0.08));
             let g = match row.glyph {
                 Glyph::Path(d) => d,
-                _ => FILE,
+                _ => builtin.unwrap_or(FILE),
             };
             c.icon(g, (tile.cx(), tile.cy()), 18.0, 1.8, INK, 0.0);
         }

@@ -284,13 +284,19 @@ pub fn find_loose_exes(q: &str) {
 
 // ---------- icons ----------
 
-/// The app's icon, loaded once (the shell's, at the size the panels draw it); null if it has none.
+/// The app's icon, loaded once (the shell's, at the size the panels draw it); null if it has none, and for an app the design
+/// draws as a line glyph ([`glyph`]): its icon is never extracted.
 pub fn icon(path: &[u16]) -> windows::Win32::UI::WindowsAndMessaging::HICON {
     if let Some(&h) = ICONS.lock().unwrap().as_ref().and_then(|m| m.get(path)) {
         return wicon(h as HICON);
     }
     // SAFETY: shell calls on this thread; the icon is kept for the life of the process.
-    let ic = unsafe { lnk_icon(path, &lnk_target(path), ICON_PX.load(Rlx)) };
+    let target = unsafe { lnk_target(path) };
+    if glyph_with(path, || target.clone()).is_some() {
+        return wicon(std::ptr::null_mut());
+    }
+    // SAFETY: as above.
+    let ic = unsafe { lnk_icon(path, &target, ICON_PX.load(Rlx)) };
     wicon(keep_icon(path.to_vec(), ic))
 }
 
@@ -322,7 +328,7 @@ pub fn warm_icons(paths: impl IntoIterator<Item = Vec<u16>>) {
     {
         let have = ICONS.lock().unwrap();
         for p in paths {
-            if !have.as_ref().is_some_and(|m| m.contains_key(&p)) && !q.contains(&p) {
+            if !have.as_ref().is_some_and(|m| m.contains_key(&p)) && glyph_ready(&p).is_none() && !q.contains(&p) {
                 q.push(p);
             }
         }
@@ -350,8 +356,12 @@ pub fn warm_icons(paths: impl IntoIterator<Item = Vec<u16>>) {
             let Some(p) = next else { break };
             if icon_ready(&p).is_none() {
                 // SAFETY: shell calls on this thread (COM is up); the icon is kept for the life of the process.
-                let ic = unsafe { lnk_icon(&p, &lnk_target(&p), ICON_PX.load(Rlx)) };
-                keep_icon(p, ic);
+                let target = unsafe { lnk_target(&p) };
+                // a built-in app is drawn as the design's glyph: no icon to extract, the panel just repaints with it
+                if glyph_with(&p, || target.clone()).is_none() {
+                    let ic = unsafe { lnk_icon(&p, &target, ICON_PX.load(Rlx)) };
+                    keep_icon(p, ic);
+                }
                 n += 1;
                 if n % 6 == 0 {
                     ui::panel::refresh(); // half a page at a time: icons appear while the rest load
@@ -759,9 +769,180 @@ pub fn sleep_now() {
     }
 }
 
+// ---------- the design's glyphs for built-in apps ----------
+
+// the line icons of the Obsidian mockup's app tables (`P1`, `P2`, `CMDS` in Main.v5.html), on a 24 x 24 grid
+const G_TERMINAL: &str = "M4 5h16v14H4zM7.5 10l3 2.5-3 2.5M13 15h4";
+const G_PHOTOS: &str = "M4 5h16v14H4zM4 16l5-5 4 4 3-3 4 4M15.5 9.5h.01";
+const G_DISK: &str = "M4 4h9v10H4zM15 4h5v6h-5zM15 12h5v8h-5zM4 16h9v4H4z";
+const G_CALC: &str = "M6 3h12v18H6zM9 7h6M9 11h.01M12 11h.01M15 11h.01M9 14h.01M12 14h.01M15 14h.01M9 17h.01M12 17h.01M15 17h.01";
+const G_NOTEPAD: &str = "M6 3h9l3 3v15H6zM9 9h6M9 13h6M9 17h4";
+const G_CALENDAR: &str = "M4 6h16v14H4zM4 10h16M8 3v4M16 3v4";
+const G_CLOCK: &str = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2";
+const G_CAMERA: &str = "M4 8h4l2-3h4l2 3h4v11H4zM12 16.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z";
+const G_PAINT: &str = "M12 21a9 9 0 1 1 9-9c0 2-1.5 3-3 3h-2a2 2 0 0 0-1.5 3.3A2 2 0 0 1 12 21zM7.5 11h.01M10 7.5h.01M14.5 7.5h.01";
+const G_SNIPPING: &str = "M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM8.1 7.9L20 20M8.1 16.1L20 4";
+const G_MAPS: &str = "M9 4L3 6v14l6-2 6 2 6-2V4l-6 2zM9 4v14M15 6v14";
+const G_WEATHER: &str = "M7 18a4 4 0 0 1-.5-8 5.5 5.5 0 0 1 10.6-1.3A4.5 4.5 0 0 1 17 18z";
+const G_STORE: &str = "M4 8h16l-1 12H5zM9 8V6a3 3 0 0 1 6 0v2";
+const G_RECORDER: &str = "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3";
+const G_CONTROL: &str = "M4 7h10M18 7h2M4 17h2M10 17h10M14 5v4M6 15v4";
+const G_REGISTRY: &str = "M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12v9M12 12L4 7.5";
+const G_GEAR: &str = ui::icons::GEAR;
+
+/// Built-in apps and our own, by what is the same in every language and on every machine: a Store app's package family name
+/// (`Microsoft.WindowsCalculator_8wekyb3d8bbwe!App` -> `microsoft.windowscalculator`, or `family!app` where one package holds several
+/// apps), the id of a shell app (`Microsoft.Windows.ControlPanel`), or the file name of an exe (also a shortcut's target). Lower case.
+const BUILTIN: &[(&str, &str)] = &[
+    // ours
+    ("rust-settings.exe", G_GEAR),
+    ("rust-term.exe", G_TERMINAL),
+    ("photoview.exe", G_PHOTOS),
+    ("wiztree.exe", G_DISK),
+    // Windows: the design's tables
+    ("windows.immersivecontrolpanel", G_GEAR), // Settings
+    ("microsoft.windowsterminal", G_TERMINAL),
+    ("microsoft.windowsterminalpreview", G_TERMINAL),
+    ("wt.exe", G_TERMINAL),
+    ("windowsterminal.exe", G_TERMINAL),
+    ("cmd.exe", G_TERMINAL),
+    ("powershell.exe", G_TERMINAL),
+    ("pwsh.exe", G_TERMINAL),
+    ("microsoft.windows.photos", G_PHOTOS),
+    ("microsoft.windowscalculator", G_CALC),
+    ("calc.exe", G_CALC),
+    ("microsoft.windowsnotepad", G_NOTEPAD),
+    ("notepad.exe", G_NOTEPAD),
+    ("microsoft.windowscommunicationsapps!microsoft.windowslive.calendar", G_CALENDAR),
+    ("microsoft.windowsalarms", G_CLOCK),
+    ("microsoft.windowscamera", G_CAMERA),
+    ("microsoft.paint", G_PAINT),
+    ("mspaint.exe", G_PAINT),
+    ("microsoft.screensketch", G_SNIPPING),
+    ("snippingtool.exe", G_SNIPPING),
+    ("microsoft.windowsmaps", G_MAPS),
+    ("microsoft.bingweather", G_WEATHER),
+    ("microsoft.windowsstore", G_STORE),
+    ("microsoft.windowssoundrecorder", G_RECORDER),
+    ("soundrecorder.exe", G_RECORDER),
+    ("microsoft.windows.controlpanel", G_CONTROL),
+    ("regedit.exe", G_REGISTRY),
+    ("msconfig.exe", G_GEAR),
+];
+
+/// The design's glyph for a built-in app, if `what` is one: a `shell:AppsFolder\<id>` path or a bare app id, an exe path, or a
+/// `.lnk` (its target is asked from `target`, which is only called for a shortcut). Case and language do not matter.
+pub fn builtin_glyph(what: &str, target: impl FnOnce() -> String) -> Option<&'static str> {
+    let w = what.trim().to_lowercase();
+    let by = |k: &str| BUILTIN.iter().find(|(name, _)| *name == k).map(|(_, d)| *d);
+    let by_file = |p: &str| by(p.rsplit(['\\', '/']).next().unwrap_or(p));
+    if w.ends_with(".lnk") {
+        return by_file(&target().to_lowercase());
+    }
+    let id = w.strip_prefix(r"shell:appsfolder\").unwrap_or(&w);
+    if let Some((family, app)) = id.split_once('!') {
+        let family = family.split('_').next().unwrap_or(family);
+        return by(&format!("{family}!{app}")).or_else(|| by(family));
+    }
+    if id.ends_with(".exe") { by_file(id) } else { by(id) }
+}
+
+static GLYPHS: Mutex<Option<HashMap<Vec<u16>, Option<&'static str>>>> = Mutex::new(None); // by path; None = it keeps its real icon
+
+fn glyph_with(path: &[u16], target: impl FnOnce() -> String) -> Option<&'static str> {
+    if let Some(&g) = GLYPHS.lock().unwrap().as_ref().and_then(|m| m.get(path)) {
+        return g;
+    }
+    let g = builtin_glyph(&wstr_of(path), target);
+    GLYPHS.lock().unwrap().get_or_insert_with(HashMap::new).insert(path.to_vec(), g);
+    g
+}
+
+/// The design's line glyph an app is drawn with instead of its icon (a built-in Windows app, or one of ours); None = it keeps its
+/// real icon. Looked up once per path; a shortcut's target is read on the first ask.
+pub fn glyph(path: &[u16]) -> Option<&'static str> {
+    // SAFETY: a shell link read on this thread (COM is up on the UI threads and on the icon thread).
+    glyph_with(path, || unsafe { lnk_target(path) })
+}
+
+/// The glyph if it has been looked up already: a panel that draws every frame must not read shortcuts. [`icon`] and the icon thread
+/// ([`warm_icons`]) look up what a page needs.
+pub fn glyph_ready(path: &[u16]) -> Option<&'static str> {
+    GLYPHS.lock().unwrap().as_ref().and_then(|m| m.get(path)).copied().flatten()
+}
+
+/// For `--render-panel`: builtin apps the machine may not have (this one has no Calculator), first in the list.
+pub fn add_demo_builtins() {
+    const DEMO: [(&str, &str); 9] = [
+        ("Settings", r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"),
+        ("Calculator", r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+        ("Notepad", r"shell:AppsFolder\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"),
+        ("Terminal", r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"),
+        ("Paint", r"shell:AppsFolder\Microsoft.Paint_8wekyb3d8bbwe!App"),
+        ("Snipping Tool", r"shell:AppsFolder\Microsoft.ScreenSketch_8wekyb3d8bbwe!App"),
+        ("Clock", r"shell:AppsFolder\Microsoft.WindowsAlarms_8wekyb3d8bbwe!App"),
+        ("Microsoft Store", r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App"),
+        ("Weather", r"shell:AppsFolder\Microsoft.BingWeather_8wekyb3d8bbwe!App"),
+    ];
+    let mut apps = APPS.lock().unwrap();
+    for (i, (name, id)) in DEMO.iter().enumerate() {
+        apps.insert(i, (name.to_string(), wide(id)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_in_apps_are_matched_by_id_or_exe_not_by_name() {
+        let no = String::new;
+        // Store apps: the package family name, whatever the publisher hash and the app's own id
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", no), Some(G_CALC));
+        assert_eq!(builtin_glyph("MICROSOFT.WINDOWSNOTEPAD_8WEKYB3D8BBWE!APP", no), Some(G_NOTEPAD));
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\Microsoft.Paint_8wekyb3d8bbwe!App", no), Some(G_PAINT));
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\Microsoft.ScreenSketch_8wekyb3d8bbwe!App", no), Some(G_SNIPPING));
+        assert_eq!(builtin_glyph("Microsoft.WindowsAlarms_8wekyb3d8bbwe!App", no), Some(G_CLOCK));
+        assert_eq!(builtin_glyph("Microsoft.WindowsCamera_8wekyb3d8bbwe!App", no), Some(G_CAMERA));
+        assert_eq!(builtin_glyph("Microsoft.WindowsMaps_8wekyb3d8bbwe!App", no), Some(G_MAPS));
+        assert_eq!(builtin_glyph("Microsoft.BingWeather_8wekyb3d8bbwe!App", no), Some(G_WEATHER));
+        assert_eq!(builtin_glyph("Microsoft.WindowsStore_8wekyb3d8bbwe!App", no), Some(G_STORE));
+        assert_eq!(builtin_glyph("Microsoft.WindowsSoundRecorder_8wekyb3d8bbwe!App", no), Some(G_RECORDER));
+        assert_eq!(builtin_glyph("Microsoft.Windows.Photos_8wekyb3d8bbwe!App", no), Some(G_PHOTOS));
+        assert_eq!(builtin_glyph("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", no), Some(G_TERMINAL));
+        assert_eq!(builtin_glyph("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel", no), Some(G_GEAR));
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\Microsoft.Windows.ControlPanel", no), Some(G_CONTROL));
+        // one package, several apps: only the calendar of Mail and Calendar
+        assert_eq!(builtin_glyph("microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.calendar", no), Some(G_CALENDAR));
+        assert_eq!(builtin_glyph("microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.mail", no), None);
+        // exes, by path or as the AppsFolder lists them
+        assert_eq!(builtin_glyph(r"C:\Windows\System32\NOTEPAD.EXE", no), Some(G_NOTEPAD));
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cmd.exe", no), Some(G_TERMINAL));
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\{F38BF404-1D43-42F2-9305-67DE0B28FC23}\regedit.exe", no), Some(G_REGISTRY));
+        assert_eq!(builtin_glyph(r"C:\Windows\System32\mspaint.exe", no), Some(G_PAINT));
+        assert_eq!(builtin_glyph(r"C:\Windows\System32\SnippingTool.exe", no), Some(G_SNIPPING));
+        // control.exe also opens Administrative Tools and the like (their shortcuts differ only in the arguments): not Control Panel
+        assert_eq!(builtin_glyph(r"C:\Windows\System32\control.exe", no), None);
+        // ours
+        assert_eq!(builtin_glyph(r"C:\Program Files\rust-settings\Rust-Settings.exe", no), Some(G_GEAR));
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\{6D809377-6AF0-444B-8957-A3773F02200E}\rust-term\rust-term.exe", no), Some(G_TERMINAL));
+        assert_eq!(builtin_glyph(r"C:\x\photoview.exe", no), Some(G_PHOTOS));
+        assert_eq!(builtin_glyph(r"C:\x\wiztree.exe", no), Some(G_DISK));
+    }
+
+    #[test]
+    fn a_shortcut_is_matched_by_its_target_and_other_apps_keep_their_icons() {
+        // the name of the .lnk is localized ("Блокнот.lnk"): only the target counts
+        assert_eq!(builtin_glyph(r"C:\ProgramData\Start Menu\Programs\Accessories\Блокнот.lnk", || r"c:\windows\system32\notepad.exe".into()), Some(G_NOTEPAD));
+        assert_eq!(builtin_glyph(r"C:\Start Menu\Notepad.lnk", || r"c:\program files\other\other.exe".into()), None); // the name is not looked at
+        assert_eq!(builtin_glyph(r"C:\Start Menu\Store app.lnk", String::new), None); // no target
+        let never = || -> String { panic!("only a shortcut has a target to read") };
+        assert_eq!(builtin_glyph("Chrome", never), None);
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude", never), None);
+        assert_eq!(builtin_glyph(r"shell:AppsFolder\{6D809377-6AF0-444B-8957-A3773F02200E}\Git\cmd\git-gui.exe", never), None);
+        assert_eq!(builtin_glyph(r"C:\Games\notepad-plus-plus.exe", never), None); // the whole file name, not a prefix
+        assert_eq!(builtin_glyph("Microsoft.WindowsCalculatorPro_8wekyb3d8bbwe!App", never), None);
+    }
 
     #[test]
     fn layout_flip_both_ways() {
