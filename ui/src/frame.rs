@@ -434,6 +434,12 @@ impl Frame<'_> {
         self.mo.active
     }
 
+    /// A menu of the window is open.
+    #[must_use]
+    pub fn menu_open(&self) -> bool {
+        self.mo.menu_open
+    }
+
     /// Names an item of an application window: records where it is (cut to the clip in force) so the host can hit-test it,
     /// and gives its eased hover and press. Items drawn later stand over those drawn earlier.
     pub fn item(&mut self, id: Id, r: Rect) -> Hot {
@@ -513,6 +519,8 @@ pub struct Motion {
     pub maximized: bool,
     /// The window has the keyboard focus.
     pub active: bool,
+    /// A menu of the window is open (its button is drawn pressed in).
+    pub menu_open: bool,
 }
 
 impl Motion {

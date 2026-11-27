@@ -60,6 +60,7 @@ fn frame(g: &mut Gfx, core: &mut Core, surf: &mut Surface, now: u64) -> bool {
 /// device pixels. The window's pointer events are the ones a mouse would make, one at a time, each with a frame between.
 pub fn render_pixels(app: Box<dyn App>, o: &Opts) -> Option<(Vec<u32>, i32, i32)> {
     let s = o.scale;
+    let clicks: Vec<Id> = app.demo_clicks().into_iter().chain(o.click.iter().copied()).collect();
     let px = |d: f32| (d * s).round() as i32;
     let (win_w, win_h) = if o.max { (o.w, o.h) } else { (o.w - 2.0 * STAGE_INSET, o.h - 2.0 * STAGE_INSET) };
     let mut g = Gfx::new(s).ok()?;
@@ -69,7 +70,7 @@ pub fn render_pixels(app: Box<dyn App>, o: &Opts) -> Option<(Vec<u32>, i32, i32)
     let mut t = 1_000_000u64;
     frame(&mut g, &mut core, &mut surf, t);
     let centre = |core: &Core, id: Id| core.hits().get(id).map(|h| (h.r.cx(), h.r.cy()));
-    for &id in &o.click {
+    for &id in &clicks {
         t += 400;
         let Some((x, y)) = centre(&core, id) else { continue };
         core.pointer_move(x, y, t);

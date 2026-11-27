@@ -8,7 +8,7 @@
 //! `gpu` (what the GPU still needed after the CPU was done). `open` is the time from the start of `main` to the first frame
 //! committed, the median of five runs of the exe; memory is the working set and the private bytes in MB.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -28,7 +28,7 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
         open();
     }
     let all = what == "all";
-    if !matches!(what, "hover" | "menu" | "scroll" | "resize" | "rest") && !all {
+    if !matches!(what, "hover" | "menu" | "scroll" | "pan" | "resize" | "rest") && !all {
         return i32::from(!matches!(what, "open"));
     }
     println!("scenario      | encode  mean    p95     max |    end  mean    p95     max | present mean    p95     max |  total  mean    p95     max |    gpu  mean    p95     max |   ws priv");
@@ -85,7 +85,8 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
                 }
             }));
             if close {
-                drive(hwnd, |h| h.core.key(0x1B, Default::default(), false, crate::anim::now_ms()));
+                // Esc closes what the click opened (an app without that overlay would take it as "close the window")
+                drive(hwnd, |h| h.core.ov.modal() && h.core.key(0x1B, Default::default(), false, crate::anim::now_ms()));
             } else {
                 click(hwnd, crate::widgets::overlay::TOAST_UNDO); // the toast would still be leaving when `rest` counts
             }
@@ -97,6 +98,31 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
             h.core.wheel(0.0, if (i / 60) % 2 == 0 { -0.35 } else { 0.35 }, Default::default(), crate::anim::now_ms());
             true
         })));
+    }
+    if all || what == "pan" {
+        // the wheel zooms in over the middle of the window (an app that zooms), then the button is held and the pointer goes round
+        let (px, py) = (cw * 0.4, ch * 0.55);
+        drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            h.core.pointer_move(px, py, now);
+            for _ in 0..8 {
+                h.core.wheel(0.0, 1.0, Default::default(), now);
+            }
+            true
+        });
+        pump(700);
+        drive(hwnd, |h| {
+            h.core.down(crate::frame::Button::Left, px, py, crate::anim::now_ms());
+            true
+        });
+        step(hwnd, "pan", 300, Box::new(move |i| drive(hwnd, |h| {
+            let a = i as f32 * 0.09;
+            h.core.pointer_move(px + 220.0 * a.cos(), py + 120.0 * a.sin(), crate::anim::now_ms())
+        })));
+        drive(hwnd, |h| {
+            h.core.up(crate::frame::Button::Left, px, py, crate::anim::now_ms());
+            true
+        });
     }
     if all || what == "resize" {
         // the size changes at every step, as when a corner is dragged: WM_SIZE draws the frame, then the shadow follows
@@ -207,6 +233,7 @@ fn open() {
 /// fonts, the first text layouts, the shadow's blur), showing it.
 fn open_once(demo: fn(&str) -> Box<dyn App>) -> i32 {
     let started = crate::render::started();
+    gfx::fast_start();
     let composed = gfx::compose_windows();
     let devices = started.elapsed().as_secs_f64() * 1000.0;
     let o = Options { class: "winrust_ui_open", size: (1160.0, 740.0), icon: 0, place_file: None };
@@ -215,7 +242,8 @@ fn open_once(demo: fn(&str) -> Box<dyn App>) -> i32 {
     // SAFETY: shown off the screen without activation: the frame is really composed.
     unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    pump(Duration::from_millis(100).as_millis() as u64);
+    // the hardware device takes over a little later (`gfx::WM_HARDWARE`): the memory is read after that
+    pump(700);
     let (ws, pv) = memory_now();
     println!("open1 {ms:.1} {ws:.1} {pv:.1} devices {devices:.0} window+first frame {:.0} show {:.0}", made - devices, ms - made);
     0

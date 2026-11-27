@@ -265,6 +265,12 @@ impl Overlays {
         self.menu.is_some() || self.dialog.is_some()
     }
 
+    /// A menu is open.
+    #[must_use]
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
     #[must_use]
     pub fn owns(id: Id) -> bool {
         id <= OVERLAY

@@ -58,6 +58,20 @@ pub trait App {
     fn close(&mut self, _cx: &mut Cx) -> bool {
         true
     }
+    /// The window exists (its first frame is not drawn yet): `hwnd` is what a worker thread posts to ([`crate::window::post`]).
+    fn start(&mut self, _hwnd: isize) {}
+    /// The wheel with the pointer's place in the window (DIPs): zooming about the pointer needs it. By default it is `wheel`.
+    #[allow(clippy::too_many_arguments)]
+    fn wheel_at(&mut self, id: Option<Id>, _x: f32, _y: f32, dx: f32, dy: f32, mods: Mods, cx: &mut Cx) {
+        self.wheel(id, dx, dy, mods, cx);
+    }
+    /// What is dragged over the window left it without dropping.
+    fn drag_leave(&mut self, _cx: &mut Cx) {}
+    /// `--render`: the items the renderer clicks, one after the other, before it takes the picture (what a state of the design needs
+    /// open: a menu, a toast).
+    fn demo_clicks(&self) -> Vec<Id> {
+        Vec::new()
+    }
 }
 
 /// What Windows is told about a point of the window (`WM_NCHITTEST`).
@@ -151,6 +165,7 @@ impl Core {
         self.mo.hits.clear();
         self.mo.maximized = self.maximized;
         self.mo.active = self.active;
+        self.mo.menu_open = self.ov.menu_open();
         let (w, h) = self.size;
         let mut f = Frame { now, age: now.saturating_sub(self.born), leaving: 0, hover: self.hover, press: self.press.map(|p| p.0), size: self.size, opacity: 1.0, mo: &mut self.mo };
         self.app.draw(c, &mut f);
@@ -307,8 +322,9 @@ impl Core {
             return;
         }
         let id = self.hover.filter(|&i| !Overlays::owns(i));
+        let (x, y) = self.pointer.unwrap_or_default();
         let mut cx = self.cx();
-        self.app.wheel(id, dx, dy, mods, &mut cx);
+        self.app.wheel_at(id, x, y, dx, dy, mods, &mut cx);
         self.finish(cx, now);
         self.redraw = true;
     }
@@ -403,6 +419,21 @@ impl Core {
     pub fn files(&mut self, paths: Vec<String>, x: f32, y: f32, now: u64) {
         let mut cx = self.cx();
         App::drop(self.app.as_mut(), paths, x, y, &mut cx);
+        self.finish(cx, now);
+        self.redraw = true;
+    }
+
+    /// Files are dragged over the window at `(x, y)` DIPs (the first time or again): whether the app takes them.
+    pub fn drag_over(&mut self, paths: &[String], x: f32, y: f32) -> bool {
+        let ok = self.app.drag_over(paths, x, y);
+        self.redraw = true;
+        ok
+    }
+
+    /// What was dragged over the window left it.
+    pub fn drag_leave(&mut self, now: u64) {
+        let mut cx = self.cx();
+        self.app.drag_leave(&mut cx);
         self.finish(cx, now);
         self.redraw = true;
     }

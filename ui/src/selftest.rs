@@ -289,7 +289,7 @@ fn memory(demo: fn(&str) -> Box<dyn App>) -> i32 {
             mouse(hwnd, WM_LBUTTONDOWN, x, y);
             mouse(hwnd, WM_LBUTTONUP, x, y);
             pump(220);
-            if close != 0 {
+            if close != 0 && with(hwnd, |h| h.core.ov.modal()).unwrap_or(false) {
                 key(hwnd, close);
             }
             pump(40);
