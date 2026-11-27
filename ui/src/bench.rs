@@ -1,4 +1,4 @@
-//! `--bench [open|hover|menu|scroll|resize|rest|all]`: what an application window costs on this machine, in the form of the bar's
+//! `--bench [open|hover|menu|scroll|glide|type|resize|rest|all]`: what an application window costs on this machine, in the form of the bar's
 //! benchmark. The window is a real composed one, put at (-5000, -5000) where nobody sees it, 2560 × 1440 device pixels big (the
 //! user's screen); the pointer, the wheel and the size are driven by calls, one frame each, and the GPU is waited for after every
 //! frame (`gfx::gpu_wait`) so that what is left to it is counted too.
@@ -28,7 +28,7 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
         open();
     }
     let all = what == "all";
-    if !matches!(what, "hover" | "menu" | "scroll" | "resize" | "rest") && !all {
+    if !matches!(what, "hover" | "menu" | "scroll" | "glide" | "type" | "resize" | "rest") && !all {
         return i32::from(!matches!(what, "open"));
     }
     println!("scenario      | encode  mean    p95     max |    end  mean    p95     max | present mean    p95     max |  total  mean    p95     max |    gpu  mean    p95     max |   ws priv");
@@ -70,8 +70,9 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
         let _ = total;
     };
     if all || what == "hover" {
-        // the pointer sweeps the row of buttons, then the list: every step moves a hover
-        let pts: Vec<(f32, f32)> = (0..300).map(|i| if i < 150 { (30.0 + i as f32 * 4.0, 89.0) } else { (300.0 + (i - 150) as f32 * 3.0, 240.0 + (i - 150) as f32 * 8.0) }).collect();
+        // the pointer sweeps the row of buttons, then runs down the list (10,000 rows): every step moves a hover
+        let low = (ch - 60.0).max(300.0);
+        let pts: Vec<(f32, f32)> = (0..300).map(|i| if i < 150 { (30.0 + i as f32 * 4.0, 89.0) } else { (300.0 + (i - 150) as f32 * 3.0, 300.0 + (i - 150) as f32 * (low - 300.0) / 150.0) }).collect();
         step(hwnd, "hover", pts.len(), Box::new(move |i| drive(hwnd, |h| h.core.pointer_move(pts[i].0, pts[i].1, crate::anim::now_ms()))));
     }
     if all || what == "menu" {
@@ -90,6 +91,47 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
                 click(hwnd, crate::widgets::overlay::TOAST_UNDO); // the toast would still be leaving when `rest` counts
             }
         }
+    }
+    if all || what == "glide" {
+        // a mouse wheel: a notch every 20 frames, each glides for 150 ms
+        step(hwnd, "glide", 300, Box::new(move |i| drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            h.core.pointer_move(400.0, 400.0, now);
+            if i % 20 == 0 {
+                h.core.wheel(0.0, if (i / 100) % 2 == 0 { -1.0 } else { 1.0 }, Default::default(), now);
+            }
+            true
+        })));
+    }
+    if all || what == "type" {
+        // the search field has the focus: a letter a frame, Backspace now and then; the pointer rests over the list
+        click(hwnd, 200);
+        let keys: Vec<char> = "reportbackupdesignholiday".chars().collect();
+        step(hwnd, "type", 300, Box::new(move |i| drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            if i % 24 < 20 {
+                h.core.text(&keys[i % keys.len()].to_string(), now);
+            } else {
+                h.core.key(0x08, Default::default(), false, now);
+            }
+            true
+        })));
+        // the text goes (Ctrl+A, Backspace); what a focused caret costs at rest is the one timer, a frame at each blink
+        drive(hwnd, |h| h.core.key(0x41, crate::frame::Mods { ctrl: true, shift: false }, false, crate::anim::now_ms()));
+        drive(hwnd, |h| h.core.key(0x08, Default::default(), false, crate::anim::now_ms()));
+        pump(800);
+        let n = with(hwnd, |h| h.frames).unwrap_or(0);
+        pump(3000);
+        let m = with(hwnd, |h| h.frames).unwrap_or(0);
+        println!("caret at rest | {} frames in 3 s with the field focused (the blink: two a second, nothing in between)", m - n);
+        // the focus goes (a click on the margin, where nothing is), as `rest` below counts with none
+        drive(hwnd, |h| {
+            let now = crate::anim::now_ms();
+            h.core.pointer_move(4.0, 400.0, now);
+            h.core.down(crate::frame::Button::Left, 4.0, 400.0, now);
+            h.core.up(crate::frame::Button::Left, 4.0, 400.0, now);
+            true
+        });
     }
     if all || what == "scroll" {
         step(hwnd, "scroll", 300, Box::new(move |i| drive(hwnd, |h| {
