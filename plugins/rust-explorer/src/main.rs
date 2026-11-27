@@ -454,6 +454,7 @@ unsafe fn bg_menu(h: HWND) {
     menu::item(m, 5, "\u{E946}", t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性"), false);
     let id = menu::track(h, m);
     let dir = cur_dir();
+    if desk() && matches!(id, 1..=3) { desk::want_near_click(); } // new icons where the menu was opened
     match id {
         7 => set_icons_hidden(!icons_hidden()),
         20..=23 => SORT_COL.store(id as usize - 20, Relaxed), // the reload below sorts again
@@ -1078,6 +1079,7 @@ mod sh {
             }
             let paths = hdrop_paths(o.ok()?)?;
             let to = super::cur_dir();
+            if super::desk() { super::desk::want_near((pt.x, pt.y)); } // the new icons appear at the drop point, on whichever monitor
             // like Explorer: same drive moves, other drive copies, Ctrl forces copy
             let copy = k.0 & 8 != 0 || paths.first().and_then(|p| p.components().next()) != to.components().next();
             unsafe { *e = if copy { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } };
@@ -1215,10 +1217,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 if m == WM_DISPLAYCHANGE {
                     reload_wall(); // monitors came, went or changed resolution: each one gets its picture again
                     let (vx, vy, vw, vh) = virt();
-                    SetWindowPos(h, HWND_BOTTOM, vx, vy, vw, vh, SWP_NOACTIVATE); // WM_SIZE lays out
+                    SetWindowPos(h, HWND_BOTTOM, vx, vy, vw, vh, SWP_NOACTIVATE); // WM_SIZE sizes the list
+                    desk::relayout(ST.with_borrow(|st| st.list)); // icons of a monitor that went (or moved) snap to the cells of the others
                     InvalidateRect(h, ptr::null(), 1);
                 } else if wp == SPI_SETWORKAREA as usize {
-                    place_desk_list(ST.with_borrow(|st| st.list));
+                    desk::relayout(ST.with_borrow(|st| st.list)); // a bar strip came or went on some monitor: the icons go with their area
                 } else if wp == SPI_SETDESKWALLPAPER as usize {
                     wallpaper_changed(h); // Settings or the Photo viewer set a new picture
                 }
@@ -1523,8 +1526,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 SetFocus(list);
                 0
             }
-            // a click on the desktop itself, not on the icon list (which has its own NM_RCLICK menu): icons hidden, or
-            // a secondary monitor, where the list does not reach (#125)
+            // a click on the desktop itself, not on the icon list (which has its own NM_RCLICK menu and covers every monitor): icons hidden
             WM_CONTEXTMENU if desk() && (icons_hidden() || wp as HWND == h) => { bg_menu(h); 0 }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
             WM_TIMER if wp == shellmenu::TIMER => { shellmenu::tick(h); 0 }
