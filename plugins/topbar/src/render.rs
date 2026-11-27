@@ -393,7 +393,7 @@ fn parse_date(v: &str) -> Option<(i32, i32, i32)> {
 
 /// `topbar --render-panel <file.png> tray|lang|tip|quick|wifi|calendar|start|search|settings[:<page>]|toast|jumplist|preview|taskview|
 /// switcher|menu|power-restart|power-shutdown|power-busy [classic|floating|dock] [bottom|left|right] [scale=1.25] [t=<ms>] [hover=<n>] [n=<icons>] [real] [at=<n>]
-/// [q=<text>] [page=<n>] [pins=<n>] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
+/// [q=<text>] [page=<n>] [pins=<n>] [builtins] [wins=<n>] [recent] [kind=ctx|clock|winx] [desks=<n>]`
 ///
 /// `quick` shows the list of sound devices after a click on the Sound card's button: `click=23 after=800`. `switcher` takes
 /// `permon` (the list is one monitor's), `menu kind=winx` shows the sign-out submenu with `hover=23`.
@@ -427,6 +427,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
     let (mut t_given, mut lang_arg, mut open_row, mut upd, mut tpl, mut text) = (false, "en", None, "", 0usize, "Alt+Tab lists windows from this monitor only");
     let (mut tiled, mut del, mut hide, mut alignl, mut bar_size, mut opacity, mut accent) = (false, false, false, false, 1u8, 85u8, "blue");
     let (mut dir_arg, mut mode_arg) = ("", "auto"); // `mode=light|dark|auto`: what the Appearance row shows (the picture itself is `light` or not)
+    // the desktop's menu (`desk`): where the pointer is (DIPs) and what the desktop says its state is
+    let (mut desk_at, mut desk_sort, mut desk_size, mut desk_auto, mut desk_shown) = ((400.0f32, 300.0f32), "name", "medium", true, true);
+    let (mut desk_rec, mut desk_disk) = (false, true);
     let (mut apps_on, mut other_bars, mut one_display) = (String::new(), String::new(), false); // the bar page's monitor rows
     let (mut click, mut after, mut busy, mut per_monitor) = (None::<i32>, 0u64, false, false);
     // the notification centre (`calendar`) and the pop-ups (`popups`): what is in the store
@@ -455,6 +458,12 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Some(("accent", v)) => accent = Box::leak(v.to_string().into_boxed_str()),
             Some(("dir", v)) => dir_arg = Box::leak(v.to_string().into_boxed_str()),
             Some(("mode", v)) => mode_arg = Box::leak(v.to_string().into_boxed_str()),
+            Some(("x", v)) => desk_at.0 = v.parse().unwrap_or(400.0),
+            Some(("y", v)) => desk_at.1 = v.parse().unwrap_or(300.0),
+            Some(("sort", v)) => desk_sort = Box::leak(v.to_string().into_boxed_str()),
+            Some(("icons", v)) => desk_size = Box::leak(v.to_string().into_boxed_str()),
+            Some(("auto", v)) => desk_auto = v == "1",
+            Some(("shown", v)) => desk_shown = v == "1",
             Some(("appson", v)) => apps_on = v.to_string(),
             Some(("other", v)) => other_bars = v.to_string(),
             Some(("hover", v)) => hover = v.parse().ok(),
@@ -473,6 +482,8 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
                 "dnd" => dnd_flag = true,
                 "undo" => undo_flag = true,
                 "real" => real = true,
+                "rec" if what == "desk" => desk_rec = true,
+                "nodisk" => desk_disk = false,
                 "busy" => busy = true,
                 "permon" => per_monitor = true,
                 "onedisplay" => one_display = true,
@@ -686,6 +697,9 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             Box::new(ui::cal_popup::CalPanel::new(demo_now, side, room).pick(view, get("sel").and_then(parse_date).unwrap_or(today)))
         } else if what == "start" || what == "search" {
             apps::load(); // the machine's apps, synchronously, with the icons of what is pinned
+            if args.iter().any(|a| a == "builtins") {
+                apps::add_demo_builtins(); // the machine may have none of the built-in apps the design draws as glyphs
+            }
             let recent = if what == "start" && args.iter().any(|a| a == "recent") {
                 let names = ["Project proposal.docx", "Meeting notes.pdf", "Budget.xlsx", "Design brief.docx", "Roadmap.pdf", "Readme.md", "Notes.txt", "Landscape.jpg", "Dashboard.png", "Photo.jpg", "Sketch.png", "Projects", "Documents"];
                 names.iter().enumerate().map(|(i, name)| apps::Recent {
@@ -745,6 +759,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             demo_taskview(scale, (sw, sh), n_wins, n_desks, &icon)
         } else if what == "switcher" {
             demo_switcher(scale, (sw, sh), n_wins, per_monitor, &icon)
+        } else if what == "desk" {
+            use ui::desk_menu::{DeskPanel, Disk, State, place};
+            use winrust_common::deskmenu::{IconSize, Sort};
+            // the machine's own state is never read: the mockup's numbers (604 of 953 GB), its defaults unless the arguments say
+            let st = State { sort: Sort::parse(desk_sort).unwrap_or_default(), size: IconSize::parse(desk_size).unwrap_or_default(), auto: desk_auto, shown: desk_shown, recording: desk_rec, disk: desk_disk.then_some(Disk { used: 604, total: 953 }) };
+            let (bw, bh) = DeskPanel::size_for(desk_disk);
+            let px = |v: f32| (v * scale).round() as i32;
+            let (at, corner) = place((px(desk_at.0), px(desk_at.1)), (px(bw), px(bh)), (0, 0, sw, if side == Side::Bottom { p.rest.1 } else { sh }), px(12.0), scale);
+            Box::new(DeskPanel::new(st, at, corner, |_| {}))
         } else if what == "menu" {
             demo_menu(kind, side, (sh as f32 / scale) - 130.0, side == Side::Right)
         } else if let Some(which) = what.strip_prefix("power-") {
@@ -848,7 +871,15 @@ pub(crate) unsafe fn render_panel(args: &[String]) {
             let (win, _, alpha) = tip.frame(&mut gfx, 5000);
             blend(&mut canvas, (sw, sh), tip.surface().pixels(), win.2, (win.0, win.1), alpha);
         }
-        if whole { (0, 0, sw, sh) } else { around(popup.rect()) }
+        if whole {
+            (0, 0, sw, sh)
+        } else if what == "desk" {
+            // the box alone with room for its shadow: the desktop's menu stands where the pointer was, not at the bar
+            let (b, m) = (popup.rect(), (30.0 * scale) as i32);
+            ((b.0 - m).max(0), (b.1 - m).max(0), (b.0 + b.2 + m).min(sw), (b.1 + b.3 + m).min(sh))
+        } else {
+            around(popup.rect())
+        }
     };
     let (x0, y0, x1, y1) = crop;
     let (w, h) = (x1 - x0, y1 - y0);

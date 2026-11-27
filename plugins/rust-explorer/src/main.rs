@@ -19,7 +19,7 @@
 //   drag-to-position / auto-arrange, items from the public desktop can't be renamed.
 #![windows_subsystem = "windows"]
 use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
-use winrust_common::{t, tf};
+use winrust_common::{deskmenu::{self, Cmd}, t, tf};
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect, ScreenToClient}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
 
 mod desktop;
@@ -383,9 +383,11 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
     }
 }
 
-/// Right click on empty space: the folder's own menu.
+/// Right click on empty space: the folder's own menu. On the desktop the bar draws the design's menu when it runs (`desktop::ask_bar`);
+/// this one is the desktop's own, for when it does not.
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
+    if desk() && desktop::ask_bar() { return; }
     let m = CreatePopupMenu();
     menu::item(m, 1, "\u{E8F4}", t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), false);
     menu::item(m, 2, "\u{E8A5}", t!("Новый текстовый файл", "New text file", ja: "新しいテキスト ドキュメント", pt: "Novo arquivo de texto", zh: "新建文本文件"), false);
@@ -414,7 +416,7 @@ unsafe fn bg_menu(h: HWND) {
         menu::item(m, 9, "\u{E787}", t!("Упорядочить значки по дате", "Sort icons by date", ja: "日付順にアイコンを並べ替え", pt: "Classificar ícones por data", zh: "按日期排列图标"), false);
         menu::item(m, 10, "\u{E9D9}", t!("Упорядочить значки по размеру", "Sort icons by size", ja: "サイズ順にアイコンを並べ替え", pt: "Classificar ícones por tamanho", zh: "按大小排列图标"), false);
         menu::item(m, 11, "\u{E80A}", t!("Выровнять значки", "Arrange icons", ja: "アイコンの整列", pt: "Alinhar ícones", zh: "排列图标"), false);
-        let lbl = if small_marker().exists() { t!("Крупные значки", "Large icons", ja: "大きいアイコン", pt: "Ícones grandes", zh: "大图标") } else { t!("Мелкие значки", "Small icons", ja: "小さいアイコン", pt: "Ícones pequenos", zh: "小图标") };
+        let lbl = if view().size == deskmenu::IconSize::Small { t!("Крупные значки", "Large icons", ja: "大きいアイコン", pt: "Ícones grandes", zh: "大图标") } else { t!("Мелкие значки", "Small icons", ja: "小さいアイコン", pt: "Ícones pequenos", zh: "小图标") };
         menu::item(m, 12, "\u{E8A9}", lbl, false);
         let lbl = if icons_hidden() { t!("Показать значки рабочего стола", "Show desktop icons", ja: "デスクトップ アイコンを表示", pt: "Mostrar ícones da área de trabalho", zh: "显示桌面图标") } else { t!("Скрыть значки рабочего стола", "Hide desktop icons", ja: "デスクトップ アイコンを非表示", pt: "Ocultar ícones da área de trabalho", zh: "隐藏桌面图标") };
         menu::item(m, 7, "\u{E7B3}", lbl, false);
@@ -439,13 +441,12 @@ unsafe fn bg_menu(h: HWND) {
             if k.exists() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
         }
         12 => { // the grid changes with the size: icons are laid out again
-            let k = small_marker();
-            if k.exists() { let _ = fs::remove_file(&k); } else { let _ = fs::write(&k, "1"); }
+            set_view(view().toggled_small());
             apply_icon_size(ST.with_borrow(|st| st.list));
             let _ = fs::remove_file(desk::pos_file());
         }
         8..=11 => { // the saved cells are dropped: reload lays every icon out again, down the columns in sort order
-            if id != 11 { SORT_COL.store([0, 1, 3][id as usize - 8], Relaxed); SORT_ASC.store(true, Relaxed); }
+            if id != 11 { let s = deskmenu::Sort::ALL[id as usize - 8]; set_view(View { sort: s, ..view() }); SORT_COL.store(sort_col(s), Relaxed); SORT_ASC.store(true, Relaxed); }
             let _ = fs::remove_file(desk::pos_file());
         }
         6 => { // wiztree takes the drive letter and asks for admin rights itself
@@ -1198,6 +1199,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             // the topbar switched the WinRust style: take it now (the desktop's list keeps its see-through colours)
             winrust_common::style::reload();
             if desk() { InvalidateRect(h, ptr::null(), 1); } else { ui::restyle(h); }
+            return 0;
+        }
+        if desk() && m == deskmenu::cmd_msg() { // what the bar's desktop menu chose
+            if let Some(c) = Cmd::decode(wp, lp) { desktop::command(h, c); }
             return 0;
         }
         match m {

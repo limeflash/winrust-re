@@ -285,8 +285,17 @@ impl StartPanel {
                 let lift = f.tween(id, 1, -3.0 * f32::from(f.hover == Some(id)), 250, SPRING);
                 let k = f.tween(id, 2, if f.press == Some(id) { 0.94 } else { 1.0 }, 250, SPRING);
                 let (cx, top) = (r.cx(), r.y + 15.8);
+                // a built-in app is the design's line glyph on a soft tile (`mkPin`: 48 px, radius 14, a 1 px ring and a lit top edge)
+                if let Some(d) = apps::glyph_ready(&app.path) {
+                    c.transformed(cx, top + 24.0, k, 0.0, lift, |c| {
+                        let tile = Rect::new(cx - 24.0, top, 48.0, 48.0);
+                        c.gradient(tile, 14.0, Rgba::white(0.1), Rgba::white(0.05));
+                        c.ring(tile, 14.0, 1.0, Rgba::white(0.08));
+                        c.inset_edge(tile, 14.0, 1.0, Rgba::white(0.1));
+                        c.icon(d, (cx, top + 24.0), 24.0, 1.7, INK, 0.0);
+                    });
                 // an icon still loading is left out for a moment (warm_icons was asked for it in `update`)
-                if let Some(ic) = apps::icon_ready(&app.path) {
+                } else if let Some(ic) = apps::icon_ready(&app.path) {
                     c.transformed(cx, top + 24.0, k, 0.0, lift, |c| c.hicon(ic, Rect::new(cx - 22.0, top + 2.0, 44.0, 44.0), 1.0));
                 }
                 c.text_fit(&app.name, Rect::new(r.x + 4.0, top + 58.0, r.w - 8.0, 14.4), Font::new(12.0, 400), INK, Align::Center);

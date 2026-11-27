@@ -1211,7 +1211,7 @@ fn draw_appearance(c: &mut Canvas<'_>, f: &mut Frame<'_>, r: Rect) {
 }
 
 /// A switch: the 36×20 track and the 16 px knob (`.16s` colour, `.18s` slide).
-fn switch(c: &mut Canvas<'_>, f: &mut Frame<'_>, key: i32, (x, y): (f32, f32), on: bool, accent: Rgba) {
+pub(crate) fn switch(c: &mut Canvas<'_>, f: &mut Frame<'_>, key: i32, (x, y): (f32, f32), on: bool, accent: Rgba) {
     let k = f.tween(key, 1, f32::from(on), 160, EASE);
     let slide = f.tween(key, 2, f32::from(on), 180, SPRING);
     c.fill(Rect::new(x, y, 36.0, 20.0), 10.0, Rgba::white(0.16).mix(accent, k));

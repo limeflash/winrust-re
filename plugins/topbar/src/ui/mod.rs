@@ -4,6 +4,7 @@
 pub use winrust_ui::{gfx, anim, svg, frame};
 pub mod bar;
 pub mod cal_popup;
+pub mod desk_menu;
 pub mod icons;
 pub mod jump;
 pub mod lang_popup;

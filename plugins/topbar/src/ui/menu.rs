@@ -112,9 +112,14 @@ pub fn kbd(c: &mut Canvas<'_>, right: f32, cy: f32, text: &str) -> f32 {
 /// A row of a menu: the hover plate, the icon, the label and the hint. `hot` is the hover 0..1.
 pub fn draw_row(c: &mut Canvas<'_>, r: Rect, hot: f32, danger: bool, icon: &'static str, label: &str, hint: Hint) {
     let plate = if danger { Rgba::css(229, 72, 77, 0.14) } else { Rgba::white(0.08) };
-    c.fill(r, 10.0, plate.alpha(plate.a * hot));
-    let ink = if danger { DANGER } else { INK };
-    c.icon(icon, (r.x + 10.0 + 8.5, r.cy()), 17.0, 1.8, if danger { DANGER } else { DIM }, 0.0);
+    draw_row_ink(c, r, plate.alpha(plate.a * hot), icon, if danger { DANGER } else { DIM }, if danger { DANGER } else { INK }, label, hint);
+}
+
+/// [`draw_row`] with its colours given: the plate as it is now, the icon's and the label's.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_row_ink(c: &mut Canvas<'_>, r: Rect, plate: Rgba, icon: &'static str, icon_ink: Rgba, ink: Rgba, label: &str, hint: Hint) {
+    c.fill(r, 10.0, plate);
+    c.icon(icon, (r.x + 10.0 + 8.5, r.cy()), 17.0, 1.8, icon_ink, 0.0);
     let mut right = r.x + r.w - 10.0;
     if let Hint::Keys(keys) = hint {
         for k in keys.iter().rev() {

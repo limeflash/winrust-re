@@ -260,3 +260,64 @@ pub(crate) unsafe fn winx_content(side: Side, room: f32, left: bool) -> Box<dyn 
         }
     }))
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the desktop's menu (`ui::desk_menu`)
+
+/// GB used and in all on the volume of `drive`.
+unsafe fn disk_of(drive: char) -> Option<ui::desk_menu::Disk> {
+    let (mut caller, mut total, mut free) = (0u64, 0u64, 0u64);
+    let ok = windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide(&format!("{drive}:\\")).as_ptr(), &mut caller, &mut total, &mut free);
+    if ok == 0 { None } else { ui::desk_menu::Disk::from_bytes(total, free) }
+}
+
+/// What rust-explorer's desktop asked for with a right click at the pointer: the menu and where it goes, or `None` when it
+/// cannot be shown now (no panel host). The menu's choices go back to the desktop ([`winrust_common::deskmenu::send`]) or
+/// to the bar's own tools: those ask the bar's window for what Win+Shift+S and Win+Shift+R do, 160 ms on (the mockup's
+/// wait), when the menu has left the screen the picture is taken of.
+pub(crate) unsafe fn desk_menu(r: &winrust_common::deskmenu::Request) -> Option<(Box<dyn panel::Content>, panel::Anchor)> {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
+    use ui::desk_menu::{DeskPanel, Pick as DeskPick, State};
+    use winrust_common::deskmenu;
+    if panel::hwnd().is_null() {
+        return None;
+    }
+    let s = SCALE.get();
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(MonitorFromPoint(POINT { x: r.at.0, y: r.at.1 }, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+        return None;
+    }
+    let (m, work) = (mi.rcMonitor, mi.rcWork);
+    // the room: the monitor's work area, less the bar when it floats over the screen without reserving a strip
+    let bar = anchor(NONE);
+    let mut room = (work.left, work.top, work.right, work.bottom);
+    if let Some(a) = bar.filter(|a| a.origin == (m.left, m.top)) {
+        match a.side {
+            Side::Bottom => room.3 = room.3.min(a.bar.1),
+            Side::Left => room.0 = room.0.max(a.bar.2),
+            Side::Right => room.2 = room.2.min(a.bar.0),
+        }
+    }
+    let disk = r.drive.and_then(|d| disk_of(d));
+    let (w, h) = DeskPanel::size_for(disk.is_some());
+    let (at, corner) = ui::desk_menu::place(r.at, ((w * s).round() as i32, (h * s).round() as i32), room, (12.0 * s).round() as i32, s);
+    let st = State { sort: r.sort, size: r.size, auto: r.auto, shown: r.shown, recording: snip::recording(), disk };
+    let content = DeskPanel::new(st, at, corner, |p| {
+        let later = |wp: usize| {
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(160));
+                // SAFETY: posts plain integers to the bar's window.
+                unsafe { PostMessageW(BAR.load(Relaxed) as HWND, SNIP, wp, 0) };
+            });
+        };
+        match p {
+            DeskPick::Cmd(c) => _ = deskmenu::send(c),
+            DeskPick::Shot => later(0),
+            DeskPick::Record => later(3),
+        }
+    });
+    let a = panel::Anchor { side: i18n::style::side(), button: (r.at.0, r.at.1, r.at.0 + 1, r.at.1 + 1), bar: bar.map_or((0, 0, 0, 0), |a| a.bar), screen: (m.right - m.left, m.bottom - m.top), origin: (m.left, m.top) };
+    OPEN.set("desk");
+    Some((Box::new(content), a))
+}
