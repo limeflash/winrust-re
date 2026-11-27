@@ -1,8 +1,10 @@
-//! `--selftest window | stage <png> | memory`: the host on real windows.
+//! `--selftest window | widgets | stage <png> | memory`: the host on real windows.
 //!
 //! * `window`: an app window made off the screen (never shown), asked what Windows asks of it (`WM_NCHITTEST` at chosen points),
 //!   driven through its message procedure (pointer, click, key), told its DPI changed from 96 to 144, and watched at rest. Once
 //!   composed (DirectComposition) and once as the fallback (a redirected window painted from a DIB).
+//! * `widgets`: the text field, the scroll bar, the list and its header driven through the message procedure (clicks, `WM_CHAR`, keys,
+//!   the wheel), on a demo that keeps its clipboard in a variable and reports what it holds in its window title.
 //! * `stage <png>`: the window for a moment (under 2 s, never active, in the top left corner of the screen) and a picture of what
 //!   reached the screen, shadow and corners included.
 //! * `memory`: 30 openings and closings of a menu, a dialog and a toast: the process must not grow.
@@ -31,6 +33,7 @@ pub fn run(args: &[String], demo: fn(&str) -> Box<dyn App>) -> i32 {
     match args.first().map(String::as_str) {
         Some("stage") => stage(args.get(1).map_or("stage.png", String::as_str), demo),
         Some("memory") => memory(demo),
+        Some("widgets") => widgets(demo),
         _ => window(demo),
     }
 }
@@ -217,6 +220,166 @@ fn window_checks(rep: &mut Report, demo: fn(&str) -> Box<dyn App>, composed: boo
     let saved = std::fs::read_to_string(&place).unwrap_or_default();
     rep.check(saved.split_whitespace().filter(|n| n.parse::<i32>().is_ok()).count() == 5, &format!("... and writes its place: \"{}\"", saved.trim()));
     let _ = std::fs::remove_file(&place);
+}
+
+/// The window title as the demo's probe writes it: `key=value|key=value`.
+fn probe(hwnd: HWND) -> std::collections::HashMap<String, String> {
+    let mut buf = [0u16; 1024];
+    // SAFETY: a query of our own window's title into a local buffer.
+    let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) } as usize;
+    let t = String::from_utf16_lossy(&buf[..n]);
+    t.split('|').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+}
+
+fn typed(hwnd: HWND, s: &str) {
+    for ch in s.encode_utf16() {
+        // SAFETY: a message sent to our own window.
+        unsafe { SendMessageW(hwnd, WM_CHAR, ch as usize, 0) };
+    }
+}
+
+fn click_at(hwnd: HWND, x: f32, y: f32) {
+    mouse(hwnd, WM_MOUSEMOVE, x, y);
+    mouse(hwnd, WM_LBUTTONDOWN, x, y);
+    mouse(hwnd, WM_LBUTTONUP, x, y);
+}
+
+fn click_id(hwnd: HWND, id: i32) {
+    let (x, y) = centre(hwnd, id);
+    click_at(hwnd, x, y);
+}
+
+fn wheel(hwnd: HWND, notches: i32) {
+    // SAFETY: a message sent to our own window; the delta is the high word of wParam, as Windows sends it.
+    unsafe { SendMessageW(hwnd, WM_MOUSEWHEEL, ((notches * 120) as i16 as u16 as usize) << 16, 0) };
+}
+
+fn widgets(demo: fn(&str) -> Box<dyn App>) -> i32 {
+    let mut rep = Report(0);
+    let composed = gfx::compose_windows();
+    println!("widgets self-test: {} windows, off the screen; the demo keeps its clipboard in a variable", if composed { "composed" } else { "layered fallback" });
+    widget_checks(&mut rep, demo, composed);
+    if composed {
+        gfx::compose_off();
+        println!("-- the fallback (a redirected window painted from a DIB)");
+        widget_checks(&mut rep, demo, false);
+    }
+    println!("{} checks wrong", rep.0);
+    rep.0
+}
+
+fn widget_checks(rep: &mut Report, demo: fn(&str) -> Box<dyn App>, composed: bool) {
+    const SEARCH: i32 = 200;
+    const CLEAR: i32 = 201;
+    const LIST: i32 = 1000;
+    let class: &'static str = if composed { "winrust_ui_widgets" } else { "winrust_ui_widgets_dib" };
+    let Some(hwnd) = create(demo("selftest"), &opts(class), composed, Some((-5000, -5000))) else {
+        rep.check(false, "the window can be made");
+        return;
+    };
+    let get = |k: &str| probe(hwnd).get(k).cloned().unwrap_or_default();
+    // the field: a click focuses it, characters go in, the clear button appears with the first one
+    click_id(hwnd, SEARCH);
+    rep.check(with(hwnd, |h| h.core.hits().focus) == Some(Some(SEARCH)), "a click on the search field focuses it");
+    rep.check(with(hwnd, |h| h.core.hits().get(CLEAR).is_none()) == Some(true), "an empty field has no clear button");
+    typed(hwnd, "report 007");
+    rep.check(get("q") == "report 007" && with(hwnd, |h| h.core.hits().get(CLEAR).is_some()) == Some(true), &format!("WM_CHAR types into it, and the clear button comes: q = {:?}", get("q")));
+    let rows: usize = get("rows").parse().unwrap_or(0);
+    rep.check(rows > 0 && rows < 100, &format!("the list is filtered by what is typed: {rows} of 10,000 rows"));
+    key(hwnd, 0x08);
+    rep.check(get("q") == "report 00" && get("caret") == "9", "Backspace takes a character");
+    key(hwnd, 0x25);
+    key(hwnd, 0x25);
+    rep.check(get("caret") == "7" && get("anchor") == "7", "Left, Left moves the caret");
+    key(hwnd, 0x24);
+    rep.check(get("caret") == "0", "Home");
+    key(hwnd, 0x23);
+    rep.check(get("caret") == "9", "End");
+    // a double click at the start of the text takes the first word, and typing replaces it
+    let (fx, fy) = centre(hwnd, SEARCH);
+    let text_x = with(hwnd, |h| h.core.hits().get(SEARCH).map_or(0.0, |i| i.r.x)).unwrap_or(0.0) + 10.0 + 23.0;
+    pump(600);
+    click_at(hwnd, text_x + 4.0, fy);
+    click_at(hwnd, text_x + 4.0, fy);
+    rep.check(get("anchor") == "0" && get("caret") == "6", &format!("a double click selects the word: anchor {}, caret {}", get("anchor"), get("caret")));
+    typed(hwnd, "X");
+    rep.check(get("q") == "X 00", &format!("typing over a selection replaces it: {:?}", get("q")));
+    // the pointer: a click far to the right is the end
+    pump(600);
+    click_at(hwnd, fx + 100.0, fy);
+    rep.check(get("caret") == "4" && get("anchor") == "4", "a click right of the text puts the caret at its end");
+    // the clear button empties the field and keeps the focus
+    click_id(hwnd, CLEAR);
+    rep.check(get("q").is_empty() && get("rows") == "10000" && with(hwnd, |h| h.core.hits().focus) == Some(Some(SEARCH)), "the clear button empties the field and the list is whole again");
+    // the password field's text is the user's, shown as bullets; what it holds is reported
+    click_id(hwnd, 210);
+    typed(hwnd, "pw\u{1F600}1");
+    rep.check(get("pass") == "pw\u{1F600}1", "an emoji, two WM_CHARs, is one character of the field");
+    key(hwnd, 0x08);
+    key(hwnd, 0x08);
+    rep.check(get("pass") == "pw", "and Backspace takes it whole");
+
+    // the list: rows are named only in view; a click selects; the keys move the cursor
+    let named = with(hwnd, |h| h.core.hits().all().len()).unwrap_or(0);
+    rep.check(named > 0 && named < 90, &format!("{named} items are named for a list of 10,000 rows"));
+    click_id(hwnd, LIST + 2 + 3);
+    rep.check(get("sel") == "3" && with(hwnd, |h| h.core.hits().focus) == Some(None), "a click on row 3 selects it and takes the focus from the field");
+    key(hwnd, 0x28);
+    rep.check(get("sel") == "4" && get("cursor") == "Some(4)", "Down");
+    key(hwnd, 0x23);
+    pump(400);
+    rep.check(get("cursor") == "Some(9999)" && with(hwnd, |h| h.core.hits().get(LIST + 2 + 9999).is_some()) == Some(true), "End goes to the last row and scrolls it into view");
+    key(hwnd, 0x24);
+    pump(400);
+    rep.check(get("cursor") == "Some(0)" && with(hwnd, |h| h.core.hits().get(LIST + 2).is_some()) == Some(true), "Home goes back");
+    // the wheel: three notches over the list
+    let (lx, ly) = centre(hwnd, LIST + 2 + 3);
+    mouse(hwnd, WM_MOUSEMOVE, lx, ly);
+    wheel(hwnd, -3);
+    rep.check(get("y").parse::<f32>().unwrap_or(0.0) > 200.0, &format!("the wheel scrolls the list under the pointer: y = {}", get("y")));
+    pump(300);
+    // the bar: held at its thumb and pulled
+    let strip = with(hwnd, |h| h.core.hits().get(LIST + 1).map(|i| i.r)).flatten();
+    rep.check(strip.is_some(), "the list's bar is named");
+    if let Some(s) = strip {
+        let before: f32 = get("y").parse().unwrap_or(0.0);
+        let thumb_y = s.y + 2.0 + 4.0 + before / 372_000.0 * s.h;
+        mouse(hwnd, WM_MOUSEMOVE, s.cx(), thumb_y);
+        mouse(hwnd, WM_LBUTTONDOWN, s.cx(), thumb_y);
+        mouse(hwnd, WM_MOUSEMOVE, s.cx(), thumb_y + 120.0);
+        let pulled: f32 = get("y").parse().unwrap_or(0.0);
+        mouse(hwnd, WM_LBUTTONUP, s.cx(), thumb_y + 120.0);
+        rep.check(pulled > before + 5000.0, &format!("pulling the thumb 120 DIPs down scrolls the list far: y {before} -> {pulled}"));
+    }
+    // the header: a click sorts, the grip moves an edge
+    click_id(hwnd, 301);
+    rep.check(get("sort") == "Some((1, true))", "a click on a column title sorts by it");
+    click_id(hwnd, 301);
+    rep.check(get("sort") == "Some((1, false))", "and again turns the order over");
+    let w1: f32 = get("w1").parse().unwrap_or(0.0);
+    let (gx, gy) = centre(hwnd, 364);
+    mouse(hwnd, WM_MOUSEMOVE, gx, gy);
+    mouse(hwnd, WM_LBUTTONDOWN, gx, gy);
+    mouse(hwnd, WM_MOUSEMOVE, gx + 20.0, gy);
+    mouse(hwnd, WM_LBUTTONUP, gx + 20.0, gy);
+    rep.check((get("w1").parse::<f32>().unwrap_or(0.0) - (w1 - 20.0)).abs() < 1.0, &format!("the grip between Name and Modified moved 20 right: Modified {w1} -> {}", get("w1")));
+
+    // rest: the focused caret is the only thing that ticks, and a window without the focus does not tick at all
+    click_id(hwnd, SEARCH);
+    pump(700);
+    let n = with(hwnd, |h| h.frames).unwrap_or(0);
+    pump(2100);
+    let m = with(hwnd, |h| h.frames).unwrap_or(0);
+    rep.check((3..=6).contains(&(m - n)), &format!("a focused caret: {} frames in 2.1 s (the blink)", m - n));
+    // SAFETY: a message sent to our own window.
+    unsafe { SendMessageW(hwnd, WM_KILLFOCUS, 0, 0) };
+    pump(700);
+    let n = with(hwnd, |h| h.frames).unwrap_or(0);
+    pump(2000);
+    let m = with(hwnd, |h| h.frames).unwrap_or(0);
+    rep.check(m == n, &format!("in a window that lost the focus: {} frames in 2 s", m - n));
+    // SAFETY: our own window.
+    unsafe { DestroyWindow(hwnd) };
 }
 
 fn client_size(hwnd: HWND) -> (i32, i32) {

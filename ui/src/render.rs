@@ -89,14 +89,21 @@ pub fn render_pixels(app: Box<dyn App>, o: &Opts) -> Option<(Vec<u32>, i32, i32)
         core.pointer_move(x, y, t);
         frame(&mut g, &mut core, &mut surf, t);
     }
-    if let Some(id) = o.focus {
-        core.mo.hits.focus = Some(id);
-        core.mo.hits.focus_visible = true;
-    }
     // everything that moves has arrived: hover, menus, the toast (it stands still from 8 % to 90 % of its time), the hint's delay
     t += 1000;
     if !frame(&mut g, &mut core, &mut surf, t) {
         return None;
+    }
+    if let Some(id) = o.focus {
+        core.mo.hits.focus = Some(id);
+        core.mo.hits.focus_visible = true;
+        // a text field's caret restarts at the frame that first sees the focus, and its ring takes 200 ms to come: one frame for
+        // the first, then the picture
+        frame(&mut g, &mut core, &mut surf, t);
+        t += 300;
+        if !frame(&mut g, &mut core, &mut surf, t) {
+            return None;
+        }
     }
 
     let (sw, sh) = (px(o.w), px(o.h));

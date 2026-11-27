@@ -156,6 +156,12 @@ pub struct Cx {
     pub hwnd: isize,
     /// Alt was held with the key (the panels never asked: `Mods` is theirs and stays as it is).
     pub alt: bool,
+    /// The item that has the keyboard focus (an application window; the panels leave it empty).
+    pub focus: Option<Id>,
+    /// Shift and Ctrl as they were at the last click or key (an application window).
+    pub mods: Mods,
+    /// The pointer in the window's DIPs, when it is over it (an application window).
+    pub pointer: Option<(f32, f32)>,
 }
 
 /// What an application asks of its window through [`Cx`]; the host does it once the call has returned.
@@ -335,6 +341,8 @@ pub struct Hits {
     list: Vec<Hit>,
     clips: Vec<Rect>,
     pub focus: Option<Id>,
+    /// Where the caret of the focused text field is (DIPs), for the IME's composition and candidate windows.
+    pub caret: Option<Rect>,
     /// Keyboard navigation shows the focus ring (`:focus-visible`); the mouse hides it again.
     pub focus_visible: bool,
 }
@@ -344,6 +352,7 @@ impl Hits {
     pub fn clear(&mut self) {
         self.list.clear();
         self.clips.clear();
+        self.caret = None;
     }
 
     /// The item under a point (DIPs), the topmost.
@@ -440,6 +449,18 @@ impl Frame<'_> {
         self.mo.menu_open
     }
 
+    /// Item `id` has the keyboard focus (and the window is the active one).
+    #[must_use]
+    pub fn focused(&self, id: Id) -> bool {
+        self.mo.hits.focus == Some(id) && self.mo.active
+    }
+
+    /// A frame is due at `at` (milliseconds on the clock of `now`) though nothing moves until then: a caret that blinks. One
+    /// timer for the earliest of them, no frames in between.
+    pub fn due(&mut self, at: u64) {
+        self.mo.due = Some(self.mo.due.map_or(at, |d| d.min(at)));
+    }
+
     /// Names an item of an application window: records where it is (cut to the clip in force) so the host can hit-test it,
     /// and gives its eased hover and press. Items drawn later stand over those drawn earlier.
     pub fn item(&mut self, id: Id, r: Rect) -> Hot {
@@ -511,7 +532,11 @@ impl Frame<'_> {
 /// The transitions of a panel's items.
 #[derive(Default)]
 pub struct Motion {
-    t: HashMap<(i32, u8), Transition>,
+    t: HashMap<(i32, u8), (Transition, u32)>,
+    /// The frame being drawn (for `sweep`).
+    epoch: u32,
+    /// The earliest time an item asked for a frame with [`Frame::due`] since the last one.
+    pub due: Option<u64>,
     pub mode: Option<Anim>,
     /// The items an application window drew (the panels of the bar do not name any).
     pub hits: Hits,
@@ -531,13 +556,32 @@ impl Motion {
     /// Retargets like a CSS transition (a first sight settles at once) and returns the value now.
     fn go(&mut self, key: i32, slot: u8, to: f32, now: u64, dur: u32, ease: CubicBezier) -> f32 {
         let (dur, delay) = anim::timing(self.mode(), dur, 0);
-        let t = self.t.entry((key, slot)).or_insert_with(|| Transition::new(to));
+        let epoch = self.epoch;
+        let (t, seen) = self.t.entry((key, slot)).or_insert_with(|| (Transition::new(to), epoch));
+        *seen = epoch;
         t.set(to, now, dur, delay, ease);
         t.value(now)
     }
 
+    /// How many transitions are kept (a list that was scrolled through keeps only what is in view).
+    #[must_use]
+    pub fn tracked(&self) -> usize {
+        self.t.len()
+    }
+
     pub fn running(&self, now: u64) -> bool {
-        self.t.values().any(|t| t.running(now))
+        self.t.values().any(|(t, _)| t.running(now))
+    }
+
+    /// Ends a frame of an application window: the transitions of items that were not named in it and have settled go (a list
+    /// scrolled through 10,000 rows would otherwise keep two for each, and `running` would walk them all). An item that comes
+    /// back starts settled, as at its first sight.
+    pub fn sweep(&mut self, now: u64) {
+        if self.t.len() > 512 {
+            let epoch = self.epoch;
+            self.t.retain(|_, (t, seen)| *seen == epoch || t.running(now));
+        }
+        self.epoch = self.epoch.wrapping_add(1);
     }
 }
 

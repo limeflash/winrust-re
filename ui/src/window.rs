@@ -30,6 +30,7 @@ use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
+use windows_sys::Win32::UI::Input::Ime::{CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM, GCS_RESULTREADSTR, GCS_RESULTSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -634,7 +635,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             };
             // SAFETY: capturing the mouse for our own window: a held item follows the pointer beyond it.
             unsafe { SetCapture(hwnd) };
+            let (m, _) = mods();
             event(hwnd, |h| {
+                h.core.held = m;
                 let s = h.core.scale;
                 h.core.down(b, x as f32 / s, y as f32 / s, now);
                 h.core.ask_redraw();
@@ -651,7 +654,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             };
             // SAFETY: releases the capture taken above (a no-op without one).
             unsafe { ReleaseCapture() };
+            let (m, _) = mods();
             event(hwnd, |h| {
+                h.core.held = m;
                 let s = h.core.scale;
                 let act = h.core.up(b, x as f32 / s, y as f32 / s, now);
                 h.core.ask_redraw();
@@ -688,6 +693,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 });
             }
             return 0;
+        }
+        // the IME composes in its own windows, at the focused text field's caret; what it composed arrives here as one string (the
+        // default would send it as WM_CHARs a unit at a time, and a character beyond the BMP as two)
+        WM_IME_STARTCOMPOSITION => place_ime(hwnd),
+        WM_IME_COMPOSITION => {
+            place_ime(hwnd);
+            if lp as u32 & GCS_RESULTSTR != 0 {
+                if let Some(s) = ime_result(hwnd) {
+                    event(hwnd, |h| {
+                        h.core.text(&s, now);
+                        None
+                    });
+                }
+                // SAFETY: the default procedure of our own window; it draws the composition that is left, and the result is not sent twice.
+                return unsafe { DefWindowProcW(hwnd, msg, wp, lp & !((GCS_RESULTSTR | GCS_RESULTREADSTR) as LPARAM)) };
+            }
         }
         // Alt and a letter would look for a menu bar's mnemonic and beep: there is none (Alt+Space, the system menu, passes)
         WM_SYSCOMMAND if (wp & 0xfff0) as u32 == SC_KEYMENU && lp != i32::from(b' ') as LPARAM => return 0,
@@ -807,6 +828,44 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
     // SAFETY: the default procedure of our own window.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+/// Puts the IME's composition and candidate windows at the caret of the focused text field.
+fn place_ime(hwnd: HWND) {
+    let Some((Some(r), s)) = with(hwnd, |h| (h.core.ime_caret(), h.core.scale)) else { return };
+    let (x, y, below) = ((r.x * s).round() as i32, (r.y * s).round() as i32, ((r.y + r.h) * s).round() as i32 + 2);
+    // SAFETY: the window's own input context, released at once; the forms are locals.
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_null() {
+            return;
+        }
+        let zero = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let comp = COMPOSITIONFORM { dwStyle: CFS_POINT, ptCurrentPos: POINT { x, y }, rcArea: zero };
+        ImmSetCompositionWindow(himc, &comp);
+        let cand = CANDIDATEFORM { dwIndex: 0, dwStyle: CFS_CANDIDATEPOS, ptCurrentPos: POINT { x, y: below }, rcArea: zero };
+        ImmSetCandidateWindow(himc, &cand);
+        ImmReleaseContext(hwnd, himc);
+    }
+}
+
+/// What the IME has just composed (`GCS_RESULTSTR`).
+fn ime_result(hwnd: HWND) -> Option<String> {
+    // SAFETY: the window's own input context, released at once; the buffer is `len` bytes as the call asked.
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_null() {
+            return None;
+        }
+        let len = ImmGetCompositionStringW(himc, GCS_RESULTSTR, null_mut(), 0);
+        let s = (len > 0).then(|| {
+            let mut buf = vec![0u16; len as usize / 2];
+            ImmGetCompositionStringW(himc, GCS_RESULTSTR, buf.as_mut_ptr().cast(), len as u32);
+            String::from_utf16_lossy(&buf)
+        });
+        ImmReleaseContext(hwnd, himc);
+        s
+    }
 }
 
 fn ht_of(n: Nc) -> LRESULT {
