@@ -126,6 +126,53 @@ pub struct NotifyApp {
     pub mode: usize,
 }
 
+/// One key of the consent store's `NonPackaged` folder as it stands in the registry: a desktop app's exe path with `#` for the
+/// backslash, and the two times Windows keeps (a FILETIME each; 0 = none, and for the stop 0 also means "still open").
+#[derive(Clone, Debug)]
+pub struct RawDesk {
+    pub key: String,
+    pub start: u64,
+    pub stop: u64,
+    pub start_when: Option<When>,
+    pub stop_when: Option<When>,
+}
+
+/// The exe's path of a `NonPackaged` key (`C:#Users#me#Discord#app-1.0.9251#Discord.exe` is the path with backslashes).
+#[must_use]
+pub fn desk_path(key: &str) -> String {
+    key.replace('#', "\\")
+}
+
+fn exe_of(key: &str) -> String {
+    key.rsplit('#').next().unwrap_or(key).to_lowercase()
+}
+
+/// One row per app: the keys of an app that installs every update into a new folder (Discord, Edge WebView) are one app, named by the
+/// exe's file name; the key with the latest start speaks for it. It is "in use now" only when that key was never closed AND a process of
+/// that exe name runs now (a crash leaves a key open for ever). `describe` gives the exe's own name (its version info) when it is still there.
+pub fn group_desktop(raw: Vec<RawDesk>, running: &dyn Fn(&str) -> bool, describe: &dyn Fn(&str) -> Option<String>) -> Vec<CApp> {
+    let mut best: Vec<(String, RawDesk)> = Vec::new();
+    for r in raw {
+        let exe = exe_of(&r.key);
+        match best.iter_mut().find(|(e, _)| *e == exe) {
+            Some((_, b)) => {
+                if r.start > b.start {
+                    *b = r;
+                }
+            }
+            None => best.push((exe, r)),
+        }
+    }
+    best.into_iter()
+        .map(|(exe, r)| {
+            let live = r.start != 0 && r.stop == 0 && running(&exe);
+            let last = if r.stop == 0 { r.start_when } else { r.stop_when };
+            let name = describe(&desk_path(&r.key)).unwrap_or_else(|| app_name(&r.key));
+            CApp { id: r.key, name, desktop: true, last, live }
+        })
+        .collect()
+}
+
 /// When something happened, in the user's time: whole days ago and the wall clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct When {

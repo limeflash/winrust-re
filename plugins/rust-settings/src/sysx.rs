@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
+    more::{CApp, Cap, Consent, RawDesk, group_desktop, DATE_PATS, Flag, Gauge, Layout, NOC, NotifyApp, Opt, Security, When, Who, app_name, fmt_date},
     os::{Note, Ping},
     sys::{self, wide},
 };
@@ -385,15 +385,56 @@ pub fn notify_set(id: &str, mode: usize) -> bool {
 // ---------------------------------------------------------------------------------------------------------------------
 // privacy
 
+/// The exe's own name for itself (version info `FileDescription`: "Microsoft Edge WebView2"); None when the file is gone or says nothing.
+fn file_description(path: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+    let w = wide(path);
+    let mut h = 0u32;
+    // SAFETY: the buffer is as long as Windows said; what VerQueryValueW points at stays inside it while `buf` lives.
+    unsafe {
+        let n = GetFileVersionInfoSizeW(w.as_ptr(), &mut h);
+        if n == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize];
+        if GetFileVersionInfoW(w.as_ptr(), 0, n, buf.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let (mut p, mut len): (*mut std::ffi::c_void, u32) = (null_mut(), 0);
+        if VerQueryValueW(buf.as_ptr().cast(), wide(r"\VarFileInfo\Translation").as_ptr(), &mut p, &mut len) == 0 || len < 4 {
+            return None;
+        }
+        let t = std::slice::from_raw_parts(p.cast::<u16>(), 2);
+        let sub = wide(&format!(r"\StringFileInfo\{:04x}{:04x}\FileDescription", t[0], t[1]));
+        if VerQueryValueW(buf.as_ptr().cast(), sub.as_ptr(), &mut p, &mut len) == 0 || len == 0 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p.cast::<u16>(), len as usize)).trim_end_matches('\0').trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+}
+
 pub fn consent(cap: Cap) -> Consent {
     let base = format!(r"{CONSENT}\{}", cap.key());
-    let read_app = |key: String, id: String, desktop: bool| {
-        let (start, stop) = (qword(HKEY_CURRENT_USER, &key, "LastUsedTimeStart").unwrap_or(0), qword(HKEY_CURRENT_USER, &key, "LastUsedTimeStop").unwrap_or(0));
-        let live = start != 0 && stop == 0;
-        CApp { name: app_name(&id), id, desktop, last: when(if live { start } else { stop }), live }
-    };
-    let mut apps: Vec<CApp> = sys::subkeys(HKEY_CURRENT_USER, &base).into_iter().filter(|k| k != "NonPackaged").map(|k| read_app(format!(r"{base}\{k}"), k, false)).collect();
-    apps.extend(sys::subkeys(HKEY_CURRENT_USER, &format!(r"{base}\NonPackaged")).into_iter().map(|k| read_app(format!(r"{base}\NonPackaged\{k}"), k, true)));
+    let times = |key: &str| (qword(HKEY_CURRENT_USER, key, "LastUsedTimeStart").unwrap_or(0), qword(HKEY_CURRENT_USER, key, "LastUsedTimeStop").unwrap_or(0));
+    let mut apps: Vec<CApp> = sys::subkeys(HKEY_CURRENT_USER, &base)
+        .into_iter()
+        .filter(|k| k != "NonPackaged")
+        .map(|k| {
+            let (start, stop) = times(&format!(r"{base}\{k}"));
+            let live = start != 0 && stop == 0; // (a Store app's process cannot be named from here)
+            CApp { name: app_name(&k), id: k, desktop: false, last: when(if live { start } else { stop }), live }
+        })
+        .collect();
+    let raw = sys::subkeys(HKEY_CURRENT_USER, &format!(r"{base}\NonPackaged"))
+        .into_iter()
+        .map(|key| {
+            let (start, stop) = times(&format!(r"{base}\NonPackaged\{key}"));
+            RawDesk { key, start, stop, start_when: when(start), stop_when: when(stop) }
+        })
+        .collect();
+    let running: std::collections::HashSet<String> = winrust_common::proc::list().into_iter().map(|(_, n)| n.to_lowercase()).collect();
+    apps.extend(group_desktop(raw, &|exe| running.contains(exe), &file_description));
     // Store apps by name, then desktop apps, the one using it now first, then the latest (a PC holds hundreds of old ones: 30 are shown)
     let recent = |a: &CApp| a.last.map_or((u32::MAX, 0), |w| (w.days_ago, u32::MAX - (u32::from(w.hour) * 60 + u32::from(w.min))));
     apps.sort_by_key(|a| (a.desktop, !a.live, if a.desktop { recent(a) } else { (0, 0) }, a.name.to_lowercase()));
@@ -527,7 +568,7 @@ mod live {
         for cap in Cap::ALL {
             let c = consent(cap);
             println!("{cap:?}: pc {:?} user {:?} desktop {:?}, {} apps", flag(&Flag::Access(cap, Who::Pc)), flag(&Flag::Access(cap, Who::User)), flag(&Flag::Access(cap, Who::Desktop)), c.apps.len());
-            for a in c.apps.iter().take(4) {
+            for a in c.apps.iter().filter(|a| a.desktop).take(6) {
                 println!("   {} ({}) desktop={} last={:?} live={}", a.name, a.id, a.desktop, a.last, a.live);
             }
         }

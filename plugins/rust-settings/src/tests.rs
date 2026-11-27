@@ -1188,3 +1188,35 @@ fn names_dates_and_times_of_the_new_pages_read_well() {
     assert!(more::when_text(w(0)).ends_with("08:05") && more::when_text(w(1)).ends_with("08:05"));
     assert!(more::when_text(w(5)).starts_with("20 "));
 }
+
+#[test]
+fn an_app_that_installs_into_a_new_folder_each_update_is_one_row_and_a_crash_is_not_in_use() {
+    use crate::more::{CApp, RawDesk, When, group_desktop};
+    let w = |ago: u32| When { days_ago: ago, hour: 9, min: 0, day: 1, month: 1 };
+    let k = |key: &str, start: u64, stop: u64, ago: u32| RawDesk { key: key.into(), start, stop, start_when: Some(w(ago)), stop_when: (stop != 0).then(|| w(ago)) };
+    let raw = || vec![k("C:#x#Discord#app-1.0.9248#DISCORD.EXE", 100, 0, 130), k("C:#x#Discord#app-1.0.9251#Discord.exe", 200, 0, 100), k("C:#x#Edge#1#msedgewebview2.exe", 10, 20, 9), k("C:#x#Edge#2#msedgewebview2.exe", 30, 40, 7)];
+    let named = |_: &str| None;
+    // not running: two crashed keys, none of them "in use"; one row per exe, the latest start speaks for it
+    let apps: Vec<CApp> = group_desktop(raw(), &|_| false, &named);
+    assert_eq!(apps.len(), 2, "{apps:?}");
+    let d = apps.iter().find(|a| a.id.contains("9251")).expect("the latest Discord key");
+    assert!(!d.live && d.last == Some(w(100)), "a crash left it open: it was last used at its start: {d:?}");
+    let e = apps.iter().find(|a| a.id.contains("#2#")).unwrap();
+    assert_eq!(e.last, Some(w(7)), "the closed one: its stop time");
+    // running: the newest key was never closed and Discord runs: in use now
+    assert!(group_desktop(raw(), &|exe| exe == "discord.exe", &named).iter().any(|a| a.id.contains("9251") && a.live));
+    // the name comes from the exe's own description when it is there, else the prettified file name
+    let apps = group_desktop(raw(), &|_| false, &|p| p.ends_with("msedgewebview2.exe").then(|| "Microsoft Edge WebView2".to_string()));
+    assert!(apps.iter().any(|a| a.name == "Microsoft Edge WebView2") && apps.iter().any(|a| a.name == "Discord"), "{apps:?}");
+}
+
+#[test]
+fn the_microphone_list_shows_discord_once_and_names_the_webview_properly() {
+    let (s, _d) = win("privacy");
+    let rows = &s.pg.groups[2].rows;
+    assert_eq!(rows.iter().filter(|l| l.row.label() == "Discord").count(), 1, "one Discord row");
+    assert!(rows.iter().any(|l| l.row.label() == "Microsoft Edge WebView2"));
+    assert!(rows.iter().filter(|l| l.badge.is_some()).count() >= 2, "the PC's Admin badge and Discord's In use now");
+    let mic = s.pg.groups[0].rows.iter().find(|l| l.key == "now:microphone").unwrap();
+    assert!(mic.sub.contains("Discord"), "{}", mic.sub);
+}

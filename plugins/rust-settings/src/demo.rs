@@ -12,7 +12,7 @@ use crate::{
     Fill, Wall, audio, bt,
     display::{Mode, Mon, Topo},
     ext,
-    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NotifyApp, Opt, Security, When, Who, fmt_date},
+    more::{CApp, Cap, Consent, DATE_PATS, Flag, Gauge, Layout, NotifyApp, Opt, RawDesk, Security, When, Who, fmt_date, group_desktop},
     net,
     os::{Battery, Note, Os, Ping, WuExtra, set_os},
     power, wifi, wu,
@@ -128,6 +128,27 @@ fn when(ago: u32, h: u8, m: u8) -> When {
 }
 
 /// What the design's Privacy page lists: Store apps and desktop apps for each of camera, microphone and location.
+/// The desktop apps of the microphone as the registry has them: Discord and Edge WebView2 keep one key for every version they ever installed
+/// (two of Discord's were left open by a crash); they must come out as one row each, and Discord is the one in use now.
+fn demo_desktop_mic() -> Vec<CApp> {
+    let key = |k: &str, start: u64, stop: u64, ws: When, we: Option<When>| RawDesk { key: k.into(), start, stop, start_when: Some(ws), stop_when: we };
+    let raw = vec![
+        key("C:#Users#me#AppData#Local#Discord#app-1.0.9248#Discord.exe", 100, 0, when(130, 10, 0), None),
+        key("C:#Users#me#AppData#Local#Discord#app-1.0.9251#Discord.exe", 200, 0, when(108, 21, 30), None),
+        key("C:#Users#me#AppData#Local#Discord#app-1.0.9260#Discord.exe", 300, 0, when(0, 9, 14), None),
+        key("C:#Program Files (x86)#Microsoft#EdgeWebView#Application#131.0.2903#msedgewebview2.exe", 50, 60, when(9, 18, 0), Some(when(9, 18, 2))),
+        key("C:#Program Files (x86)#Microsoft#EdgeWebView#Application#132.0.1#MSEDGEWEBVIEW2.EXE", 70, 80, when(7, 18, 0), Some(when(7, 18, 2))),
+    ];
+    group_desktop(raw, &|exe| exe == "discord.exe", &|path| {
+        let exe = path.rsplit('\\').next().unwrap_or("").to_lowercase();
+        match exe.as_str() {
+            "discord.exe" => Some("Discord".into()),
+            "msedgewebview2.exe" => Some("Microsoft Edge WebView2".into()),
+            _ => None,
+        }
+    })
+}
+
 fn demo_consent() -> Vec<(Cap, Vec<CApp>)> {
     let app = |id: &str, name: &str, desktop: bool, last: Option<When>, live: bool| CApp { id: id.into(), name: name.into(), desktop, last, live };
     vec![
@@ -137,11 +158,12 @@ fn demo_consent() -> Vec<(Cap, Vec<CApp>)> {
             vec![
                 app("vrec", "Voice Recorder", false, Some(when(15, 9, 0)), false),
                 app("plink", "Phone Link", false, None, false),
-                app("discord", "Discord", true, Some(when(0, 9, 14)), true),
                 app("telegram", "Telegram", true, Some(when(1, 21, 40)), false),
-                app("edge", "Microsoft Edge", true, Some(when(7, 18, 2)), false),
-                app("winrust", "WinRust screen recorder", true, Some(when(0, 12, 40)), false),
-            ],
+                                app("winrust", "WinRust screen recorder", true, Some(when(0, 12, 40)), false),
+            ]
+            .into_iter()
+            .chain(demo_desktop_mic())
+            .collect(),
         ),
         (Cap::Loc, vec![app("weather", "Weather", false, Some(when(0, 9, 11)), false), app("maps", "Maps", false, Some(when(9, 14, 20)), false), app("edge", "Microsoft Edge", true, None, false), app("telegram", "Telegram", true, None, false)]),
     ]
